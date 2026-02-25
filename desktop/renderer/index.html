@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mediation Desktop</title>
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: #111b2e;
+        --accent: #2dd4bf;
+        --muted: #9aa9c7;
+        --text: #eaf2ff;
+        --danger: #f87171;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 20% 0%, #1b2e52 0%, transparent 45%),
+          radial-gradient(circle at 85% 20%, #193f4f 0%, transparent 40%),
+          var(--bg);
+        min-height: 100vh;
+      }
+
+      .app {
+        width: min(1300px, 97vw);
+        margin: 20px auto;
+        display: grid;
+        grid-template-columns: repeat(12, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .card {
+        background: color-mix(in oklab, var(--panel), black 8%);
+        border: 1px solid rgba(154, 169, 199, 0.2);
+        border-radius: 12px;
+        padding: 14px;
+      }
+
+      .span-12 { grid-column: span 12; }
+      .span-8 { grid-column: span 8; }
+      .span-6 { grid-column: span 6; }
+      .span-4 { grid-column: span 4; }
+
+      h1 { margin: 0; font-size: 1.1rem; }
+      h2 { margin: 0 0 10px; font-size: 1rem; color: var(--accent); }
+      p { margin: 0; color: var(--muted); }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        font-size: 0.84rem;
+        line-height: 1.4;
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .grid-2 {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .grid-3 {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      input, button, textarea, select {
+        border-radius: 8px;
+        border: 1px solid rgba(154, 169, 199, 0.25);
+        background: #0c1425;
+        color: var(--text);
+        padding: 8px 10px;
+        font-size: 0.93rem;
+      }
+
+      input, textarea, select { width: 100%; }
+      textarea { min-height: 120px; resize: vertical; }
+
+      button {
+        cursor: pointer;
+        border-color: color-mix(in oklab, var(--accent), #ffffff 25%);
+      }
+
+      button.secondary {
+        border-color: rgba(154, 169, 199, 0.4);
+      }
+
+      button.warn {
+        border-color: color-mix(in oklab, var(--danger), #ffffff 15%);
+      }
+
+      .status {
+        font-weight: 600;
+      }
+
+      .status.ok { color: var(--accent); }
+      .status.err { color: var(--danger); }
+
+      .muted {
+        color: var(--muted);
+        font-size: 0.83rem;
+      }
+
+      #output {
+        min-height: 260px;
+      }
+
+      @media (max-width: 980px) {
+        .span-8, .span-6, .span-4 {
+          grid-column: span 12;
+        }
+        .grid-3, .grid-2 {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="card span-12">
+        <h1>Mediation Desktop</h1>
+        <p>Login, create/list cases, generate invites, join from invite links, run private intake template, and mark parties ready.</p>
+      </section>
+
+      <section class="card span-4">
+        <h2>Auth</h2>
+        <div class="row" style="margin-bottom: 8px;">
+          <button id="auth-status">Refresh Status</button>
+          <button id="auth-signin">Sign In</button>
+          <button id="auth-signout" class="secondary">Sign Out</button>
+        </div>
+        <div id="auth-result" class="status muted"></div>
+      </section>
+
+      <section class="card span-4">
+        <h2>Mediation Device</h2>
+        <div class="row" style="margin-bottom: 8px;">
+          <input id="default-device-id" placeholder="Default remote device id (remembered)" />
+          <button id="save-default-device">Save</button>
+        </div>
+        <div class="row">
+          <button id="gateway-devices" class="secondary">List Devices</button>
+          <button id="gateway-start-session">Start Session</button>
+          <button id="gateway-end-session" class="secondary">End Session</button>
+        </div>
+      </section>
+
+      <section class="card span-4">
+        <h2>Gateway Message</h2>
+        <div class="row" style="margin-bottom: 8px;">
+          <input id="gateway-message" placeholder="Send a message to remembered device" />
+          <button id="gateway-send">Send</button>
+        </div>
+        <div class="muted">Uses the saved mediation device id.</div>
+      </section>
+
+      <section class="card span-6">
+        <h2>Create Case</h2>
+        <div class="grid-2" style="margin-bottom: 8px;">
+          <input id="topic" placeholder="Topic" value="Co-founder governance dispute" />
+          <input id="description" placeholder="Description (optional)" value="Need a fair path for decision ownership and accountability." />
+        </div>
+        <div class="grid-2" style="margin-bottom: 8px;">
+          <input id="party-a-name" placeholder="Party A Name" value="Alex" />
+          <input id="party-b-name" placeholder="Party B Name" value="Blair" />
+        </div>
+        <div class="row">
+          <button id="create-case">Create Case</button>
+          <button id="list-cases" class="secondary">Refresh Cases</button>
+        </div>
+      </section>
+
+      <section class="card span-6">
+        <h2>Case List</h2>
+        <div class="row" style="margin-bottom: 8px;">
+          <select id="case-select"></select>
+        </div>
+        <pre id="case-status" class="muted">No case selected.</pre>
+      </section>
+
+      <section class="card span-6">
+        <h2>Invite</h2>
+        <div class="grid-2" style="margin-bottom: 8px;">
+          <input id="invite-email" placeholder="Invitee email" />
+          <button id="create-invite-link">Generate Invite Link</button>
+        </div>
+        <textarea id="invite-link-output" readonly placeholder="Generated invite link appears here"></textarea>
+      </section>
+
+      <section class="card span-6">
+        <h2>Join From Invite Link</h2>
+        <div class="row" style="margin-bottom: 8px;">
+          <input id="invite-link-input" placeholder="Paste invite link" />
+          <button id="parse-invite-link" class="secondary">Parse</button>
+        </div>
+        <div class="grid-2" style="margin-bottom: 8px;">
+          <input id="join-case-id" placeholder="caseId" />
+          <input id="join-token" placeholder="invite token" />
+        </div>
+        <div class="grid-2" style="margin-bottom: 8px;">
+          <select id="join-party-id"></select>
+          <button id="join-case">Join Case</button>
+        </div>
+        <div class="muted">Join automatically starts local intake template for selected party.</div>
+      </section>
+
+      <section class="card span-12">
+        <h2>Private Intake + Ready</h2>
+        <div class="grid-3" style="margin-bottom: 8px;">
+          <select id="intake-party-id"></select>
+          <button id="run-intake-template">Run Intake Template (LLM)</button>
+          <button id="mark-ready">Mark Ready</button>
+        </div>
+        <textarea id="private-summary" placeholder="Private summary for selected party"></textarea>
+        <div class="row" style="margin-top: 8px;">
+          <button id="save-private-summary" class="secondary">Save Summary</button>
+        </div>
+      </section>
+
+      <section class="card span-12">
+        <h2>Event Log</h2>
+        <textarea id="output" readonly></textarea>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
+

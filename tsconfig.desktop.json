@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "outDir": "dist-desktop",
+    "rootDir": "."
+  },
+  "include": ["desktop/**/*.ts", "src/**/*.ts"],
+  "exclude": ["dist", "dist-desktop", "node_modules"]
+}

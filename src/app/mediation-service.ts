@@ -1,3 +1,4 @@
+import { randomBytes, randomUUID } from 'node:crypto';
 import { DomainError } from '../domain/errors';
 import type {
   AppendMessageInput,
@@ -21,9 +22,11 @@ function nowIso(): string {
 }
 
 function makeId(prefix = 'id'): string {
-  const ts = Date.now().toString(36);
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `${prefix}_${ts}_${rand}`;
+  return `${prefix}_${randomUUID()}`;
+}
+
+function makeInviteToken(): string {
+  return randomBytes(32).toString('base64url');
 }
 
 function makeMessage(
@@ -86,7 +89,8 @@ export class MediationService {
   constructor(private readonly store: InMemoryMediationStore = new InMemoryMediationStore()) {}
 
   createCase(input: CreateCaseInput): MediationCase {
-    if (!input.topic.trim()) {
+    const topic = input.topic.trim();
+    if (!topic) {
       throw new DomainError('invalid_topic', 'mediation topic is required');
     }
     if (input.parties.length < 2) {
@@ -97,7 +101,7 @@ export class MediationService {
     assertConsentCoverage(input.parties, input.consent);
 
     const caseId = makeId('case');
-    const inviteToken = makeId('invite');
+    const inviteToken = makeInviteToken();
     const inviteBase = (input.inviteBaseUrl || 'https://mediation.local/join').trim();
     const inviteUrl = `${inviteBase}?caseId=${encodeURIComponent(caseId)}&token=${encodeURIComponent(inviteToken)}`;
 
@@ -126,7 +130,7 @@ export class MediationService {
 
     const mediationCase: MediationCase = {
       id: caseId,
-      topic: input.topic.trim(),
+      topic,
       description: (input.description || '').trim(),
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -207,8 +211,8 @@ export class MediationService {
 
   appendPrivateMessage(input: AppendMessageInput): MediationCase {
     const mediationCase = this.getCase(input.caseId);
-    if (mediationCase.phase !== 'private_intake') {
-      throw new DomainError('invalid_phase', 'private intake messages are only allowed during private_intake phase');
+    if (mediationCase.phase !== 'awaiting_join' && mediationCase.phase !== 'private_intake') {
+      throw new DomainError('invalid_phase', 'private intake messages are only allowed during awaiting_join/private_intake phases');
     }
     if (!input.partyId) {
       throw new DomainError('missing_party', 'partyId is required for private messages');
@@ -241,8 +245,16 @@ export class MediationService {
 
   setPrivateSummary(caseId: string, partyId: string, summary: string, resolved = true): MediationCase {
     const mediationCase = this.getCase(caseId);
-    if (mediationCase.phase !== 'private_intake') {
-      throw new DomainError('invalid_phase', 'private summaries are only allowed during private_intake phase');
+    if (mediationCase.phase !== 'awaiting_join' && mediationCase.phase !== 'private_intake') {
+      throw new DomainError('invalid_phase', 'private summaries are only allowed during awaiting_join/private_intake phases');
+    }
+
+    const participant = mediationCase.partyParticipationById[partyId];
+    if (!participant) {
+      throw new DomainError('party_not_found', `party '${partyId}' not found in case`);
+    }
+    if (!hasJoined(participant.state)) {
+      throw new DomainError('party_not_joined', `party '${partyId}' must join before private summary`);
     }
 
     const thread = mediationCase.privateIntakeByPartyId[partyId];
@@ -260,12 +272,15 @@ export class MediationService {
 
   setPartyReady(caseId: string, partyId: string): MediationCase {
     const mediationCase = this.getCase(caseId);
-    if (mediationCase.phase !== 'private_intake') {
-      throw new DomainError('invalid_phase', 'parties can only be marked ready during private_intake phase');
+    if (mediationCase.phase !== 'awaiting_join' && mediationCase.phase !== 'private_intake') {
+      throw new DomainError('invalid_phase', 'parties can only be marked ready during awaiting_join/private_intake phases');
     }
 
     const participant = mediationCase.partyParticipationById[partyId];
-    if (!participant || !hasJoined(participant.state)) {
+    if (!participant) {
+      throw new DomainError('party_not_found', `party '${partyId}' not found in case`);
+    }
+    if (!hasJoined(participant.state)) {
       throw new DomainError('party_not_joined', `party '${partyId}' must join before ready state`);
     }
 

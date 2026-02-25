@@ -14,4 +14,8 @@ export class InMemoryMediationStore {
   list(): MediationCase[] {
     return [...this.cases.values()];
   }
+
+  clear(): void {
+    this.cases.clear();
+  }
 }

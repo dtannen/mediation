@@ -5,8 +5,33 @@ Date: 2026-02-25
 Codebase: `/Users/dtannen/Code/mediation`
 Source baseline for reuse: `/Users/dtannen/Code/commands-com-agent`
 Gateway reference: `/Users/dtannen/Code/commands-com-api-gateway`
+Authoritative implementation baseline for this specification: `src/` (**`dist/` is non-authoritative and may be stale**).
 
 ---
+
+## 0. Implementation Boundary and Status Legend
+
+This document contains both **currently implemented scaffold contracts** and **target architecture contracts**.
+
+- **CURRENT (implemented in `src/`)**
+  - Domain types (`src/domain/types.ts`)
+  - Domain service/orchestration (`src/app/mediation-service.ts`)
+  - Phase guards (`src/engine/phase-engine.ts`)
+  - Consent enforcement (`src/policy/consent.ts`)
+  - In-memory case storage (`src/store/in-memory-store.ts`)
+  - Transport adapter **interfaces only** (`src/transport/contracts.ts`)
+
+- **TARGET (future scope, not yet implemented in `src/`)**
+  - Desktop/Electron UI and IPC layers
+  - Auth/OAuth runtime
+  - E2EE handshake/session transport
+  - Gateway runtime integrations
+  - Persistent encrypted storage/history
+  - Real provider/LLM adapter implementations
+  - Room/plugin runtime and external interface stack
+  - Full observability/audit pipeline
+
+When a section is target-only, it is explicitly marked as such.
 
 ## 1. Product Goal
 
@@ -77,12 +102,13 @@ const ALLOWED_TRANSITIONS: Record<MediationPhase, Set<MediationPhase>> = {
 
 ### 4.3 Transition Guards
 
-| From | To | Guard |
+| From | To | Guard (current implementation) |
 |---|---|---|
 | `awaiting_join` | `private_intake` | All parties have `state === 'joined'` or `state === 'ready'` |
 | `private_intake` | `group_chat` | All parties have `state === 'ready'` AND `privateIntakeByPartyId[partyId].resolved === true` AND `summary.trim().length > 0` |
-| `group_chat` | `resolved` | Resolution text accepted and stored |
-| any non-terminal | `closed` | Always allowed (no reason required) |
+| `group_chat` | `resolved` | No additional guard in `validateTransition`; edge is allowed by `ALLOWED_TRANSITIONS`. `resolveCase()` enforces `group_chat` phase, performs transition, then stores `resolution.trim()`. |
+| `resolved` | `closed` | No additional guard in `validateTransition`; edge is allowed by `ALLOWED_TRANSITIONS`. |
+| `awaiting_join` / `private_intake` / `group_chat` | `closed` | Allowed by `ALLOWED_TRANSITIONS` (no additional guard logic in `validateTransition`). |
 
 ### 4.4 Participation States
 
@@ -126,23 +152,26 @@ Flow:
 
 1. Party creates a coach draft with initial message text. Status: `composing`.
 2. Multi-turn private conversation between party and coach (author: `'party'` | `'party_llm'`).
-3. Coach provides a suggested final draft. Status transitions to `pending_approval`, `suggestedText` is set.
-4. Party can continue iterating after seeing a suggested draft: appending a party message moves status back to `composing` and clears `suggestedText`.
-5. Party approves: status becomes `approved`, `approvedText` and `sentMessageId` are set, message posted to group with `deliveryMode: 'coach_approved'`.
-6. Party rejects: status becomes `rejected`, optional `rejectionReason` stored.
+3. Coach provides a suggested final draft via `setCoachDraftSuggestion`: a compose message is appended with `author: 'party_llm'`, `suggestedText` is set, and status transitions to `pending_approval`.
+4. Party can continue iterating after seeing a suggested draft: appending a party compose message while status is `pending_approval` moves status back to `composing` and clears `suggestedText`.
+5. Party approves via `approveCoachDraftAndSend`: status becomes `approved`, `approvedText`, `approvedAt`, and `sentMessageId` are set; a group message is posted with `deliveryMode: 'coach_approved'`, `tags: ['coach_draft']`, and `sourceDraftId` set to the draft ID.
+6. Party rejects via `rejectCoachDraft`: status becomes `rejected`, `rejectedAt` is set, and optional `rejectionReason` is stored as trimmed text (or omitted).
 7. Direct send remains available for every turn (bypasses draft entirely).
 
-### 5.5 Media Content Policy (v1)
+### 5.5 Media Content Policy (TARGET architecture; not currently implemented in `src/`)
 
-**External images are blocked.** Markdown image syntax `![alt](url)` is replaced with a blocked indicator span. This is a deliberate security control inherited from the source baseline:
+Implementation status: **TARGET**. The current scaffold has no markdown rendering/sanitization module yet.
 
+Planned control model:
+
+- External images are blocked.
 - Marked.js custom renderer replaces all `image()` calls with `<span class="md-image-blocked" title="External images blocked">[blocked]</span>`.
 - HTML sanitizer removes `<img>`, `<script>`, `<iframe>`, `<embed>`, `<form>`, `<style>`, `<link>`, `<base>`, `<meta>` tags.
 - Only `https:` and `mailto:` URI schemes are allowed in links; all others are blocked with `#blocked:` prefix.
 - All `on*` event handler attributes are stripped.
 - `javascript:`, `data:`, `vbscript:` URI schemes are blocked on `href`, `src`, `action` attributes.
 
-**Future scope:** If image support is required, it must define a safe fetch/proxy model, content-type validation, size limits, and CSP controls before enabling.
+Future scope: if image support is required, define safe fetch/proxy model, content-type validation, size limits, and CSP controls before enabling.
 
 ## 6. Functional Requirements
 
@@ -150,8 +179,8 @@ Flow:
 
 1. Case requires topic (non-empty string) and 2+ parties.
 2. Each party must have `id`, `displayName`, and `localLLM` (provider + model).
-3. Invite token is a UUID v4 (or crypto-random equivalent).
-4. Invite URL is generated from `inviteBaseUrl` + token.
+3. Invite token is generated by internal helper `makeId('invite')` (timestamp + random suffix; not UUID v4 in current implementation).
+4. Invite URL is generated as: `${inviteBaseUrl}?caseId=${encodeURIComponent(caseId)}&token=${encodeURIComponent(inviteToken)}`. Default `inviteBaseUrl` is `https://mediation.local/join` when omitted.
 5. Invite token is validated on join (exact match).
 6. Case starts in `awaiting_join`.
 
@@ -180,11 +209,24 @@ Flow:
 3. Mediator keeps neutrality and process discipline through active questioning.
 4. Mediator asks follow-up and clarifying questions to identify overlap, constraints, and option sets.
 
+### 6.4.1 Messaging Method Semantics (normative, current implementation)
+
+| Method | Preconditions / Guards | Message & state effects | Method-specific error conditions |
+|---|---|---|---|
+| `sendDirectGroupMessage(caseId, partyId, text, tags?)` | Requires `phase === 'group_chat'` and `partyId` exists in `mediationCase.parties`; `text.trim()` must be non-empty | Appends a `ThreadMessage` via `makeMessage('party', finalText, 'group', partyId, tags, { deliveryMode: 'direct' })`.<br>Resulting message has `authorType: 'party'`, `visibility: 'group'`, `deliveryMode: 'direct'`, and no `sourceDraftId`. | `invalid_phase`, `party_not_found`, `invalid_group_message` |
+| `createCoachDraft(caseId, partyId, initialPartyMessage)` | Requires `phase === 'group_chat'`; party must exist; `initialPartyMessage.trim()` non-empty | Creates `GroupMessageDraft` with `status: 'composing'` and initial compose message `{ author: 'party', text: trimmedInitial }`; stores at `groupChat.draftsById[draft.id]`. | `invalid_phase`, `party_not_found`, `invalid_intent` |
+| `appendCoachDraftMessage(caseId, draftId, author, text)` | Requires `phase === 'group_chat'`; draft must exist; draft must not be `approved` or `rejected`; `text.trim()` non-empty | Appends compose message with supplied `author` and trimmed text. If `author === 'party'` and prior status was `pending_approval`, status is reset to `composing` and `suggestedText` is cleared (`undefined`). | `invalid_phase`, `draft_not_found`, `draft_closed`, `invalid_compose_message` |
+| `setCoachDraftSuggestion(caseId, draftId, suggestedText)` | Requires `phase === 'group_chat'`; draft must exist; draft must not be `approved` or `rejected`; `suggestedText.trim()` non-empty | Appends compose message `{ author: 'party_llm', text: finalSuggestion }`, sets `draft.suggestedText = finalSuggestion`, and sets `draft.status = 'pending_approval'`. | `invalid_phase`, `draft_not_found`, `draft_closed`, `invalid_suggested_text` |
+| `approveCoachDraftAndSend(caseId, draftId, approvedText?)` | Requires `phase === 'group_chat'`; draft must exist; draft status must be exactly `pending_approval`; final text computed as `(approvedText || draft.suggestedText || '').trim()` must be non-empty | Sets draft fields: `status = 'approved'`, `approvedText`, `approvedAt`, `updatedAt`.<br>Appends group message via `makeMessage('party', finalText, 'group', draft.partyId, ['coach_draft'], { deliveryMode: 'coach_approved', sourceDraftId: draft.id })` and stores `draft.sentMessageId` to that message ID. | `invalid_phase`, `draft_not_found`, `draft_not_pending`, `invalid_approved_text` |
+| `rejectCoachDraft(caseId, draftId, reason?)` | Requires `phase === 'group_chat'`; draft must exist; draft must not be `approved` or `rejected` | Sets `status = 'rejected'`, sets `rejectedAt`, and stores `rejectionReason = (reason || '').trim() || undefined`. | `invalid_phase`, `draft_not_found`, `draft_closed` |
+| `appendGroupMessage(input)` | Requires `phase === 'group_chat'`.<br>If `input.authorType === 'party'`: `input.partyId` is required and method delegates to `sendDirectGroupMessage`.<br>If non-party author type: no partyId requirement and no trim/empty validation on text in current implementation. | Party-author path results in same message semantics as `sendDirectGroupMessage` (`deliveryMode: 'direct'`).<br>Non-party path appends via `makeMessage(input.authorType, input.text, 'group', input.partyId, input.tags ?? [], { deliveryMode: 'system' })` with `visibility: 'group'`, `deliveryMode: 'system'`, and no `sourceDraftId`. | Always: `invalid_phase`.<br>Party-author delegated path may also throw `missing_party`, `party_not_found`, `invalid_group_message`. |
+
 ### 6.5 Resolution
 
-1. `resolveCase` transitions from `group_chat` to `resolved` and stores resolution text.
-2. `closeCase` can close from any non-terminal phase.
-3. Full message timeline serves as audit trail.
+1. `resolveCase` is only valid during `group_chat`; it transitions to `resolved` and then stores `resolution.trim()`.
+2. Current implementation does not enforce non-empty resolution text before storing.
+3. `closeCase` can close from any non-terminal phase.
+4. Full message timeline serves as audit trail.
 
 ## 7. Data Model (Normative TypeScript)
 
@@ -334,24 +376,103 @@ Per party:
 | Field | Type | Effect |
 |---|---|---|
 | `allowSummaryShare` | `boolean` | If `false`, mediator receives no summary for that party |
-| `allowDirectQuote` | `boolean` | If `false`, summary is paraphrased (first 36 words + ellipsis) |
-| `allowedTags` | `string[]` | Only messages with matching tags are shareable. Empty = all allowed |
+| `allowDirectQuote` | `boolean` | If `false`, summary text is paraphrased using first-36-word truncation semantics |
+| `allowedTags` | `string[]` | Only messages with matching tags are shareable. Empty = all tags allowed |
 
-### 8.2 Enforcement Rules (normative)
+### 8.2 Enforcement Rules (normative, exact current implementation)
 
-Implemented in `src/policy/consent.ts` → `enforceShareGrant()`:
+Implemented in `src/policy/consent.ts`:
 
-1. If `allowSummaryShare === false`: returns `{ allowed: false, text: '', reason }`.
-2. If candidate tags are not all in `allowedTags` (when non-empty): returns `{ allowed: false, text: '', reason }`.
-3. If `allowDirectQuote === true`: returns `{ allowed: true, text: <original> }`.
-4. If `allowDirectQuote === false`: returns `{ allowed: true, text: <paraphrased> }` where paraphrase is first 36 words with ellipsis.
+```typescript
+interface ShareCandidate {
+  partyId: string;
+  text: string;
+  tags: string[];
+}
 
-### 8.3 Consent in Group Opening
+interface ShareResult {
+  allowed: boolean;
+  text: string;
+  reason?: string;
+}
 
-During `emitMediatorOpenMessages`:
-- Each party's summary is passed through `enforceShareGrant()`.
-- If sharing is disallowed, mediator introduction states: `"[partyName]: summary remains private and was not shared."`.
-- If sharing is allowed, mediator uses the (possibly paraphrased) text.
+function allTagsAllowed(candidateTags: string[], allowedTags: string[]): boolean {
+  if (allowedTags.length === 0) {
+    return true;
+  }
+  const allowSet = new Set(allowedTags.map((tag) => tag.trim()).filter(Boolean));
+  return candidateTags.every((tag) => allowSet.has(tag));
+}
+
+function toParaphrasedSummary(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+  const words = normalized.split(' ');
+  const clipped = words.slice(0, 36).join(' ');
+  return words.length > 36 ? `${clipped}...` : clipped;
+}
+
+function enforceShareGrant(grant: ConsentGrant, candidate: ShareCandidate): ShareResult {
+  if (!grant.allowSummaryShare) {
+    return {
+      allowed: false,
+      text: '',
+      reason: `party '${candidate.partyId}' disallowed sharing from private intake`,
+    };
+  }
+
+  if (!allTagsAllowed(candidate.tags, grant.allowedTags)) {
+    return {
+      allowed: false,
+      text: '',
+      reason: `party '${candidate.partyId}' disallowed one or more content tags`,
+    };
+  }
+
+  if (grant.allowDirectQuote) {
+    return {
+      allowed: true,
+      text: candidate.text,
+    };
+  }
+
+  return {
+    allowed: true,
+    text: toParaphrasedSummary(candidate.text),
+  };
+}
+```
+
+Normative behavior summary:
+1. Deny when `allowSummaryShare === false`.
+2. Deny when candidate tags are not allowed by `allowedTags` (with `allowedTags` normalized by trimming and filtering empty entries; candidate tags are checked as-provided).
+3. If `allowDirectQuote === true`, return original `candidate.text` unchanged.
+4. If `allowDirectQuote === false`, return paraphrased text:
+   - collapse whitespace,
+   - take first 36 words,
+   - append `...` **only when** source text exceeds 36 words,
+   - return empty string when normalized input is empty.
+
+### 8.3 Consent in Group Opening (`emitMediatorOpenMessages`)
+
+Current implementation behavior:
+
+```typescript
+const shareResult = enforceShareGrant(grant, {
+  partyId: party.id,
+  text: thread.summary,
+  tags: ['summary'],
+});
+```
+
+- If `shareResult.allowed === false`, mediator intro line is:
+  - `${party.displayName}: summary remains private and was not shared.`
+- If `shareResult.allowed === true`, mediator intro line is:
+  - `${party.displayName} coach summary: ${shareResult.text}`
+
+This ensures private intake summaries are only introduced into group context via explicit consent filtering.
 
 ## 9. Service/API Contract
 
@@ -369,16 +490,17 @@ All operations are methods on `MediationService` (`src/app/mediation-service.ts`
 | 6 | `appendPrivateMessage` | `(input: AppendMessageInput)` | `MediationCase` |
 | 7 | `setPrivateSummary` | `(caseId: string, partyId: string, summary: string, resolved?: boolean)` | `MediationCase` |
 | 8 | `setPartyReady` | `(caseId: string, partyId: string)` | `MediationCase` |
-| 9 | `sendDirectGroupMessage` | `(caseId: string, partyId: string, text: string, tags?: string[])` | `MediationCase` |
-| 10 | `createCoachDraft` | `(caseId: string, partyId: string, initialPartyMessage: string)` | `GroupMessageDraft` |
-| 11 | `appendCoachDraftMessage` | `(caseId: string, draftId: string, author: CoachComposeAuthor, text: string)` | `MediationCase` |
-| 12 | `setCoachDraftSuggestion` | `(caseId: string, draftId: string, suggestedText: string)` | `MediationCase` |
-| 13 | `approveCoachDraftAndSend` | `(caseId: string, draftId: string, approvedText?: string)` | `MediationCase` |
-| 14 | `rejectCoachDraft` | `(caseId: string, draftId: string, reason?: string)` | `MediationCase` |
-| 15 | `appendGroupMessage` | `(input: AppendMessageInput)` | `MediationCase` |
-| 16 | `setMediatorSummary` | `(caseId: string, summary: string)` | `MediationCase` |
-| 17 | `resolveCase` | `(caseId: string, resolution: string)` | `MediationCase` |
-| 18 | `closeCase` | `(caseId: string)` | `MediationCase` |
+| 9 | `transition` | `(caseId: string, targetPhase: MediationPhase)` | `MediationCase` |
+| 10 | `sendDirectGroupMessage` | `(caseId: string, partyId: string, text: string, tags?: string[])` | `MediationCase` |
+| 11 | `createCoachDraft` | `(caseId: string, partyId: string, initialPartyMessage: string)` | `GroupMessageDraft` |
+| 12 | `appendCoachDraftMessage` | `(caseId: string, draftId: string, author: CoachComposeAuthor, text: string)` | `MediationCase` |
+| 13 | `setCoachDraftSuggestion` | `(caseId: string, draftId: string, suggestedText: string)` | `MediationCase` |
+| 14 | `approveCoachDraftAndSend` | `(caseId: string, draftId: string, approvedText?: string)` | `MediationCase` |
+| 15 | `rejectCoachDraft` | `(caseId: string, draftId: string, reason?: string)` | `MediationCase` |
+| 16 | `appendGroupMessage` | `(input: AppendMessageInput)` | `MediationCase` |
+| 17 | `setMediatorSummary` | `(caseId: string, summary: string)` | `MediationCase` |
+| 18 | `resolveCase` | `(caseId: string, resolution: string)` | `MediationCase` |
+| 19 | `closeCase` | `(caseId: string)` | `MediationCase` |
 
 ### 9.2 Error Contract
 
@@ -401,28 +523,28 @@ class DomainError extends Error {
 | `missing_consent` | `createCase` | Missing consent policy for a party |
 | `case_not_found` | `getCase` | Case ID does not exist |
 | `invalid_invite_token` | `joinWithInvite` | Token does not match case invite |
-| `party_not_found` | join, intake, draft, summary | Party ID not in case |
+| `party_not_found` | join, intake, summary, and group operations | Party ID not in case |
 | `party_not_joined` | intake, ready | Party must join before this action |
-| `invalid_phase` | intake, ready, summary | Operation not valid in current phase |
+| `invalid_phase` | private/group operations and ready/summary transitions | Operation not valid in current phase |
 | `missing_private_summary` | `setPartyReady` | Summary must be resolved before ready |
 | `invalid_transition` | `transition` | Phase transition not allowed |
 | `invalid_group_message` | `sendDirectGroupMessage` | Empty message text |
 | `draft_not_found` | draft operations | Draft ID not found |
-| `draft_closed` | `appendCoachDraftMessage`, etc. | Draft already approved/rejected |
+| `draft_closed` | `appendCoachDraftMessage`, `setCoachDraftSuggestion`, `rejectCoachDraft` | Draft already approved/rejected |
 | `draft_not_pending` | `approveCoachDraftAndSend` | Draft not in `pending_approval` state |
 | `invalid_intent` | `createCoachDraft` | Empty initial message |
 | `invalid_compose_message` | `appendCoachDraftMessage` | Empty compose message |
 | `invalid_suggested_text` | `setCoachDraftSuggestion` | Empty suggestion |
 | `invalid_approved_text` | `approveCoachDraftAndSend` | Empty approved text |
-| `missing_party` | `appendGroupMessage` | `partyId` required for party messages |
+| `missing_party` | `appendPrivateMessage`, `appendGroupMessage` (when `authorType === 'party'`) | `partyId` required |
 
-**Error precedence per operation:** Errors are checked in order: input validation (topic, party count, duplicates, consent) → existence checks (case, party) → state checks (phase, join status) → business rules (summary, draft status).
+**Error precedence:** Error-check order is method-specific and follows each method’s control flow in `src/app/mediation-service.ts`. Consumers should not assume one global precedence order across all operations.
 
-### 9.3 IPC Error Contract (Desktop Layer)
+### 9.3 IPC Error Contract (Desktop Layer — TARGET, not currently implemented in `src/`)
 
-When the mediation app adds a desktop/Electron layer, IPC channels MUST follow the per-channel error shape conventions documented below. This reflects the actual implementation patterns in the source baseline.
+This section defines the **target desktop IPC boundary contract**. The current scaffold does not include a desktop/Electron runtime yet.
 
-**Normative v1 per-channel shapes:**
+Normative v1 target shapes:
 
 | IPC Layer | Error Shape | Example |
 |---|---|---|
@@ -432,7 +554,7 @@ When the mediation app adds a desktop/Electron layer, IPC channels MUST follow t
 | Gateway general IPC | `{ ok: false, error: string }` | `{ ok: false, error: 'Invalid deviceId' }` |
 | Auth IPC | `{ ok: false, error: string }` | `{ ok: false, error: 'Sign in failed' }` |
 
-**Migration target (v2):** All channels SHOULD converge to the structured shape:
+Migration target (v2):
 
 ```typescript
 interface IpcError {
@@ -447,13 +569,18 @@ interface IpcError {
 type IpcResult<T> = { ok: true } & T | { ok: false; error: IpcError };
 ```
 
-**Migration steps:**
+Migration steps:
 1. Add `normalizeIpcError(err)` utility that coerces string errors into `{ code: 'unknown', message: err, recoverable: true }`.
 2. Wrap all IPC handlers with the normalizer at the boundary.
 3. Update renderer to accept both shapes during migration window.
 4. Remove legacy string-error paths after all handlers are migrated.
 
 ## 10. Transport Contracts (LLM Adapters)
+
+Implementation status:
+- **CURRENT**: interface contracts in `src/transport/contracts.ts` (Sections 10.1–10.3).
+- **TARGET**: concrete adapter implementations (local coach provider, mediator provider, gateway runtime wiring) are not yet implemented in `src/`.
+- **TARGET**: Section 10.4 local prompt bridge reuse contract is future integration work.
 
 ### 10.1 Coach LLM Adapter
 
@@ -527,7 +654,7 @@ interface GatewayGroupMessageAdapter {
 }
 ```
 
-### 10.4 Local Prompt Bridge Reuse
+### 10.4 Local Prompt Bridge Reuse (TARGET, not currently implemented in `src/`)
 
 Reused from `src/local-prompt-bridge.ts` (ADAPT mode). Key frame protocol:
 
@@ -591,7 +718,9 @@ Reused from `src/local-prompt-bridge.ts` (ADAPT mode). Key frame protocol:
 
 **Error recovery:** On `status: "error"`, the `code` field provides a machine-readable error category (e.g., `"provider_error"`, `"timeout"`, `"invalid_request"`). The `reason` field provides a human-readable description. The caller can use `resume_session_id` on the next request to resume from the last successful provider state.
 
-## 11. Security and Trust Invariants
+## 11. Security and Trust Invariants (TARGET architecture; not fully implemented in current `src/` scaffold)
+
+This section defines target security/runtime controls for planned desktop/runtime layers. The current scaffold only implements domain-level consent checks and in-memory state transitions.
 
 ### 11.1 Inherited Mandatory Controls
 
@@ -600,15 +729,14 @@ Reused from `src/local-prompt-bridge.ts` (ADAPT mode). Key frame protocol:
 3. Untrusted origins fail closed.
 4. Invalid auth fails closed.
 5. Replay/correlation checks on transport are mandatory.
-6. Logs are append-only. **Current state:** Source baseline (`src/runtime.ts`, `src/audit.ts`) writes prompts and requester metadata in plaintext. Redaction is a **v2 requirement** — v1 implementations MUST NOT assume logs are redacted. v2 work items: (a) define redaction rules for PII and prompt content, (b) implement `redactAuditEntry()` filter, (c) add tests for redaction completeness.
+6. Logs are append-only. **Current state in source baseline:** (`src/runtime.ts`, `src/audit.ts`) writes prompts and requester metadata in plaintext. Redaction is a **v2 requirement** — v1 implementations MUST NOT assume logs are redacted. v2 work items: (a) define redaction rules for PII and prompt content, (b) implement `redactAuditEntry()` filter, (c) add tests for redaction completeness.
 7. Consent violations block unsafe sharing.
 
-### 11.2 Gateway Host Allowlist (v1 Normative)
+### 11.2 Gateway Host Allowlist (v1 Normative Target)
 
-Gateway connections use a **hardcoded trusted-origin allowlist**. This is the actual v1 behavior, not configurable self-host:
+Gateway connections use a hardcoded trusted-origin allowlist in the target desktop runtime:
 
 ```typescript
-// Normative v1 allowlist (from desktop/lib/trusted-origins.js):
 const TRUSTED_ORIGINS = new Set([
   'https://api.commands.com',
   'http://localhost:8091',
@@ -616,58 +744,37 @@ const TRUSTED_ORIGINS = new Set([
 ]);
 ```
 
-**Behavior:**
-- `validateTrustedOrigin(url)`: Throws if URL origin is not in the trusted set.
-- HTTPS is enforced for non-localhost origins (HTTP only for `localhost`/`127.0.0.1`).
-- `normalizeTrustedUrl(value, fallbackUrl)`: Returns normalized URL if trusted, falls back to default otherwise.
-- All gateway client operations call `validateTrustedOrigin()` before any network request.
+Behavior:
+- `validateTrustedOrigin(url)`: throws if URL origin not trusted.
+- HTTPS enforced for non-localhost origins.
+- `normalizeTrustedUrl(value, fallbackUrl)`: returns trusted normalized URL or fallback.
+- Desktop-side gateway operations call `validateTrustedOrigin()` before outbound requests.
 
-**Gateway URL resolution — two distinct paths:**
+Mediation requirement (target runtime hardening): add `validateTrustedOrigin()` enforcement in agent runtime gateway client (`src/transport/gateway-client.ts`) before outbound network requests.
 
-**Path 1: Desktop IPC / Gateway Client** (used by auth service, session manager, interfaces service):
-1. Auth service maintains `_gatewayUrl` state, initialized to `DEFAULT_GATEWAY_URL`.
-2. On sign-in, the gateway URL can be overridden if explicitly provided and trusted.
-3. On config fallback load, uses `normalizeTrustedUrl(config.gatewayUrl, DEFAULT_GATEWAY_URL)`.
-4. `getGatewayUrl()` always returns the current state normalized through `normalizeTrustedUrl()`.
-5. All desktop-side gateway operations call `getGatewayUrl()` from the auth service.
-
-**Path 2: Spawned Agent Runtime** (used when launching agent CLI processes):
-1. `getCredentialsForAgent()` returns `{ gatewayUrl, accessToken, refreshToken, ... }`.
-2. These credentials are synced into the agent's `config.json` before spawn.
-3. The agent runtime reads `config.gatewayUrl` from its own config file.
-4. **Current state:** The source baseline agent runtime (`src/config.ts`, `src/gateway.ts`, `src/oauth.ts`) does NOT independently enforce `validateTrustedOrigin()`. It trusts whatever gateway URL is provided in its config. The desktop process pre-validates the URL before writing it to config, so in practice only trusted URLs reach the agent — but the agent itself has no runtime guard.
-
-**Security invariant (desktop path only):** The desktop IPC / gateway client path enforces `validateTrustedOrigin()` on all network requests. The spawned agent runtime relies on the desktop process to supply only pre-validated URLs.
-
-**Mediation implementation requirement:** The mediation app MUST add `validateTrustedOrigin()` enforcement in the agent runtime's gateway client (`src/transport/gateway-client.ts`) before any outbound network request, to close this defense-in-depth gap. This is a normative v1 requirement for the mediation codebase even though the source baseline lacks it.
-
-**Future scope:** To enable self-hosted gateways, the allowlist must be made configurable via signed config or admin-only settings, with certificate pinning and origin verification tests.
-
-### 11.3 E2EE Session Protocol
+### 11.3 E2EE Session Protocol (TARGET)
 
 Reused from `src/crypto.ts` + `src/handshake.ts` (ADAPT mode):
 
-- **Key exchange:** Ed25519 identity keys + X25519 ephemeral keys per session.
-- **Encryption:** AES-256-GCM with deterministic nonce = `direction_prefix(4 bytes) || sequence_number(8 bytes BE)`.
-- **Direction prefixes:** `c2a\0` (`0x63 0x32 0x61 0x00`, client-to-agent), `a2c\0` (`0x61 0x32 0x63 0x00`, agent-to-client).
-- **Nonce construction:** `Buffer.alloc(12)` → copy 4-byte direction prefix at offset 0 → `writeBigUInt64BE(seq, 4)`. Total: 12 bytes (GCM nonce size).
-- **Sequence numbers:** Must be positive integers starting at 1 (not 0). `validateSeq()` rejects `seq <= 0`.
-- **Key derivation:** HKDF-SHA256 with salt from transcript hash of handshake parameters.
-- **Replay protection:** Strict monotonic sequence numbers; out-of-order frames rejected.
-- **Key zeroing:** Session keys are explicitly zeroed on session end.
+- Key exchange: Ed25519 identity keys + X25519 ephemeral keys.
+- Encryption: AES-256-GCM with nonce = 4-byte direction prefix + 8-byte BE sequence.
+- Direction prefixes: `c2a\0` and `a2c\0`.
+- Sequence numbers: positive integers starting at 1.
+- Replay protection: strict monotonic sequence enforcement.
+- Session key zeroing on cleanup.
 
-### 11.4 Markdown Sanitization
+### 11.4 Markdown Sanitization (TARGET)
 
-Defense-in-depth with two layers:
+Planned defense-in-depth:
 
-1. **Marked.js custom renderer:** Blocks images, escapes raw HTML in markdown.
-2. **DOMParser sanitizer:** Removes dangerous tags (`script`, `iframe`, `object`, `embed`, `form`, `style`, `link`, `base`, `meta`, `img`), strips event handlers, blocks dangerous URI schemes.
+1. Marked.js custom renderer blocks images and escapes raw HTML.
+2. DOMParser sanitizer removes dangerous tags, strips event handlers, blocks dangerous URI schemes.
 
 ## 12. Storage Model (v1)
 
-### 12.1 Case Storage
+### 12.1 Case Storage (CURRENT)
 
-v1 uses an in-memory store:
+v1 scaffold uses an in-memory store:
 
 ```typescript
 class InMemoryMediationStore {
@@ -678,51 +785,43 @@ class InMemoryMediationStore {
 }
 ```
 
-**v1 limitations:**
+Current limitations:
 - All case state is volatile; lost on process restart.
 - No encryption-at-rest.
 - No persistence to disk or database.
 
-### 12.2 Chat/Session Persistence (v1 Scope)
+### 12.2 Chat/Session Persistence (TARGET architecture; not currently implemented in `src/`)
 
-**v1: In-memory only.** Chat messages, session state, and conversation IDs are stored in Maps and are lost on app restart. This matches the source baseline behavior:
+Target v1 behavior (when runtime layer is added): in-memory-only sessions/messages with no durable persistence.
 
-- Sessions stored in `Map<deviceId, session>` (volatile).
-- Conversation IDs tracked in `Map<deviceId, conversationId>` (volatile).
-- Session keys zeroed on cleanup.
-- Max 20 concurrent sessions.
-- No file or database persistence in v1.
+Future scope (v2): durable encrypted local history:
+1. Storage path: `~/.mediation/cases/{caseId}/` with `case.enc` + `messages.enc`.
+2. Keying: per-case AES-256-GCM key via HKDF from user credential.
+3. Retention: configurable TTL (default 90 days).
+4. Migration: version header in encrypted blobs.
+5. Tests: round-trip, key rotation, TTL expiry, corrupt-file recovery.
 
-**Future scope (v2):** Durable encrypted local history requires:
-1. Storage path: `~/.mediation/cases/{caseId}/` with `case.enc` + `messages.enc` files.
-2. Keying: Per-case AES-256-GCM key derived from user credential via HKDF.
-3. Retention: Configurable TTL per case (default 90 days).
-4. Migration: Store version header in encrypted blob; version-aware loader.
-5. Tests: Round-trip encrypt/decrypt, key rotation, TTL expiry, corrupt-file recovery.
+### 12.3 Credential Persistence (TARGET architecture; not currently implemented in `src/`)
 
-### 12.3 Credential Persistence
+Planned reuse from `desktop/lib/credentials.js`:
 
-Reused AS_IS from `desktop/lib/credentials.js`:
+- Sensitive fields extracted from config and encrypted via Electron `safeStorage.encryptString()`.
+- Written to `credentials.enc` with `0o600` permissions on Unix.
+- `config.json` redacted with `_credentialsSecured: true`.
+- Profile support via `profileId`.
 
-- Sensitive fields (`deviceToken`, `refreshToken`, identity private keys) extracted from config.
-- Encrypted via Electron `safeStorage.encryptString()`.
-- Written to `credentials.enc` with file permissions `0o600` on Unix.
-- Config.json is redacted with `_credentialsSecured: true` flag.
-- Profile support via `profileId` parameter.
-
-## 13. External Interface Provider (v1: Slack Only)
+## 13. External Interface Provider (TARGET v1 architecture: Slack only; not currently implemented in `src/`)
 
 ### 13.1 Scope
 
-v1 supports **Slack as the only external interface provider**. The implementation is Slack-specific throughout:
+Target v1 external interface scope is Slack-only:
 
-- IPC channel: `INTERFACES_CREATE_SLACK` (not generic create).
-- Gateway route creation requires `interface_type: 'slack'` (gateway rejects all others).
-- Token auth mode must be `'path'` for Slack routes.
-- Slack-specific operations: signature verification (HMAC-SHA256), bot token posting, message purge.
-- Secret storage: Slack signing secret + bot token per interface.
+- IPC channel: `INTERFACES_CREATE_SLACK`.
+- Gateway route creation uses `interface_type: 'slack'`.
+- Token auth mode `'path'`.
+- Slack-specific signature verification/posting/purge behavior.
 
-### 13.2 Slack Integration Architecture
+### 13.2 Slack Integration Architecture (TARGET)
 
 ```
 Party Device <-> Desktop App (tunnel client)
@@ -734,11 +833,11 @@ Party Device <-> Desktop App (tunnel client)
               Slack API
 ```
 
-### 13.3 Gateway Integration Route API
+### 13.3 Gateway Integration Route API (TARGET)
 
 **POST `/gateway/v1/integrations/routes`** - Create integration route
 
-Request (snake_case, all fields):
+Request (snake_case):
 ```json
 {
   "interface_type": "slack",
@@ -773,102 +872,61 @@ Response (201):
 }
 ```
 
-**PUT `/gateway/v1/integrations/routes/:route_id`** - Update route
+Other target endpoints:
+- `PUT /gateway/v1/integrations/routes/:route_id`
+- `DELETE /gateway/v1/integrations/routes/:route_id`
+- `POST /gateway/v1/integrations/routes/:route_id/rotate-token`
 
-Request fields (all optional): `deadline_ms`, `max_body_bytes`, `token_auth_mode`, `status`, `device_id`.
-
-**DELETE `/gateway/v1/integrations/routes/:route_id`** - Delete route
-
-**POST `/gateway/v1/integrations/routes/:route_id/rotate-token`** - Rotate token
-
-Request: `{ "grace_seconds": <0..1800> }` (optional; bounds enforced by gateway, 0 = immediate rotation)
-
-**Gateway integration error shape:**
+Gateway integration error shape:
 ```json
 {
   "error": {
     "code": "string",
     "message": "string",
-    "details": { }
+    "details": {}
   }
 }
 ```
 
-Error codes:
+### 13.4 Tunnel Protocol (TARGET)
 
-| Code | HTTP Status | Endpoint(s) | Meaning |
-|---|---|---|---|
-| `unauthorized` | 401 | all | Missing or invalid auth token |
-| `invalid_request` | 400 | all | Malformed request body or invalid field values |
-| `forbidden` | 403 | all | Authenticated but not authorized for this resource |
-| `route_not_found` | 404 | PUT/DELETE routes, rotate-token | Route ID does not exist or is not owned by caller |
-| `token_validation_failed` | 422 | POST create | Route token format/length validation failed |
-| `invalid_route_update` | 400 | PUT routes | Invalid status value (e.g., `"active"` which can only be set via tunnel activation) |
-| `deletion_failed` | 500 | DELETE routes | Route storage deletion failed; route may still be active — client should retry |
-| `internal_error` | 500 | all | Unrecoverable server error |
+Client → Gateway frames:
+- `tunnel.activate`
+- `tunnel.deactivate`
+- `tunnel.response`
 
-Clients MUST handle unknown error codes defensively (treat any unrecognized code as a retriable error with the returned HTTP status).
+Gateway → Client frames:
+- `tunnel.connected`
+- `tunnel.activate.result`
+- `tunnel.deactivate.result`
+- `tunnel.request`
+- `tunnel.route_deactivated`
+- `tunnel.error`
 
-### 13.4 Tunnel Protocol (WebSocket JSON Frames)
-
-**Client → Gateway frames:**
-
-| Frame Type | Fields |
-|---|---|
-| `tunnel.activate` | `routes: [{ route_id }]` or `routes: ["route_id_string"]`, optional `request_id` |
-| `tunnel.deactivate` | `routes: [{ route_id }]`, optional `request_id` |
-| `tunnel.response` | `request_id`, `status` (int), `headers` (`[[key, value], ...]`), `body_base64` (base64-encoded body) |
-
-**Gateway → Client frames:**
-
-| Frame Type | Fields |
-|---|---|
-| `tunnel.connected` | `device_id`, `at` (ISO 8601) |
-| `tunnel.activate.result` | `request_id`, `results: [{ route_id, status, activation?, error? }]` — see below |
-| `tunnel.deactivate.result` | `request_id`, `results: [{ route_id, status, error? }]` — see below |
-| `tunnel.request` | `request_id`, `route_id`, `method`, `scheme`, `host`, `external_url`, `raw_target`, `raw_target_base64`, `path`, `query`, `headers` (`[[key, value], ...]`), `body_base64`, `received_at` (ISO 8601), `deadline_ms` (int) |
-| `tunnel.route_deactivated` | `route_id`, `reason`, `at` (ISO 8601) |
-| `tunnel.error` | `error` (string code: `"invalid_json"`, `"unknown_frame_type"`, etc.) |
-
-**`tunnel.activate.result` per-route result variants:**
-
-| `status` | Meaning | Extra Fields |
-|---|---|---|
-| `"active"` | Route successfully activated | `activation`: `"clean"` (first activation) or `"superseded"` (took over from another tunnel) |
-| `"rejected"` | Activation denied | `error: { code, message }` — codes: `route_not_found`, `route_not_owned`, `device_mismatch`, `token_revoked`, `registration_failed` |
-
-**`tunnel.deactivate.result` per-route result variants:**
-
-| `status` | Meaning | Extra Fields |
-|---|---|---|
-| `"inactive"` | Route successfully deactivated | — |
-| `"rejected"` | Deactivation denied | `error: { code, message }` — code: `route_not_found` (route not active on this tunnel) |
-
-**Important:** The body field is named `body_base64` (not `body`). Response frames use the same `body_base64` field name with base64-encoded content and `status` as an integer HTTP status code.
+`body_base64` is the canonical body field name.
 
 ### 13.5 Future Scope: Generic Provider Plugins
 
-Generic interface-provider plugins are **not implemented in v1**. Future deliverable requires:
-1. Provider plugin contract (register, validate, activate, deactivate).
-2. Provider-agnostic IPC channels replacing Slack-specific ones.
-3. Secret storage abstraction per provider type.
-4. Migration path from Slack-specific to generic.
+Not implemented in target v1; planned for later:
+1. Provider plugin contract.
+2. Provider-agnostic IPC channels.
+3. Secret storage abstraction per provider.
+4. Slack-specific migration path.
 
-## 14. Gateway Session API (Field Reference)
+## 14. Gateway Session API (TARGET architecture; not currently implemented in `src/`)
 
 ### 14.1 Naming Convention
 
-All gateway REST and WebSocket frames use **snake_case** field names. This is normative.
+Target gateway REST/WebSocket frames use snake_case field names.
 
-### 14.2 Session Lifecycle
+### 14.2 Session Lifecycle (TARGET)
 
-**Start session** (desktop → gateway):
+Target flow:
+- Handshake init → poll → SSE subscribe → ready.
+- Send encrypted frame to `POST /gateway/v1/sessions/{session_id}/messages`.
+- Sequence numbers start at 1 and are strictly monotonic.
 
-Handshake init → handshake poll → SSE subscribe → ready.
-
-**Send message** (desktop → gateway):
-
-POST encrypted frame to `POST /gateway/v1/sessions/{session_id}/messages`:
+Message shape:
 ```json
 {
   "type": "session.message",
@@ -886,162 +944,53 @@ POST encrypted frame to `POST /gateway/v1/sessions/{session_id}/messages`:
 }
 ```
 
-**Sequence numbers:** `seq` MUST be a positive integer (≥ 1). The first message in a session uses `seq: 1`. Sequence numbers are strictly monotonically increasing. `seq: 0` is invalid and will be rejected by the crypto layer (`validateSeq()` requires `seq > 0`).
+### 14.3 SSE Event Types (TARGET)
 
-**Decrypted plaintext payload:**
-```json
-{
-  "session_id": "string",
-  "conversation_id": "string",
-  "message_id": "string",
-  "prompt": "string",
-  "origin_agent_device_id": "string (optional)",
-  "trace_id": "string (optional)",
-  "orchestrator_profile_id": "string (optional)",
-  "hop_count": 0
-}
-```
+Guaranteed event classes in target runtime:
+- `session.progress`
+- `session.result`
+- `session.error`
 
-### 14.3 SSE Event Types (gateway → desktop)
+Completion signal: `session.result` or `session.error`.
 
-The gateway emits all session events as SSE event type `session.event`. The client disambiguates based on the decrypted payload content. The three **guaranteed** event types emitted by the agent runtime are:
+### 14.4 Device/Identity API (TARGET)
 
-| Event (payload-derived) | Encrypted | Decrypted Payload Fields | Status |
-|---|---|---|---|
-| `session.progress` | yes | `status: "running"` | **Guaranteed** — emitted during active processing |
-| `session.result` | yes | `result: string`, `message_id`, `conversation_id?`, `turns: number`, `cost_usd: number`, `model: string`, `session_id`, `correlation_id?`, `usage?: { input_tokens, output_tokens }` | **Guaranteed** — emitted on successful completion |
-| `session.error` | yes | `error: string`, `message_id`, `correlation_id?` | **Guaranteed** — emitted on failure |
+- `PUT /gateway/v1/devices/{device_id}/identity-key`
+- `GET /gateway/v1/devices`
 
-**Optional/compatibility events** (NOT guaranteed to be emitted by current agent runtime):
+### 14.5 Share/Invite API (TARGET)
 
-| Event | Encrypted | Notes |
-|---|---|---|
-| `session.ended` | no | Not a guaranteed emitted frame from current agent runtime. Clients MUST treat `session.result` or `session.error` as authoritative session completion signals. |
-| `session.processing` | no | Not a guaranteed emitted frame. Clients SHOULD NOT depend on this for state tracking. |
+Share endpoints and expected payloads are defined for future gateway integration:
+- `POST /gateway/v1/shares/invites`
+- `POST /gateway/v1/shares/invites/accept`
+- `GET /gateway/v1/shares/devices/:device_id/grants`
+- `POST /gateway/v1/shares/grants/:grant_id/revoke`
+- `POST /gateway/v1/shares/grants/:grant_id/leave`
 
-**`session.result` field notes:** The runtime (`src/runtime.ts`) emits `result`, `turns`, `cost_usd`, `model`, `session_id`, `message_id`, and optionally `conversation_id`. The `usage` field (`{ input_tokens, output_tokens }`) is **optional** — it is NOT emitted by the current agent runtime. Desktop consumer logic (`session-manager.js`) treats `usage` as optional. Clients MUST NOT depend on `usage` being present.
+## 15. MCP Configuration (TARGET v1 scope; not currently implemented in `src/`)
 
-**Authoritative completion detection:** A session is complete when either `session.result` or `session.error` is received. Clients MUST NOT wait for `session.ended` as the sole completion signal. The desktop session manager (`session-manager.js`) checks `decrypted.result !== undefined` or `decrypted.error` to determine completion.
+### 15.1 Target v1 Behavior
 
-**Gateway SSE transport:** The gateway relays all events using SSE event name `session.event` with `writeSSEDataWithID()`. The event ID is set when available for resume support.
-
-### 14.4 Device/Identity API
-
-**PUT `/gateway/v1/devices/{device_id}/identity-key`** - Register identity:
-```json
-{
-  "algorithm": "ed25519",
-  "public_key": "<base64 raw 32-byte Ed25519 public key>",
-  "display_name": "string (optional)"
-}
-```
-
-Notes:
-- `algorithm` is optional; defaults to `"ed25519"`. Only `"ed25519"` is supported; other values return HTTP 400.
-- `public_key` is a **raw 32-byte Ed25519 public key** encoded as base64 (NOT SPKI-wrapped). The gateway validates the key via `gatewaycrypto.ValidateEd25519PublicKey()`.
-- `display_name` is optional; if omitted and the device already exists, the existing display name is preserved.
-
-**GET `/gateway/v1/devices`** - List devices:
-```json
-{ "devices": [{ "device_id", "status", "display_name", "last_seen_at" }] }
-```
-
-### 14.5 Share/Invite API
-
-All share endpoints use **camelCase** for request/response fields (exception to the general snake_case convention):
-
-**POST `/gateway/v1/shares/invites`** — Create share invite
-
-Request:
-```json
-{ "deviceId": "string", "email": "string", "grantExpiresAt": 0, "inviteTokenTtlSeconds": 0 }
-```
-- `grantExpiresAt` (optional, unix epoch seconds) — when the grant expires. Must be in the future, max 365 days.
-- `inviteTokenTtlSeconds` (optional) — TTL for the invite token in seconds. Defaults to server-side default if omitted or ≤ 0. Maximum: 7,776,000 (90 days); values exceeding this return HTTP 400.
-
-Response (201):
-```json
-{ "grantId": "gr_<hex>", "status": "pending", "inviteUrl": "string", "inviteTokenExpiresAt": 0, "grantExpiresAt": 0 }
-```
-- Note: No `deviceId` or plaintext `inviteToken` in response. The `inviteUrl` contains the token embedded in the URL.
-- `inviteTokenExpiresAt` is the expiry field (not `inviteExpiresAt`).
-
-**POST `/gateway/v1/shares/invites/accept`** — Accept share invite
-
-Request: `{ "token": "string" }`
-
-Response (200):
-```json
-{ "grantId": "string", "deviceId": "string", "role": "collaborator", "status": "active" }
-```
-
-**GET `/gateway/v1/shares/devices/:device_id/grants`** — List grants for a device
-
-Response (200):
-```json
-{
-  "deviceId": "string",
-  "grants": [{
-    "grantId": "string", "granteeEmail": "string", "granteeUid": "string",
-    "role": "string", "status": "string",
-    "grantExpiresAt": 0, "acceptedAt": 0, "createdAt": 0
-  }]
-}
-```
-- `status` is computed at query time from grant state and expiry (`effectiveShareGrantStatus()`).
-
-**POST `/gateway/v1/shares/grants/:grant_id/revoke`** — Revoke a grant (owner action)
-
-Response (200):
-```json
-{ "grantId": "string", "status": "revoked" }
-```
-- Idempotent: if already revoked, returns the same response shape without error.
-
-**POST `/gateway/v1/shares/grants/:grant_id/leave`** — Leave a grant (grantee action)
-
-Response (200):
-```json
-{ "grantId": "string", "status": "revoked" }
-```
-- Only valid from `active` state. If already revoked, returns the same response shape without error.
-
-**Path parameters:**
-- `:device_id` — the target device identifier (validated via `validateDeviceID()`)
-- `:grant_id` — the share grant identifier
-
-**Grant statuses:** `pending` (invite sent, not accepted), `active` (accepted), `suspended`, `revoked`, `expired` (computed at query time by `effectiveShareGrantStatus()`).
-
-**`expired` computation rules:**
-- A `pending`, `active`, or `suspended` grant becomes `expired` when `grantExpiresAt > 0` and `now > grantExpiresAt`.
-- A `pending` grant (unaccepted invite) also becomes `expired` when `inviteTokenExpiresAt > 0` and `now > inviteTokenExpiresAt`.
-- `revoked` grants are never overridden to `expired` — revocation is terminal.
-
-## 15. MCP Configuration (v1 Scope)
-
-### 15.1 Implemented Behavior
-
-v1 MCP configuration supports:
-
-1. **Filesystem toggle**: Enable/disable MCP per profile.
-2. **Raw JSON config**: MCP servers defined via JSON file or inline config.
-3. **Server types**: `stdio` (command + args + env) and `sse`/`http` (url + headers).
-4. **Parsing**: `parseMcpServers()` accepts both wrapped (`{ mcpServers: {...} }`) and direct formats.
-5. **File loading**: `loadMcpServersFromFile()` reads JSON from disk path.
+Target MCP configuration capabilities:
+1. Filesystem toggle per profile.
+2. Raw JSON server config.
+3. `stdio` and `sse`/`http` server types.
+4. Wrapped/direct parser support.
+5. File-loading helper support.
 
 ### 15.2 Not Implemented in v1
 
-- Template-driven MCP management UI (catalog browsing, one-click install).
-- MCP server health monitoring dashboard.
+- Template-driven MCP management UI.
+- MCP server health dashboard.
 - Provider-aware MCP recommendations.
 
-## 16. Room Plugin Contract (Normative)
+## 16. Room Plugin Contract (TARGET architecture; not currently implemented in `src/`)
 
-When the mediation app extends to use the room/plugin architecture from the source baseline, these rules are normative.
+When mediation extends to room/plugin runtime, these target rules apply.
 
 ### 16.1 Plugin Manifest Schema
 
-Allowed top-level fields (ONLY these; unknown fields cause validation failure):
+Allowed top-level fields:
 
 ```json
 {
@@ -1065,68 +1014,28 @@ Allowed top-level fields (ONLY these; unknown fields cause validation failure):
 }
 ```
 
-Role fields: ONLY `required`, `optional`, `forbidden`, `minCount` allowed. Unknown role fields are rejected.
-
 ### 16.2 Limits Schema
 
-**Room config limits** (user-supplied in room configuration) are plain numbers:
+Room config limits are numbers (`maxCycles`, `maxTurns`, `maxDurationMs`, `maxFailures`, `agentTimeoutMs`, `pluginHookTimeoutMs`, `llmTimeoutMs`).
 
-| Field | Type | Description |
-|---|---|---|
-| `maxCycles` | `number` | Max orchestration cycles |
-| `maxTurns` | `number` | Max turns per cycle |
-| `maxDurationMs` | `number` | Max wall-clock time |
-| `maxFailures` | `number` | Max consecutive failures |
-| `agentTimeoutMs` | `number` | Per-agent response timeout |
-| `pluginHookTimeoutMs` | `number` | Plugin hook timeout |
-| `llmTimeoutMs` | `number` | LLM call timeout |
-
-Unknown limit fields cause validation failure.
-
-**Plugin manifest limits** use a different schema — each numeric limit is an object with bounds, not a plain number:
-
-```json
-{
-  "limits": {
-    "maxCycles": { "default": 10 },
-    "maxTurns": { "default": 80, "min": 3, "max": 1000 },
-    "maxDurationMs": { "default": 300000 },
-    "maxFailures": { "default": 5 },
-    "agentTimeoutMs": { "default": 60000 },
-    "pluginHookTimeoutMs": { "default": 30000 },
-    "llmTimeoutMs": { "default": 120000 },
-    "turnFloorRole": "string (role name for minimum turn calculation)",
-    "turnFloorFormula": "\"1 + N\" | \"2 + N\""
-  }
-}
-```
-
-Each numeric limit field in a plugin manifest MUST be an object with optional keys:
-- `default` (finite number) — default value if user omits the limit.
-- `min` (finite number) — minimum bound enforced on user-supplied values.
-- `max` (finite number) — maximum bound enforced on user-supplied values.
-- If `min` and `max` are both present, `min` must be ≤ `max`.
-- Unknown fields inside a limit object (anything other than `default`, `min`, `max`) cause validation failure.
-
-`turnFloorRole` and `turnFloorFormula` are plain string fields (not objects).
+Plugin manifest limits use bounded objects (`default`, `min`, `max`) plus string fields `turnFloorRole`, `turnFloorFormula`.
 
 ### 16.3 Collision Rules
 
-1. Two plugins registering the same `orchestratorType` → error (reports existing plugin ID).
-2. Duplicate `id` across plugins → rejected.
-3. Exported manifest from `index.js` must exactly match `manifest.json` on disk.
+- Duplicate `orchestratorType` rejected.
+- Duplicate plugin `id` rejected.
+- `index.js` manifest export must match `manifest.json`.
 
 ### 16.4 Integrity and Security
 
-- **SHA256 hashing**: All plugin files (including node_modules) hashed with relative paths.
-- **Symlink rejection**: Symlinks in plugin directories are rejected in integrity mode.
-- **Entry points**: `manifest.json` and `index.js` must be regular files (not symlinks).
+- SHA256 over plugin files.
+- Symlink rejection in integrity mode.
+- `manifest.json` and `index.js` must be regular files.
 
 ### 16.5 Allowlist Mechanism
 
-File: `room-plugins-allowed.json` (one directory above plugin directory).
+`room-plugins-allowed.json` format:
 
-Format (MUST be an object with an `allowed` array, NOT a top-level array):
 ```json
 {
   "allowed": [
@@ -1136,20 +1045,9 @@ Format (MUST be an object with an `allowed` array, NOT a top-level array):
 }
 ```
 
-The loader (`plugin-registry.js → loadAllowlist()`) validates:
-1. Parsed JSON must be a non-null object with `Array.isArray(parsed.allowed)`.
-2. If the schema is invalid (e.g., a top-level array), all external plugins are skipped with a warning.
-3. Each entry in `allowed` can be a plain string (plugin name) or an object with `name` and optional `sha256`.
-
-- If `sha256` specified, computed hash must match exactly.
-- If `node_modules` present but no `sha256` entry, a warning is logged (deps not verified).
-
 ### 16.6 Dev Mode Bypass
 
-Trust bypass requires **dev mode AND a trust-all signal** (both conditions must be true):
-
 ```javascript
-// Exact logic from plugin-registry.js and main.js:
 const isDev = process.env.COMMANDS_AGENT_DEV === '1';
 const trustAll = isDev && (
   process.env.COMMANDS_AGENT_TRUST_ALL_PLUGINS === '1' ||
@@ -1157,17 +1055,9 @@ const trustAll = isDev && (
 );
 ```
 
-**Required conditions (AND, not OR):**
-1. `isDev` must be true — set via `COMMANDS_AGENT_DEV=1` environment variable, or `devMode: true` in `~/.commands-agent/desktop-settings.json`.
-2. AND one of:
-   - `COMMANDS_AGENT_TRUST_ALL_PLUGINS=1` environment variable, OR
-   - `trustAllPlugins: true` in `~/.commands-agent/desktop-settings.json`.
+Both dev mode and trust-all signal are required.
 
-**Important:** `devMode: true` alone does NOT bypass allowlist/integrity checks. The trust-all flag is additionally required. The settings UI disables the `trustAllPlugins` checkbox when `devMode` is false.
-
-When `trustAll` is true, allowlist loading and SHA-256 integrity verification are both skipped entirely.
-
-## 17. Provider Registry Contract
+## 17. Provider Registry Contract (TARGET architecture; not currently implemented in `src/`)
 
 ### 17.1 Plugin Interface
 
@@ -1200,7 +1090,7 @@ interface ProviderRunResult {
 }
 
 interface ProviderPlugin {
-  readonly id: string;       // /^[a-z][a-z0-9_-]{0,63}$/
+  readonly id: string;
   readonly name: string;
   readonly defaultModel: string;
   readonly capabilities: ProviderCapabilities;
@@ -1210,43 +1100,44 @@ interface ProviderPlugin {
 
 ### 17.2 External Plugin Loading
 
-1. Read `package.json` from plugin directory.
-2. Check `commands.providerId` and `commands.defaultModel` fields.
-3. Verify plugin via async security verifier.
-4. Load `index.js` or `index.mjs`.
-5. Config via environment variables: `PROVIDER_<PROVIDER_ID>_*`.
+Target loading flow:
+1. Read plugin `package.json`.
+2. Validate commands metadata.
+3. Verify plugin via security verifier.
+4. Load module entry (`index.js`/`index.mjs`).
+5. Apply env config `PROVIDER_<PROVIDER_ID>_*`.
 
-## 18. Observability
+## 18. Observability (TARGET architecture; not currently implemented in `src/`)
 
 ### 18.1 Audit Event Fields
 
-Minimum audit fields per event:
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `event_id` | `string` | yes | Unique event identifier |
-| `ts` | `string` | yes | ISO 8601 timestamp |
-| `case_id` | `string` | yes | Mediation case ID |
-| `phase` | `MediationPhase` | yes | Current phase at event time |
-| `actor_type` | `string` | yes | `'party'`, `'party_llm'`, `'mediator_llm'`, `'system'` |
-| `actor_id` | `string` | yes | Party ID or system identifier |
-| `event_type` | `string` | yes | Operation name (e.g. `'join'`, `'send_direct'`, `'approve_draft'`) |
-| `policy_decision` | `string` | no | Consent enforcement result if relevant |
-| `delivery_mode` | `string` | no | `'direct'`, `'coach_approved'`, `'system'` for group messages |
-| `error` | `string` | no | Error code if operation failed |
+Target minimum audit fields:
+- `event_id`, `ts`, `case_id`, `phase`, `actor_type`, `actor_id`, `event_type`
+- optional: `policy_decision`, `delivery_mode`, `error`
 
 ### 18.2 Core Metrics
 
-1. time-to-join: invite creation → last party joined
-2. time-to-ready: join → all parties ready
-3. group-chat duration: group open → resolved/closed
-4. direct-vs-coach-approved ratio: count of direct sends / coach-approved sends
-5. share-deny rate: consent denials / total share attempts
-6. resolution rate: resolved cases / total cases
+Target metrics:
+1. time-to-join
+2. time-to-ready
+3. group-chat duration
+4. direct-vs-coach-approved ratio
+5. share-deny rate
+6. resolution rate
 
-## 19. Testing Requirements
+## 19. Testing and Verification Status
 
-### 19.1 Domain Logic Tests
+### 19.1 Current verification commands (implemented in this repo)
+
+Use package scripts from `package.json`:
+
+- `npm run build` — compile TypeScript (`tsc -p tsconfig.json`)
+- `npm run typecheck` — static type check (`tsc -p tsconfig.json --noEmit`)
+- `npm run demo` — build + run demo workflow (`npm run build && npm run start`)
+
+There is currently **no automated test suite** and no `npm test` script in this scaffold.
+
+### 19.2 Target domain logic tests (future scope)
 
 | # | Test Area | Key Assertions |
 |---|---|---|
@@ -1261,7 +1152,7 @@ Minimum audit fields per event:
 | 9 | Resolve/close | Terminal phases are final; `closed` has empty transition set |
 | 10 | Phase enforcement | Operations reject with `invalid_phase` outside their allowed phases |
 
-### 19.2 Transport Tests
+### 19.3 Target transport tests (future scope)
 
 | # | Test Area | Key Assertions |
 |---|---|---|
@@ -1270,7 +1161,7 @@ Minimum audit fields per event:
 | 3 | Session lifecycle | Handshake → ready → send → end; keys zeroed on cleanup |
 | 4 | IPC error normalization | Each channel returns its documented error shape |
 
-### 19.3 Consent Policy Tests
+### 19.4 Target consent policy tests (future scope)
 
 | # | Test Area | Key Assertions |
 |---|---|---|
@@ -1279,7 +1170,7 @@ Minimum audit fields per event:
 | 3 | Direct quote | `allowDirectQuote: true` → original text returned |
 | 4 | Paraphrase | `allowDirectQuote: false` → first 36 words + ellipsis |
 
-## 20. Full Reuse Inventory from `commands-com-agent`
+## 20. Full Reuse Inventory from `commands-com-agent` (TARGET migration plan; not yet fully executed)
 
 Reuse modes:
 
@@ -1376,7 +1267,7 @@ Reuse modes:
 2. Unrelated dashboard/business flows.
 3. Single-owner assumptions across all participants.
 
-## 21. Target Repository Layout
+## 21. Target Repository Layout (planned architecture; not current tree)
 
 ```text
 mediation/
@@ -1455,9 +1346,9 @@ mediation/
       session-manager.ts
 ```
 
-## 22. Current Scaffold Alignment
+## 22. Current Scaffold Alignment (authoritative current-state implementation map)
 
-Current scaffold in `/Users/dtannen/Code/mediation/src` implements:
+The table below is the **current shipped status in `src/`**. Any capability not marked implemented here should be treated as target/future scope.
 
 | Feature | Status | Location |
 |---|---|---|
@@ -1471,10 +1362,46 @@ Current scaffold in `/Users/dtannen/Code/mediation/src` implements:
 | Phase transition validation | Implemented | `engine/phase-engine.ts` |
 | Domain error codes | Implemented | `domain/errors.ts` |
 | In-memory store | Implemented | `store/in-memory-store.ts` |
-| Transport adapter contracts | Defined | `transport/contracts.ts` |
-| LLM adapter implementations | Not yet | Requires provider setup |
-| Desktop/Electron layer | Not yet | Requires desktop scaffold |
-| E2EE transport | Not yet | Requires crypto/handshake port |
-| Gateway client | Not yet | Requires gateway-client port |
-| Auth/OAuth | Not yet | Requires auth port |
-| Audit service | Not yet | Requires audit port |
+| Transport adapter contracts (interfaces only) | Implemented | `transport/contracts.ts` |
+| Real local coach/mediator adapter implementations | Not yet | Planned under `src/llm/**` |
+| Gateway runtime integrations | Not yet | Planned under `src/transport/**` |
+| Auth/OAuth runtime | Not yet | Planned under `src/auth/**` |
+| E2EE transport | Not yet | Planned under `src/security/**`, `src/transport/**` |
+| Persistent storage/history | Not yet | Planned future storage layer |
+| Desktop/Electron layer (UI + IPC + preload) | Not yet | Planned under `desktop/**` |
+| Room/plugin runtime | Not yet | Planned under `src/room/**` |
+| Provider registry/runtime | Not yet | Planned under `src/llm/**` |
+| Audit/observability service | Not yet | Planned under `src/audit/**` |
+
+## 23. Audit-Closure and Consistency Checklist
+
+This section closes the audit loop for `FULL_SPEC.md`.
+
+### 23.1 Normative statement closure rule
+
+Every normative statement in this document MUST be one of:
+
+1. **CURRENT**: implemented in `src/` and traceable to one or more concrete modules, or
+2. **TARGET**: explicitly marked future scope / planned architecture.
+
+### 23.2 Current verification reality (repo-accurate)
+
+- Implemented verification commands:
+  - `npm run build`
+  - `npm run typecheck`
+  - `npm run demo`
+- There is currently **no automated test suite** and no `npm test` script.
+- Test matrices in Section 19 are target requirements, not current CI coverage.
+
+### 23.3 Documentation consistency checks
+
+- `docs/README.md` points to:
+  - `docs/FULL_SPEC.md` (canonical spec)
+  - `docs/FULL_SPEC_AUDIT.md` (traceability audit)
+- Root `README.md` reflects current script reality and explicitly notes no automated tests yet.
+- `src/` remains authoritative; `dist/` remains non-authoritative for contract decisions.
+
+### 23.4 Traceability pointer
+
+For line-by-line source-vs-spec reconciliation, see:
+- `docs/FULL_SPEC_AUDIT.md`

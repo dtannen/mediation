@@ -5,7 +5,7 @@ export interface PhaseValidation {
   reason?: string;
 }
 
-const ALLOWED_TRANSITIONS: Record<MediationPhase, Set<MediationPhase>> = {
+export const ALLOWED_TRANSITIONS: Record<MediationPhase, Set<MediationPhase>> = {
   awaiting_join: new Set(['private_intake', 'closed']),
   private_intake: new Set(['group_chat', 'closed']),
   group_chat: new Set(['resolved', 'closed']),
@@ -13,14 +13,14 @@ const ALLOWED_TRANSITIONS: Record<MediationPhase, Set<MediationPhase>> = {
   closed: new Set(),
 };
 
-function allPartiesJoined(mediationCase: MediationCase): boolean {
+export function allPartiesJoined(mediationCase: MediationCase): boolean {
   return mediationCase.parties.every((party) => {
     const participant = mediationCase.partyParticipationById[party.id];
     return participant && (participant.state === 'joined' || participant.state === 'ready');
   });
 }
 
-function allPartiesReadyWithSummaries(mediationCase: MediationCase): boolean {
+export function allPartiesReadyWithSummaries(mediationCase: MediationCase): boolean {
   return mediationCase.parties.every((party) => {
     const participant = mediationCase.partyParticipationById[party.id];
     const thread = mediationCase.privateIntakeByPartyId[party.id];
