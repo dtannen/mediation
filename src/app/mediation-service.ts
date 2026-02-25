@@ -3,6 +3,8 @@ import type {
   AppendMessageInput,
   CaseConsent,
   CreateCaseInput,
+  GroupMessageDeliveryMode,
+  GroupMessageDraft,
   MediationCase,
   MediationPhase,
   Party,
@@ -29,6 +31,7 @@ function makeMessage(
   visibility: ThreadMessage['visibility'],
   authorPartyId?: string,
   tags: string[] = [],
+  options?: { deliveryMode?: GroupMessageDeliveryMode; sourceDraftId?: string },
 ): ThreadMessage {
   return {
     id: makeId('msg'),
@@ -38,6 +41,8 @@ function makeMessage(
     text,
     tags,
     visibility,
+    deliveryMode: options?.deliveryMode,
+    sourceDraftId: options?.sourceDraftId,
   };
 }
 
@@ -61,6 +66,19 @@ function assertConsentCoverage(parties: Party[], consent: CaseConsent): void {
 
 function hasJoined(state: PartyParticipationState): boolean {
   return state === 'joined' || state === 'ready';
+}
+
+function assertPartyExists(mediationCase: MediationCase, partyId: string): void {
+  const found = mediationCase.parties.some((party) => party.id === partyId);
+  if (!found) {
+    throw new DomainError('party_not_found', `party '${partyId}' not found in case`);
+  }
+}
+
+function assertGroupChatPhase(mediationCase: MediationCase): void {
+  if (mediationCase.phase !== 'group_chat') {
+    throw new DomainError('invalid_phase', 'group operations are only allowed during group_chat phase');
+  }
 }
 
 export class MediationService {
@@ -123,9 +141,10 @@ export class MediationService {
       privateIntakeByPartyId,
       groupChat: {
         opened: false,
-        introductionSent: false,
+        introductionsSent: false,
         mediatorSummary: '',
         messages: [],
+        draftsById: {},
       },
     };
 
@@ -284,15 +303,15 @@ export class MediationService {
 
     if (targetPhase === 'group_chat' && !mediationCase.groupChat.opened) {
       mediationCase.groupChat.opened = true;
-      this.emitMediatorIntroductions(mediationCase);
+      this.emitMediatorOpenMessages(mediationCase);
     }
 
     this.store.save(mediationCase);
     return mediationCase;
   }
 
-  private emitMediatorIntroductions(mediationCase: MediationCase): void {
-    if (mediationCase.groupChat.introductionSent) {
+  private emitMediatorOpenMessages(mediationCase: MediationCase): void {
+    if (mediationCase.groupChat.introductionsSent) {
       return;
     }
 
@@ -306,41 +325,147 @@ export class MediationService {
       });
 
       if (!shareResult.allowed) {
-        return `${party.displayName}: position is private and was not shared into group chat.`;
+        return `${party.displayName}: summary remains private and was not shared.`;
       }
 
-      return `${party.displayName}: ${shareResult.text}`;
+      return `${party.displayName} coach summary: ${shareResult.text}`;
     });
 
     const intro = [
-      `Welcome to the mediation for topic: ${mediationCase.topic}.`,
-      'I will begin with each person\'s stated position from private intake:',
+      `Welcome. I am a neutral mediator for topic: ${mediationCase.topic}.`,
+      'Each party has their own private coach LLM. I will start with approved coach summaries:',
       ...positionLines,
     ].join('\n');
 
     const guidance = [
-      'Discussion guide:',
-      '1. Each party states top 2 goals and top 2 constraints.',
-      '2. We identify overlap and non-negotiables.',
-      '3. I will propose option sets and check for mutual acceptability.',
-      '4. We finalize concrete next steps and accountability.',
+      'Process for group discussion:',
+      '1. You can send direct messages at any time.',
+      '2. You can optionally ask your coach LLM for a draft before sending.',
+      '3. Only messages you approve are posted to group chat.',
+      '4. I will keep us focused on goals, constraints, overlap, and concrete options.',
     ].join('\n');
 
     mediationCase.groupChat.messages.push(
-      makeMessage('mediator_llm', intro, 'group', undefined, ['introduction', 'positions']),
+      makeMessage('mediator_llm', intro, 'group', undefined, ['introduction', 'coach_summaries'], {
+        deliveryMode: 'system',
+      }),
     );
     mediationCase.groupChat.messages.push(
-      makeMessage('mediator_llm', guidance, 'group', undefined, ['guidance']),
+      makeMessage('mediator_llm', guidance, 'group', undefined, ['guidance'], {
+        deliveryMode: 'system',
+      }),
     );
 
-    mediationCase.groupChat.introductionSent = true;
+    mediationCase.groupChat.introductionsSent = true;
     mediationCase.updatedAt = nowIso();
+  }
+
+  sendDirectGroupMessage(caseId: string, partyId: string, text: string, tags: string[] = []): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+    assertPartyExists(mediationCase, partyId);
+
+    mediationCase.groupChat.messages.push(
+      makeMessage('party', text.trim(), 'group', partyId, tags, {
+        deliveryMode: 'direct',
+      }),
+    );
+
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  createCoachDraft(caseId: string, partyId: string, intentText: string, suggestedText: string): GroupMessageDraft {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+    assertPartyExists(mediationCase, partyId);
+
+    if (!intentText.trim()) {
+      throw new DomainError('invalid_intent', 'intent text is required for coach draft');
+    }
+    if (!suggestedText.trim()) {
+      throw new DomainError('invalid_suggested_text', 'suggested text is required for coach draft');
+    }
+
+    const draft: GroupMessageDraft = {
+      id: makeId('draft'),
+      partyId,
+      createdAt: nowIso(),
+      intentText: intentText.trim(),
+      suggestedText: suggestedText.trim(),
+      status: 'pending_approval',
+    };
+
+    mediationCase.groupChat.draftsById[draft.id] = draft;
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return draft;
+  }
+
+  approveCoachDraftAndSend(caseId: string, draftId: string, approvedText?: string): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+    if (draft.status !== 'pending_approval') {
+      throw new DomainError('draft_not_pending', `draft '${draftId}' is not pending approval`);
+    }
+
+    const finalText = (approvedText || draft.suggestedText).trim();
+    if (!finalText) {
+      throw new DomainError('invalid_approved_text', 'approved text cannot be empty');
+    }
+
+    draft.status = 'approved';
+    draft.approvedText = finalText;
+    draft.approvedAt = nowIso();
+
+    const sent = makeMessage('party', finalText, 'group', draft.partyId, ['coach_draft'], {
+      deliveryMode: 'coach_approved',
+      sourceDraftId: draft.id,
+    });
+    draft.sentMessageId = sent.id;
+
+    mediationCase.groupChat.messages.push(sent);
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  rejectCoachDraft(caseId: string, draftId: string, reason?: string): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+    if (draft.status !== 'pending_approval') {
+      throw new DomainError('draft_not_pending', `draft '${draftId}' is not pending approval`);
+    }
+
+    draft.status = 'rejected';
+    draft.rejectedAt = nowIso();
+    draft.rejectionReason = (reason || '').trim() || undefined;
+
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
   }
 
   appendGroupMessage(input: AppendMessageInput): MediationCase {
     const mediationCase = this.getCase(input.caseId);
-    if (mediationCase.phase !== 'group_chat') {
-      throw new DomainError('invalid_phase', 'group chat messages are only allowed during group_chat phase');
+    assertGroupChatPhase(mediationCase);
+
+    if (input.authorType === 'party') {
+      if (!input.partyId) {
+        throw new DomainError('missing_party', 'partyId is required for party messages');
+      }
+      return this.sendDirectGroupMessage(input.caseId, input.partyId, input.text, input.tags ?? []);
     }
 
     mediationCase.groupChat.messages.push(
@@ -350,6 +475,7 @@ export class MediationService {
         'group',
         input.partyId,
         input.tags ?? [],
+        { deliveryMode: 'system' },
       ),
     );
 
@@ -360,9 +486,7 @@ export class MediationService {
 
   setMediatorSummary(caseId: string, summary: string): MediationCase {
     const mediationCase = this.getCase(caseId);
-    if (mediationCase.phase !== 'group_chat') {
-      throw new DomainError('invalid_phase', 'mediator summary is only allowed during group_chat phase');
-    }
+    assertGroupChatPhase(mediationCase);
 
     mediationCase.groupChat.mediatorSummary = summary.trim();
     mediationCase.updatedAt = nowIso();
@@ -372,9 +496,7 @@ export class MediationService {
 
   resolveCase(caseId: string, resolution: string): MediationCase {
     const mediationCase = this.getCase(caseId);
-    if (mediationCase.phase !== 'group_chat') {
-      throw new DomainError('invalid_phase', 'cases can only be resolved from group_chat phase');
-    }
+    assertGroupChatPhase(mediationCase);
 
     this.transition(caseId, 'resolved');
     const updated = this.getCase(caseId);

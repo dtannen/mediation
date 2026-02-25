@@ -1,19 +1,22 @@
 # Mediation App (MVP Scaffold)
 
-Standalone codebase for mediation with this lifecycle:
+Standalone codebase for mediation with a hybrid model:
 
 1. `awaiting_join` (create mediation topic and send invite link)
-2. `private_intake` (each party discusses privately with their local LLM)
+2. `private_intake` (each party discusses privately with their own coach LLM)
 3. per-party `ready` gate (both parties must be ready)
-4. `group_chat` (mediator LLM introduces both positions and guides discussion)
-5. `resolved` / `closed`
+4. `group_chat` with a neutral `mediator_llm`
+5. each party can either:
+   - send directly, or
+   - use optional `coach draft -> approve -> send`
+6. `resolved` / `closed`
 
 ## Status
 
 This scaffold provides:
-- Domain model for mediation lifecycle, invites, and party readiness
-- Consent policy enforcement for sharing private intake summaries
-- Phase transition engine with ready/join guards
+- Domain model for invites, party readiness, group drafts, and message delivery modes
+- Consent policy enforcement for private-summary sharing
+- Phase transition engine with join/ready guards
 - In-memory store
 - `MediationService` orchestration class
 - Demo runner in `src/index.ts`
@@ -30,6 +33,7 @@ npm run demo
 ## Next Build Steps
 
 - Replace in-memory store with SQLite/Postgres
-- Wire local LLM adapters per party
-- Add gateway transport adapters
+- Wire real local coach adapters per party
+- Wire neutral mediator adapter
+- Add gateway transport adapters for shared group chat
 - Build dedicated case/invite/private/group-chat UI

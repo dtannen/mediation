@@ -13,6 +13,8 @@ export type MessageAuthorType =
 
 export type MessageVisibility = 'private' | 'group' | 'system';
 
+export type GroupMessageDeliveryMode = 'direct' | 'coach_approved' | 'system';
+
 export interface LLMChoice {
   provider: string;
   model: string;
@@ -59,6 +61,8 @@ export interface ThreadMessage {
   text: string;
   tags: string[];
   visibility: MessageVisibility;
+  deliveryMode?: GroupMessageDeliveryMode;
+  sourceDraftId?: string;
 }
 
 export interface PrivateIntakeThread {
@@ -68,11 +72,28 @@ export interface PrivateIntakeThread {
   messages: ThreadMessage[];
 }
 
+export type GroupDraftStatus = 'pending_approval' | 'approved' | 'rejected';
+
+export interface GroupMessageDraft {
+  id: string;
+  partyId: string;
+  createdAt: string;
+  intentText: string;
+  suggestedText: string;
+  status: GroupDraftStatus;
+  approvedText?: string;
+  approvedAt?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
+  sentMessageId?: string;
+}
+
 export interface GroupChatRoom {
   opened: boolean;
-  introductionSent: boolean;
+  introductionsSent: boolean;
   mediatorSummary: string;
   messages: ThreadMessage[];
+  draftsById: Record<string, GroupMessageDraft>;
 }
 
 export interface MediationCase {

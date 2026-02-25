@@ -85,43 +85,49 @@ function main(): void {
   service.setPartyReady(mediationCase.id, 'party_a');
   service.setPartyReady(mediationCase.id, 'party_b');
 
-  printSection('Group Chat Opened (Mediator Introductions Sent)');
+  printSection('Group Chat Opened (Neutral Mediator + Coach Summaries)');
   console.log({
     phase: service.getCase(mediationCase.id).phase,
-    introductions: service.getCase(mediationCase.id).groupChat.messages,
+    openingMessages: service.getCase(mediationCase.id).groupChat.messages,
   });
 
-  service.appendGroupMessage({
-    caseId: mediationCase.id,
-    authorType: 'party',
-    partyId: 'party_a',
-    text: 'My top goals are fairness and decision stability. My key constraint is avoiding unilateral control.',
-    tags: ['goals'],
-  });
+  // Optional coach-draft path: party_a asks coach, reviews, approves, then sends.
+  const coachDraft = service.createCoachDraft(
+    mediationCase.id,
+    'party_a',
+    'I want to propose phased changes without sounding adversarial.',
+    'I propose a phased equity adjustment tied to agreed milestones, while keeping major strategic decisions jointly approved.',
+  );
+  service.approveCoachDraftAndSend(
+    mediationCase.id,
+    coachDraft.id,
+    'I propose we use phased equity adjustments tied to milestones, while keeping major strategic decisions jointly approved.',
+  );
 
-  service.appendGroupMessage({
-    caseId: mediationCase.id,
-    authorType: 'party',
-    partyId: 'party_b',
-    text: 'My top goals are execution accountability and sustainable ownership alignment.',
-    tags: ['goals'],
-  });
+  // Direct path: party_b skips coach draft and sends directly.
+  service.sendDirectGroupMessage(
+    mediationCase.id,
+    'party_b',
+    'I can work with phased adjustments if milestones and review checkpoints are clearly defined.',
+    ['direct'],
+  );
 
+  // Neutral mediator facilitation message.
   service.appendGroupMessage({
     caseId: mediationCase.id,
     authorType: 'mediator_llm',
-    text: 'Proposed path: milestone-linked adjustment, joint veto on strategic pivots, and quarterly review checkpoints.',
-    tags: ['proposal'],
+    text: 'I hear alignment on phased structure plus governance safeguards. Next: define milestone triggers and review cadence.',
+    tags: ['facilitation'],
   });
 
   service.setMediatorSummary(
     mediationCase.id,
-    'Mediator summary: both parties align on phased equity updates tied to milestones and a written governance protocol.',
+    'Mediator summary: both parties align on phased equity updates tied to milestones and a governance protocol with review checkpoints.',
   );
 
   service.resolveCase(
     mediationCase.id,
-    'Resolved with phased equity adjustments, a governance charter, and quarterly review cadence.',
+    'Resolved with phased equity adjustments, jointly approved governance rules, and quarterly review checkpoints.',
   );
 
   printSection('Final Case Snapshot');
@@ -131,6 +137,8 @@ function main(): void {
     phase: finalCase.phase,
     resolution: finalCase.resolution,
     mediatorSummary: finalCase.groupChat.mediatorSummary,
+    draftCount: Object.keys(finalCase.groupChat.draftsById).length,
+    lastMessages: finalCase.groupChat.messages.slice(-4),
   });
 }
 

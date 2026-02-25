@@ -1,35 +1,54 @@
-export interface LocalPartyLLMRequest {
+export interface LocalCoachSummaryRequest {
   partyId: string;
   caseId: string;
-  prompt: string;
+  privateConversation: string;
 }
 
-export interface LocalPartyLLMResponse {
+export interface LocalCoachSummaryResponse {
   summary: string;
-  readyForCrossDialogue: boolean;
+  readyForGroupChat: boolean;
 }
 
-export interface LocalPartyLLMAdapter {
-  runPrivateIntake(request: LocalPartyLLMRequest): Promise<LocalPartyLLMResponse>;
-}
-
-export interface GatewayDialogueRequest {
+export interface LocalCoachDraftRequest {
+  partyId: string;
   caseId: string;
-  fromPartyId: string;
-  toPartyId: string;
-  payload: string;
+  intentText: string;
 }
 
-export interface GatewayDialogueAdapter {
-  sendAgentDialogue(request: GatewayDialogueRequest): Promise<void>;
+export interface LocalCoachDraftResponse {
+  suggestedText: string;
+  rationale?: string;
 }
 
-export interface MediatorLLMRequest {
+export interface LocalCoachAdapter {
+  summarizePrivateIntake(request: LocalCoachSummaryRequest): Promise<LocalCoachSummaryResponse>;
+  createGroupDraft(request: LocalCoachDraftRequest): Promise<LocalCoachDraftResponse>;
+}
+
+export interface MediatorOpenRequest {
   caseId: string;
-  objective: string;
-  sharedContext: string;
+  topic: string;
+  approvedCoachSummaries: string[];
+}
+
+export interface MediatorTurnRequest {
+  caseId: string;
+  topic: string;
+  groupTranscript: string;
 }
 
 export interface MediatorLLMAdapter {
-  openJointRoom(request: MediatorLLMRequest): Promise<{ openingMessage: string }>;
+  buildOpeningMessages(request: MediatorOpenRequest): Promise<{ intro: string; guidance: string }>;
+  nextFacilitationTurn(request: MediatorTurnRequest): Promise<{ message: string }>;
+}
+
+export interface GatewayGroupMessageRequest {
+  caseId: string;
+  fromPartyId: string;
+  payload: string;
+  correlationId: string;
+}
+
+export interface GatewayGroupMessageAdapter {
+  sendGroupMessage(request: GatewayGroupMessageRequest): Promise<void>;
 }
