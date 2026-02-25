@@ -8,7 +8,7 @@ Standalone codebase for mediation with a hybrid model:
 4. `group_chat` with a neutral `mediator_llm`
 5. each party can either:
    - send directly, or
-   - use optional `coach draft -> approve -> send`
+   - use optional `private coach conversation -> final draft -> approve -> send`
 6. `resolved` / `closed`
 
 ## Status

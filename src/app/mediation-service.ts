@@ -2,6 +2,7 @@ import { DomainError } from '../domain/errors';
 import type {
   AppendMessageInput,
   CaseConsent,
+  CoachComposeAuthor,
   CreateCaseInput,
   GroupMessageDeliveryMode,
   GroupMessageDraft,
@@ -338,11 +339,12 @@ export class MediationService {
     ].join('\n');
 
     const guidance = [
-      'Process for group discussion:',
-      '1. You can send direct messages at any time.',
-      '2. You can optionally ask your coach LLM for a draft before sending.',
-      '3. Only messages you approve are posted to group chat.',
-      '4. I will keep us focused on goals, constraints, overlap, and concrete options.',
+      'I will facilitate this mediation by asking structured questions to both parties.',
+      'Opening questions:',
+      '1. Party A: what are your top 2 goals and top 2 constraints?',
+      '2. Party B: what are your top 2 goals and top 2 constraints?',
+      '3. Each party: what is one flexible point you can offer today?',
+      'You can answer directly or use your private coach conversation before posting.',
     ].join('\n');
 
     mediationCase.groupChat.messages.push(
@@ -365,8 +367,13 @@ export class MediationService {
     assertGroupChatPhase(mediationCase);
     assertPartyExists(mediationCase, partyId);
 
+    const finalText = text.trim();
+    if (!finalText) {
+      throw new DomainError('invalid_group_message', 'group message text cannot be empty');
+    }
+
     mediationCase.groupChat.messages.push(
-      makeMessage('party', text.trim(), 'group', partyId, tags, {
+      makeMessage('party', finalText, 'group', partyId, tags, {
         deliveryMode: 'direct',
       }),
     );
@@ -376,31 +383,110 @@ export class MediationService {
     return mediationCase;
   }
 
-  createCoachDraft(caseId: string, partyId: string, intentText: string, suggestedText: string): GroupMessageDraft {
+  createCoachDraft(caseId: string, partyId: string, initialPartyMessage: string): GroupMessageDraft {
     const mediationCase = this.getCase(caseId);
     assertGroupChatPhase(mediationCase);
     assertPartyExists(mediationCase, partyId);
 
-    if (!intentText.trim()) {
-      throw new DomainError('invalid_intent', 'intent text is required for coach draft');
-    }
-    if (!suggestedText.trim()) {
-      throw new DomainError('invalid_suggested_text', 'suggested text is required for coach draft');
+    const initialText = initialPartyMessage.trim();
+    if (!initialText) {
+      throw new DomainError('invalid_intent', 'initial coach conversation message is required');
     }
 
     const draft: GroupMessageDraft = {
       id: makeId('draft'),
       partyId,
       createdAt: nowIso(),
-      intentText: intentText.trim(),
-      suggestedText: suggestedText.trim(),
-      status: 'pending_approval',
+      updatedAt: nowIso(),
+      status: 'composing',
+      composeMessages: [
+        {
+          id: makeId('compose'),
+          createdAt: nowIso(),
+          author: 'party',
+          text: initialText,
+        },
+      ],
     };
 
     mediationCase.groupChat.draftsById[draft.id] = draft;
     mediationCase.updatedAt = nowIso();
     this.store.save(mediationCase);
     return draft;
+  }
+
+  appendCoachDraftMessage(
+    caseId: string,
+    draftId: string,
+    author: CoachComposeAuthor,
+    text: string,
+  ): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+    if (draft.status === 'approved' || draft.status === 'rejected') {
+      throw new DomainError('draft_closed', `draft '${draftId}' is already ${draft.status}`);
+    }
+
+    const finalText = text.trim();
+    if (!finalText) {
+      throw new DomainError('invalid_compose_message', 'coach conversation message text cannot be empty');
+    }
+
+    draft.composeMessages.push({
+      id: makeId('compose'),
+      createdAt: nowIso(),
+      author,
+      text: finalText,
+    });
+
+    // If the party continues iterating after a prior suggestion, move back to composing.
+    if (author === 'party' && draft.status === 'pending_approval') {
+      draft.status = 'composing';
+      draft.suggestedText = undefined;
+    }
+
+    draft.updatedAt = nowIso();
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  setCoachDraftSuggestion(caseId: string, draftId: string, suggestedText: string): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+    if (draft.status === 'approved' || draft.status === 'rejected') {
+      throw new DomainError('draft_closed', `draft '${draftId}' is already ${draft.status}`);
+    }
+
+    const finalSuggestion = suggestedText.trim();
+    if (!finalSuggestion) {
+      throw new DomainError('invalid_suggested_text', 'suggested text is required');
+    }
+
+    draft.composeMessages.push({
+      id: makeId('compose'),
+      createdAt: nowIso(),
+      author: 'party_llm',
+      text: finalSuggestion,
+    });
+
+    draft.suggestedText = finalSuggestion;
+    draft.status = 'pending_approval';
+    draft.updatedAt = nowIso();
+
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
   }
 
   approveCoachDraftAndSend(caseId: string, draftId: string, approvedText?: string): MediationCase {
@@ -415,7 +501,8 @@ export class MediationService {
       throw new DomainError('draft_not_pending', `draft '${draftId}' is not pending approval`);
     }
 
-    const finalText = (approvedText || draft.suggestedText).trim();
+    const sourceText = approvedText || draft.suggestedText || '';
+    const finalText = sourceText.trim();
     if (!finalText) {
       throw new DomainError('invalid_approved_text', 'approved text cannot be empty');
     }
@@ -423,6 +510,7 @@ export class MediationService {
     draft.status = 'approved';
     draft.approvedText = finalText;
     draft.approvedAt = nowIso();
+    draft.updatedAt = nowIso();
 
     const sent = makeMessage('party', finalText, 'group', draft.partyId, ['coach_draft'], {
       deliveryMode: 'coach_approved',
@@ -444,13 +532,14 @@ export class MediationService {
     if (!draft) {
       throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
     }
-    if (draft.status !== 'pending_approval') {
-      throw new DomainError('draft_not_pending', `draft '${draftId}' is not pending approval`);
+    if (draft.status === 'approved' || draft.status === 'rejected') {
+      throw new DomainError('draft_closed', `draft '${draftId}' is already ${draft.status}`);
     }
 
     draft.status = 'rejected';
     draft.rejectedAt = nowIso();
     draft.rejectionReason = (reason || '').trim() || undefined;
+    draft.updatedAt = nowIso();
 
     mediationCase.updatedAt = nowIso();
     this.store.save(mediationCase);

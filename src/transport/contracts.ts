@@ -9,10 +9,15 @@ export interface LocalCoachSummaryResponse {
   readyForGroupChat: boolean;
 }
 
+export interface LocalCoachConversationTurn {
+  author: 'party' | 'party_llm';
+  text: string;
+}
+
 export interface LocalCoachDraftRequest {
   partyId: string;
   caseId: string;
-  intentText: string;
+  conversationTurns: LocalCoachConversationTurn[];
 }
 
 export interface LocalCoachDraftResponse {

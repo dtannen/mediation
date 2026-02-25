@@ -86,11 +86,12 @@ Per party:
 
 ### 5.3 Coach-Draft Workflow (Optional)
 
-1. Party enters intent.
-2. Coach LLM proposes draft.
-3. Party may approve/edit and send, or reject.
-4. Only approved text is posted publicly.
-5. Direct send remains available for every turn.
+1. Party can have a multi-turn private conversation with their coach before producing a final draft.
+2. Conversation can include clarifying questions, reframing, tone adjustments, and negotiation strategy.
+3. Coach provides a suggested final draft only when the party asks for one.
+4. Party can continue iterating after seeing a suggested draft (returns to composing).
+5. Only party-approved text is posted publicly.
+6. Direct send remains available for every turn.
 
 ## 6. Functional Requirements
 
@@ -113,14 +114,14 @@ Per party:
 1. Group opens only when all parties ready.
 2. Neutral mediator posts opening context.
 3. Opening includes each coach summary under consent rules.
-4. Mediator posts explicit process guidance.
+4. Mediator starts by asking explicit opening questions to both parties.
 
 ### 6.4 Group Discussion
 
 1. Party can send direct at any turn.
 2. Party can optionally use coach draft path.
-3. Mediator keeps neutrality and process discipline.
-4. Mediator identifies overlap, constraints, and option sets.
+3. Mediator keeps neutrality and process discipline through active questioning.
+4. Mediator asks follow-up and clarifying questions to identify overlap, constraints, and option sets.
 
 ### 6.5 Resolution
 
@@ -176,14 +177,16 @@ Required operations:
 6. `setPartyReady`
 7. `sendDirectGroupMessage`
 8. `createCoachDraft`
-9. `approveCoachDraftAndSend`
-10. `rejectCoachDraft`
-11. `appendGroupMessage` (mediator/system/general path)
-12. `setMediatorSummary`
-13. `resolveCase`
-14. `closeCase`
-15. `getCase`
-16. `listCases`
+9. `appendCoachDraftMessage`
+10. `setCoachDraftSuggestion`
+11. `approveCoachDraftAndSend`
+12. `rejectCoachDraft`
+13. `appendGroupMessage` (mediator/system/general path)
+14. `setMediatorSummary`
+15. `resolveCase`
+16. `closeCase`
+17. `getCase`
+18. `listCases`
 
 Error contract:
 

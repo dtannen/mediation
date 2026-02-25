@@ -91,12 +91,28 @@ function main(): void {
     openingMessages: service.getCase(mediationCase.id).groupChat.messages,
   });
 
-  // Optional coach-draft path: party_a asks coach, reviews, approves, then sends.
+  // Optional private coach conversation path for party_a.
   const coachDraft = service.createCoachDraft(
     mediationCase.id,
     'party_a',
     'I want to propose phased changes without sounding adversarial.',
-    'I propose a phased equity adjustment tied to agreed milestones, while keeping major strategic decisions jointly approved.',
+  );
+  service.appendCoachDraftMessage(
+    mediationCase.id,
+    coachDraft.id,
+    'party_llm',
+    'Try framing this as shared risk management and joint accountability.',
+  );
+  service.appendCoachDraftMessage(
+    mediationCase.id,
+    coachDraft.id,
+    'party',
+    'Yes, I want that tone and to preserve joint major-decision control.',
+  );
+  service.setCoachDraftSuggestion(
+    mediationCase.id,
+    coachDraft.id,
+    'I propose phased equity adjustments tied to agreed milestones, while keeping major strategic decisions jointly approved.',
   );
   service.approveCoachDraftAndSend(
     mediationCase.id,
@@ -104,7 +120,7 @@ function main(): void {
     'I propose we use phased equity adjustments tied to milestones, while keeping major strategic decisions jointly approved.',
   );
 
-  // Direct path: party_b skips coach draft and sends directly.
+  // Direct path: party_b skips coach drafting and sends directly.
   service.sendDirectGroupMessage(
     mediationCase.id,
     'party_b',
@@ -138,6 +154,7 @@ function main(): void {
     resolution: finalCase.resolution,
     mediatorSummary: finalCase.groupChat.mediatorSummary,
     draftCount: Object.keys(finalCase.groupChat.draftsById).length,
+    draftRecord: finalCase.groupChat.draftsById[coachDraft.id],
     lastMessages: finalCase.groupChat.messages.slice(-4),
   });
 }

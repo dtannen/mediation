@@ -72,15 +72,25 @@ export interface PrivateIntakeThread {
   messages: ThreadMessage[];
 }
 
-export type GroupDraftStatus = 'pending_approval' | 'approved' | 'rejected';
+export type CoachComposeAuthor = 'party' | 'party_llm';
+
+export interface CoachComposeMessage {
+  id: string;
+  createdAt: string;
+  author: CoachComposeAuthor;
+  text: string;
+}
+
+export type GroupDraftStatus = 'composing' | 'pending_approval' | 'approved' | 'rejected';
 
 export interface GroupMessageDraft {
   id: string;
   partyId: string;
   createdAt: string;
-  intentText: string;
-  suggestedText: string;
+  updatedAt: string;
   status: GroupDraftStatus;
+  composeMessages: CoachComposeMessage[];
+  suggestedText?: string;
   approvedText?: string;
   approvedAt?: string;
   rejectedAt?: string;
