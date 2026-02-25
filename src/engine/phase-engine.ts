@@ -6,22 +6,32 @@ export interface PhaseValidation {
 }
 
 const ALLOWED_TRANSITIONS: Record<MediationPhase, Set<MediationPhase>> = {
-  private_intake: new Set(['cross_agent_dialogue', 'closed']),
-  cross_agent_dialogue: new Set(['joint_mediation', 'closed']),
-  joint_mediation: new Set(['resolved', 'closed']),
+  awaiting_join: new Set(['private_intake', 'closed']),
+  private_intake: new Set(['group_chat', 'closed']),
+  group_chat: new Set(['resolved', 'closed']),
   resolved: new Set(['closed']),
   closed: new Set(),
 };
 
-function readyForCrossAgentDialogue(mediationCase: MediationCase): boolean {
+function allPartiesJoined(mediationCase: MediationCase): boolean {
   return mediationCase.parties.every((party) => {
-    const thread = mediationCase.privateIntakeByPartyId[party.id];
-    return Boolean(thread && thread.resolved && thread.summary && thread.summary.trim().length > 0);
+    const participant = mediationCase.partyParticipationById[party.id];
+    return participant && (participant.state === 'joined' || participant.state === 'ready');
   });
 }
 
-function readyForJointMediation(mediationCase: MediationCase): boolean {
-  return mediationCase.sharedDialogue.completed;
+function allPartiesReadyWithSummaries(mediationCase: MediationCase): boolean {
+  return mediationCase.parties.every((party) => {
+    const participant = mediationCase.partyParticipationById[party.id];
+    const thread = mediationCase.privateIntakeByPartyId[party.id];
+    return Boolean(
+      participant &&
+      participant.state === 'ready' &&
+      thread &&
+      thread.resolved &&
+      thread.summary.trim().length > 0,
+    );
+  });
 }
 
 export function validateTransition(
@@ -36,17 +46,17 @@ export function validateTransition(
     };
   }
 
-  if (targetPhase === 'cross_agent_dialogue' && !readyForCrossAgentDialogue(mediationCase)) {
+  if (targetPhase === 'private_intake' && !allPartiesJoined(mediationCase)) {
     return {
       allowed: false,
-      reason: 'all parties must complete private intake with a summary before cross-agent dialogue',
+      reason: 'all invited parties must join before private intake can begin',
     };
   }
 
-  if (targetPhase === 'joint_mediation' && !readyForJointMediation(mediationCase)) {
+  if (targetPhase === 'group_chat' && !allPartiesReadyWithSummaries(mediationCase)) {
     return {
       allowed: false,
-      reason: 'shared agent dialogue must be completed before opening joint mediation',
+      reason: 'all parties must be ready and have a private summary before entering group chat',
     };
   }
 

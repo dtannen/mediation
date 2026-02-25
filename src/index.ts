@@ -8,8 +8,8 @@ function main(): void {
   const service = new MediationService();
 
   const mediationCase = service.createCase({
-    title: 'Co-founder equity conflict',
-    issue: 'Two co-founders disagree on revised equity and decision rights after one took on a larger operating role.',
+    topic: 'Co-founder equity and governance dispute',
+    description: 'One founder took on larger operational load; both want a fair long-term structure.',
     parties: [
       {
         id: 'party_a',
@@ -38,14 +38,28 @@ function main(): void {
     },
   });
 
-  printSection('Created Case');
-  console.log({ id: mediationCase.id, phase: mediationCase.phase, title: mediationCase.title });
+  printSection('Created Mediation + Invite Link');
+  console.log({
+    caseId: mediationCase.id,
+    topic: mediationCase.topic,
+    phase: mediationCase.phase,
+    inviteLink: mediationCase.inviteLink.url,
+  });
+
+  service.joinWithInvite(mediationCase.id, 'party_a', mediationCase.inviteLink.token);
+  service.joinWithInvite(mediationCase.id, 'party_b', mediationCase.inviteLink.token);
+
+  printSection('Both Parties Joined (Private Intake Active)');
+  console.log({
+    phase: service.getCase(mediationCase.id).phase,
+    partyParticipation: service.getCase(mediationCase.id).partyParticipationById,
+  });
 
   service.appendPrivateMessage({
     caseId: mediationCase.id,
     partyId: 'party_a',
     authorType: 'party',
-    text: 'I am open to a small shift in equity, but I need explicit guardrails on unilateral decisions.',
+    text: 'I can accept a staged equity change if governance protections are explicit and enforceable.',
     tags: ['summary'],
   });
 
@@ -53,54 +67,70 @@ function main(): void {
     caseId: mediationCase.id,
     partyId: 'party_b',
     authorType: 'party',
-    text: 'I am carrying execution risk and want the equity split to reflect that, while preserving trust.',
+    text: 'I need a structure that reflects operating load while preserving trust and shared control.',
     tags: ['summary'],
   });
 
   service.setPrivateSummary(
     mediationCase.id,
     'party_a',
-    'Alex can accept a limited equity adjustment if governance protections and escalation paths are explicit.',
+    'Alex accepts a staged equity adjustment if major decisions require joint governance controls.',
   );
   service.setPrivateSummary(
     mediationCase.id,
     'party_b',
-    'Blair seeks a revised split tied to operating burden, with a fair review checkpoint and clear accountability.',
+    'Blair wants equity to reflect operational burden with clear accountability and periodic review.',
   );
 
-  printSection('Private Intake Complete');
-  console.log(service.getCase(mediationCase.id).privateIntakeByPartyId);
+  service.setPartyReady(mediationCase.id, 'party_a');
+  service.setPartyReady(mediationCase.id, 'party_b');
 
-  service.runCrossAgentDialogue(mediationCase.id);
+  printSection('Group Chat Opened (Mediator Introductions Sent)');
+  console.log({
+    phase: service.getCase(mediationCase.id).phase,
+    introductions: service.getCase(mediationCase.id).groupChat.messages,
+  });
 
-  printSection('Cross-Agent Dialogue Output');
-  console.log(service.getCase(mediationCase.id).sharedDialogue);
+  service.appendGroupMessage({
+    caseId: mediationCase.id,
+    authorType: 'party',
+    partyId: 'party_a',
+    text: 'My top goals are fairness and decision stability. My key constraint is avoiding unilateral control.',
+    tags: ['goals'],
+  });
 
-  service.transition(mediationCase.id, 'joint_mediation');
-  service.appendJointMessage({
+  service.appendGroupMessage({
+    caseId: mediationCase.id,
+    authorType: 'party',
+    partyId: 'party_b',
+    text: 'My top goals are execution accountability and sustainable ownership alignment.',
+    tags: ['goals'],
+  });
+
+  service.appendGroupMessage({
     caseId: mediationCase.id,
     authorType: 'mediator_llm',
-    text: 'I propose we draft two options: milestone-based vesting change and governance charter update.',
+    text: 'Proposed path: milestone-linked adjustment, joint veto on strategic pivots, and quarterly review checkpoints.',
     tags: ['proposal'],
   });
 
   service.setMediatorSummary(
     mediationCase.id,
-    'Mediator draft: both parties tentatively agree to milestone-linked equity adjustment and joint veto on major strategic pivots.',
+    'Mediator summary: both parties align on phased equity updates tied to milestones and a written governance protocol.',
   );
 
   service.resolveCase(
     mediationCase.id,
-    'Resolved with a staged equity update, quarterly review checkpoints, and a written governance protocol.',
+    'Resolved with phased equity adjustments, a governance charter, and quarterly review cadence.',
   );
 
   printSection('Final Case Snapshot');
   const finalCase = service.getCase(mediationCase.id);
   console.log({
-    id: finalCase.id,
+    caseId: finalCase.id,
     phase: finalCase.phase,
     resolution: finalCase.resolution,
-    mediatorSummary: finalCase.jointRoom.mediatorSummary,
+    mediatorSummary: finalCase.groupChat.mediatorSummary,
   });
 }
 

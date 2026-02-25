@@ -1,7 +1,7 @@
 export type MediationPhase =
+  | 'awaiting_join'
   | 'private_intake'
-  | 'cross_agent_dialogue'
-  | 'joint_mediation'
+  | 'group_chat'
   | 'resolved'
   | 'closed';
 
@@ -11,7 +11,7 @@ export type MessageAuthorType =
   | 'mediator_llm'
   | 'system';
 
-export type MessageVisibility = 'private' | 'shared' | 'joint' | 'system';
+export type MessageVisibility = 'private' | 'group' | 'system';
 
 export interface LLMChoice {
   provider: string;
@@ -22,6 +22,23 @@ export interface Party {
   id: string;
   displayName: string;
   localLLM: LLMChoice;
+}
+
+export type PartyParticipationState = 'invited' | 'joined' | 'ready';
+
+export interface PartyParticipation {
+  partyId: string;
+  state: PartyParticipationState;
+  invitedAt: string;
+  joinedAt?: string;
+  readyAt?: string;
+}
+
+export interface InviteLink {
+  token: string;
+  url: string;
+  createdAt: string;
+  expiresAt?: string;
 }
 
 export interface ConsentGrant {
@@ -47,42 +64,39 @@ export interface ThreadMessage {
 export interface PrivateIntakeThread {
   partyId: string;
   resolved: boolean;
-  summary?: string;
+  summary: string;
   messages: ThreadMessage[];
 }
 
-export interface SharedDialogueThread {
-  completed: boolean;
-  summary?: string;
-  messages: ThreadMessage[];
-}
-
-export interface JointMediationRoom {
+export interface GroupChatRoom {
   opened: boolean;
-  mediatorSummary?: string;
+  introductionSent: boolean;
+  mediatorSummary: string;
   messages: ThreadMessage[];
 }
 
 export interface MediationCase {
   id: string;
-  title: string;
-  issue: string;
+  topic: string;
+  description: string;
   createdAt: string;
   updatedAt: string;
   phase: MediationPhase;
   parties: Party[];
+  inviteLink: InviteLink;
+  partyParticipationById: Record<string, PartyParticipation>;
   consent: CaseConsent;
   privateIntakeByPartyId: Record<string, PrivateIntakeThread>;
-  sharedDialogue: SharedDialogueThread;
-  jointRoom: JointMediationRoom;
+  groupChat: GroupChatRoom;
   resolution?: string;
 }
 
 export interface CreateCaseInput {
-  title: string;
-  issue: string;
+  topic: string;
+  description?: string;
   parties: Party[];
   consent: CaseConsent;
+  inviteBaseUrl?: string;
 }
 
 export interface AppendMessageInput {
