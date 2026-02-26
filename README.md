@@ -52,6 +52,34 @@ cd /Users/dtannen/Code/mediation
 npm run start:desktop
 ```
 
+### Desktop profile mode (run two accounts on one machine)
+
+Use separate profiles to isolate auth/device state and local case data:
+
+- `npm run start:desktop:owner`
+- `npm run start:desktop:collab`
+
+Or run any custom profile:
+
+```bash
+cd /Users/dtannen/Code/mediation
+MEDIATION_PROFILE=myprofile npm run start:desktop
+```
+
+You can run owner and collaborator in separate terminals at the same time.
+
+### Local case storage path
+
+Case data is persisted as JSON at:
+
+- Default: `/Users/dtannen/Library/Application Support/mediation-app/mediation-cases.json`
+- Profile mode: `/Users/dtannen/Library/Application Support/mediation-app/profiles/<profile>/mediation-cases.json`
+
+To clear local mediation data for a profile:
+
+1. Quit the app for that profile.
+2. Delete its `mediation-cases.json` file.
+
 ## Next Build Steps
 
 - Replace in-memory store with SQLite/Postgres
