@@ -20,9 +20,17 @@ export function register(
     registry: IpcRegistry;
     auth: AuthService;
     emitAuthChanged?: (payload: Record<string, unknown>) => void;
+    getStatusPayload?: () => Record<string, unknown>;
+    onSignedIn?: () => Promise<Record<string, unknown> | void> | Record<string, unknown> | void;
+    onSignedOut?: () => Promise<Record<string, unknown> | void> | Record<string, unknown> | void;
   },
 ): void {
   const { registry, auth } = deps;
+  const statusPayload = (): Record<string, unknown> => (
+    typeof deps.getStatusPayload === 'function'
+      ? deps.getStatusPayload()
+      : auth.getStatus()
+  );
 
   registry.handle(ipcMain, CH.AUTH_SIGN_IN, async (_event, payload) => {
     try {
@@ -30,7 +38,11 @@ export function register(
         gatewayUrl: typeof payload?.gatewayUrl === 'string' ? payload.gatewayUrl : undefined,
       });
       if (result.ok === true) {
-        deps.emitAuthChanged?.(auth.getStatus() as Record<string, unknown>);
+        const runtimeResult = await deps.onSignedIn?.();
+        deps.emitAuthChanged?.(statusPayload());
+        if (runtimeResult && typeof runtimeResult === 'object') {
+          return { ...result, runtime: runtimeResult };
+        }
       }
       return result;
     } catch (err) {
@@ -44,7 +56,8 @@ export function register(
   registry.handle(ipcMain, CH.AUTH_SIGN_OUT, async () => {
     try {
       const result = await auth.signOut();
-      deps.emitAuthChanged?.(auth.getStatus() as Record<string, unknown>);
+      await deps.onSignedOut?.();
+      deps.emitAuthChanged?.(statusPayload());
       return result;
     } catch (err) {
       return {
@@ -56,7 +69,7 @@ export function register(
 
   registry.handle(ipcMain, CH.AUTH_STATUS, async () => {
     try {
-      return auth.getStatus();
+      return statusPayload();
     } catch (err) {
       return {
         ok: false,

@@ -270,6 +270,30 @@ export class MediationService {
     return mediationCase;
   }
 
+  setPartyConsent(
+    caseId: string,
+    partyId: string,
+    input: { allowSummaryShare: boolean; allowDirectQuote: boolean },
+  ): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    const participant = mediationCase.partyParticipationById[partyId];
+    if (!participant) {
+      throw new DomainError('party_not_found', `party '${partyId}' not found in case`);
+    }
+
+    const grant = mediationCase.consent.byPartyId[partyId];
+    if (!grant) {
+      throw new DomainError('missing_consent', `consent policy for '${partyId}' is missing`);
+    }
+
+    grant.allowSummaryShare = input.allowSummaryShare === true;
+    grant.allowDirectQuote = input.allowDirectQuote === true;
+
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
   setPartyReady(caseId: string, partyId: string): MediationCase {
     const mediationCase = this.getCase(caseId);
     if (mediationCase.phase !== 'awaiting_join' && mediationCase.phase !== 'private_intake') {

@@ -1,6 +1,16 @@
 import { registerBuiltInProviders } from '../../src/llm/providers';
 import { startLocalPromptBridge } from '../../src/llm/local-prompt-bridge';
 
+// Gracefully handle EPIPE errors (broken pipe) instead of crashing.
+function handleEpipe(err: NodeJS.ErrnoException): void {
+  if (err.code === 'EPIPE') {
+    process.exit(0);
+  }
+  throw err;
+}
+process.stdout.on('error', handleEpipe);
+process.stderr.on('error', handleEpipe);
+
 function pickEnv(name: string, fallback: string): string {
   const value = process.env[name];
   if (typeof value !== 'string' || !value.trim()) {

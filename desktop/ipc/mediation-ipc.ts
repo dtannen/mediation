@@ -11,6 +11,11 @@ interface MediationService {
   listCases: () => Record<string, unknown>[];
   joinWithInvite: (caseId: string, partyId: string, inviteToken: string) => Record<string, unknown>;
   appendPrivateMessage: (input: Record<string, unknown>) => Record<string, unknown>;
+  setPartyConsent: (
+    caseId: string,
+    partyId: string,
+    input: { allowSummaryShare: boolean; allowDirectQuote: boolean },
+  ) => Record<string, unknown>;
   setPrivateSummary: (caseId: string, partyId: string, summary: string, resolved?: boolean) => Record<string, unknown>;
   setPartyReady: (caseId: string, partyId: string) => Record<string, unknown>;
   sendDirectGroupMessage: (caseId: string, partyId: string, text: string, tags?: string[]) => Record<string, unknown>;
@@ -42,12 +47,40 @@ function fail(err: unknown): Record<string, unknown> {
   return { ok: false, error: toError(err) };
 }
 
+function pickString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function emitCaseUpdate(
+  deps: {
+    emitMediationEvent?: (payload: Record<string, unknown>) => void;
+  },
+  action: string,
+  mediationCase: Record<string, unknown> | null,
+  extra: Record<string, unknown> = {},
+): void {
+  if (!mediationCase || typeof mediationCase !== 'object') {
+    return;
+  }
+
+  deps.emitMediationEvent?.({
+    type: 'case.updated',
+    action,
+    caseId: pickString(mediationCase.id),
+    case: mediationCase,
+    ...extra,
+  });
+}
+
 export function register(
   ipcMain: unknown,
   deps: {
     registry: IpcRegistry;
     mediationService: MediationService;
     runIntakeTemplate?: (input: { caseId: string; partyId: string }) => Promise<Record<string, unknown>>;
+    runCoachReply?: (input: { caseId: string; partyId: string; prompt: string }) => Promise<Record<string, unknown>>;
+    runDraftSuggestion?: (input: { caseId: string; draftId: string }) => Promise<Record<string, unknown>>;
+    emitMediationEvent?: (payload: Record<string, unknown>) => void;
   },
 ): void {
   const r = deps.registry;
@@ -55,7 +88,9 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_CREATE, async (_event, payload) => {
     try {
-      return ok({ case: svc.createCase(payload || {}) });
+      const mediationCase = svc.createCase(payload || {});
+      emitCaseUpdate(deps, 'create', mediationCase);
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -77,9 +112,67 @@ export function register(
     }
   });
 
+  r.handle(ipcMain, CH.MEDIATION_PEEK_INVITE, async (_event, payload) => {
+    try {
+      const caseId = String(payload?.caseId || '').trim();
+      const inviteToken = String(payload?.inviteToken || '').trim();
+      const mediationCase = svc.getCase(caseId);
+      const inviteLink = mediationCase.inviteLink && typeof mediationCase.inviteLink === 'object'
+        ? mediationCase.inviteLink as Record<string, unknown>
+        : {};
+
+      if (inviteToken && String(inviteLink.token || '') !== inviteToken) {
+        throw new DomainError('invalid_invite_token', 'invite token is invalid');
+      }
+
+      const participationById = (
+        mediationCase.partyParticipationById
+        && typeof mediationCase.partyParticipationById === 'object'
+      ) ? mediationCase.partyParticipationById as Record<string, unknown> : {};
+
+      const parties = Array.isArray(mediationCase.parties)
+        ? mediationCase.parties.map((party) => {
+          const partyId = typeof party === 'object' && party ? String((party as Record<string, unknown>).id || '') : '';
+          const participation = participationById[partyId];
+          const state = participation && typeof participation === 'object'
+            ? String((participation as Record<string, unknown>).state || 'invited')
+            : 'invited';
+
+          return {
+            id: partyId,
+            displayName: typeof party === 'object' && party
+              ? String((party as Record<string, unknown>).displayName || partyId)
+              : partyId,
+            state,
+          };
+        })
+        : [];
+
+      return ok({
+        preview: {
+          caseId: String(mediationCase.id || caseId),
+          topic: String(mediationCase.topic || ''),
+          description: String(mediationCase.description || ''),
+          parties,
+          availablePartyIds: parties
+            .filter((party) => party.state === 'invited' || party.state === 'joined')
+            .map((party) => party.id),
+        },
+      });
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
   r.handle(ipcMain, CH.MEDIATION_JOIN, async (_event, payload) => {
     try {
-      return ok({ case: svc.joinWithInvite(String(payload?.caseId || ''), String(payload?.partyId || ''), String(payload?.inviteToken || '')) });
+      const mediationCase = svc.joinWithInvite(
+        String(payload?.caseId || ''),
+        String(payload?.partyId || ''),
+        String(payload?.inviteToken || ''),
+      );
+      emitCaseUpdate(deps, 'join', mediationCase, { partyId: String(payload?.partyId || '') });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -87,7 +180,52 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_APPEND_PRIVATE, async (_event, payload) => {
     try {
-      return ok({ case: svc.appendPrivateMessage(payload || {}) });
+      const mediationCase = svc.appendPrivateMessage(payload || {});
+      emitCaseUpdate(deps, 'append_private', mediationCase, {
+        partyId: String(payload?.partyId || ''),
+      });
+      return ok({ case: mediationCase });
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
+  r.handle(ipcMain, CH.MEDIATION_COACH_REPLY, async (_event, payload) => {
+    try {
+      const runner = deps.runCoachReply;
+      if (typeof runner !== 'function') {
+        return fail(new DomainError('internal_error', 'coach reply runner is not configured'));
+      }
+      const result = await runner({
+        caseId: String(payload?.caseId || ''),
+        partyId: String(payload?.partyId || ''),
+        prompt: String(payload?.prompt || ''),
+      });
+      if (result.case && typeof result.case === 'object') {
+        emitCaseUpdate(deps, 'coach_reply', result.case as Record<string, unknown>, {
+          partyId: String(payload?.partyId || ''),
+        });
+      }
+      return ok(result);
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
+  r.handle(ipcMain, CH.MEDIATION_SET_CONSENT, async (_event, payload) => {
+    try {
+      const mediationCase = svc.setPartyConsent(
+        String(payload?.caseId || ''),
+        String(payload?.partyId || ''),
+        {
+          allowSummaryShare: payload?.allowSummaryShare === true,
+          allowDirectQuote: payload?.allowDirectQuote === true,
+        },
+      );
+      emitCaseUpdate(deps, 'set_consent', mediationCase, {
+        partyId: String(payload?.partyId || ''),
+      });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -95,14 +233,16 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_SET_PRIVATE_SUMMARY, async (_event, payload) => {
     try {
-      return ok({
-        case: svc.setPrivateSummary(
-          String(payload?.caseId || ''),
-          String(payload?.partyId || ''),
-          String(payload?.summary || ''),
-          payload?.resolved !== false,
-        ),
+      const mediationCase = svc.setPrivateSummary(
+        String(payload?.caseId || ''),
+        String(payload?.partyId || ''),
+        String(payload?.summary || ''),
+        payload?.resolved !== false,
+      );
+      emitCaseUpdate(deps, 'set_private_summary', mediationCase, {
+        partyId: String(payload?.partyId || ''),
       });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -118,6 +258,11 @@ export function register(
         caseId: String(payload?.caseId || ''),
         partyId: String(payload?.partyId || ''),
       });
+      if (result.case && typeof result.case === 'object') {
+        emitCaseUpdate(deps, 'intake_template', result.case as Record<string, unknown>, {
+          partyId: String(payload?.partyId || ''),
+        });
+      }
       return ok(result);
     } catch (err) {
       return fail(err);
@@ -126,7 +271,11 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_SET_READY, async (_event, payload) => {
     try {
-      return ok({ case: svc.setPartyReady(String(payload?.caseId || ''), String(payload?.partyId || '')) });
+      const mediationCase = svc.setPartyReady(String(payload?.caseId || ''), String(payload?.partyId || ''));
+      emitCaseUpdate(deps, 'set_ready', mediationCase, {
+        partyId: String(payload?.partyId || ''),
+      });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -134,14 +283,16 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_SEND_DIRECT, async (_event, payload) => {
     try {
-      return ok({
-        case: svc.sendDirectGroupMessage(
-          String(payload?.caseId || ''),
-          String(payload?.partyId || ''),
-          String(payload?.text || ''),
-          Array.isArray(payload?.tags) ? payload.tags : [],
-        ),
+      const mediationCase = svc.sendDirectGroupMessage(
+        String(payload?.caseId || ''),
+        String(payload?.partyId || ''),
+        String(payload?.text || ''),
+        Array.isArray(payload?.tags) ? payload.tags : [],
+      );
+      emitCaseUpdate(deps, 'send_direct', mediationCase, {
+        partyId: String(payload?.partyId || ''),
       });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -149,13 +300,17 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_CREATE_DRAFT, async (_event, payload) => {
     try {
-      return ok({
-        draft: svc.createCoachDraft(
-          String(payload?.caseId || ''),
-          String(payload?.partyId || ''),
-          String(payload?.initialPartyMessage || ''),
-        ),
+      const draft = svc.createCoachDraft(
+        String(payload?.caseId || ''),
+        String(payload?.partyId || ''),
+        String(payload?.initialPartyMessage || ''),
+      );
+      const mediationCase = svc.getCase(String(payload?.caseId || ''));
+      emitCaseUpdate(deps, 'create_draft', mediationCase, {
+        partyId: String(payload?.partyId || ''),
+        draftId: String(draft.id || ''),
       });
+      return ok({ draft, case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -163,14 +318,16 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_APPEND_DRAFT, async (_event, payload) => {
     try {
-      return ok({
-        case: svc.appendCoachDraftMessage(
-          String(payload?.caseId || ''),
-          String(payload?.draftId || ''),
-          payload?.author === 'party_llm' ? 'party_llm' : 'party',
-          String(payload?.text || ''),
-        ),
+      const mediationCase = svc.appendCoachDraftMessage(
+        String(payload?.caseId || ''),
+        String(payload?.draftId || ''),
+        payload?.author === 'party_llm' ? 'party_llm' : 'party',
+        String(payload?.text || ''),
+      );
+      emitCaseUpdate(deps, 'append_draft', mediationCase, {
+        draftId: String(payload?.draftId || ''),
       });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -178,7 +335,36 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_SUGGEST_DRAFT, async (_event, payload) => {
     try {
-      return ok({ case: svc.setCoachDraftSuggestion(String(payload?.caseId || ''), String(payload?.draftId || ''), String(payload?.suggestedText || '')) });
+      const mediationCase = svc.setCoachDraftSuggestion(
+        String(payload?.caseId || ''),
+        String(payload?.draftId || ''),
+        String(payload?.suggestedText || ''),
+      );
+      emitCaseUpdate(deps, 'suggest_draft', mediationCase, {
+        draftId: String(payload?.draftId || ''),
+      });
+      return ok({ case: mediationCase });
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
+  r.handle(ipcMain, CH.MEDIATION_RUN_DRAFT_SUGGESTION, async (_event, payload) => {
+    try {
+      const runner = deps.runDraftSuggestion;
+      if (typeof runner !== 'function') {
+        return fail(new DomainError('internal_error', 'draft suggestion runner is not configured'));
+      }
+      const result = await runner({
+        caseId: String(payload?.caseId || ''),
+        draftId: String(payload?.draftId || ''),
+      });
+      if (result.case && typeof result.case === 'object') {
+        emitCaseUpdate(deps, 'run_draft_suggestion', result.case as Record<string, unknown>, {
+          draftId: String(payload?.draftId || ''),
+        });
+      }
+      return ok(result);
     } catch (err) {
       return fail(err);
     }
@@ -186,13 +372,15 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_APPROVE_DRAFT, async (_event, payload) => {
     try {
-      return ok({
-        case: svc.approveCoachDraftAndSend(
-          String(payload?.caseId || ''),
-          String(payload?.draftId || ''),
-          typeof payload?.approvedText === 'string' ? payload.approvedText : undefined,
-        ),
+      const mediationCase = svc.approveCoachDraftAndSend(
+        String(payload?.caseId || ''),
+        String(payload?.draftId || ''),
+        typeof payload?.approvedText === 'string' ? payload.approvedText : undefined,
+      );
+      emitCaseUpdate(deps, 'approve_draft', mediationCase, {
+        draftId: String(payload?.draftId || ''),
       });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -200,7 +388,15 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_REJECT_DRAFT, async (_event, payload) => {
     try {
-      return ok({ case: svc.rejectCoachDraft(String(payload?.caseId || ''), String(payload?.draftId || ''), typeof payload?.reason === 'string' ? payload.reason : undefined) });
+      const mediationCase = svc.rejectCoachDraft(
+        String(payload?.caseId || ''),
+        String(payload?.draftId || ''),
+        typeof payload?.reason === 'string' ? payload.reason : undefined,
+      );
+      emitCaseUpdate(deps, 'reject_draft', mediationCase, {
+        draftId: String(payload?.draftId || ''),
+      });
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -208,7 +404,9 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_RESOLVE, async (_event, payload) => {
     try {
-      return ok({ case: svc.resolveCase(String(payload?.caseId || ''), String(payload?.resolution || '')) });
+      const mediationCase = svc.resolveCase(String(payload?.caseId || ''), String(payload?.resolution || ''));
+      emitCaseUpdate(deps, 'resolve', mediationCase);
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }
@@ -216,7 +414,9 @@ export function register(
 
   r.handle(ipcMain, CH.MEDIATION_CLOSE, async (_event, payload) => {
     try {
-      return ok({ case: svc.closeCase(String(payload?.caseId || '')) });
+      const mediationCase = svc.closeCase(String(payload?.caseId || ''));
+      emitCaseUpdate(deps, 'close', mediationCase);
+      return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);
     }

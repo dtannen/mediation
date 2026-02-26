@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { CLIENT_ID, randomString, codeChallengeFromVerifier, parseJwtPayload, buildAuthorizeUrl } from './lib/pkce';
 import { validateTrustedOrigin, normalizeTrustedUrl } from './lib/trusted-origins';
 
@@ -9,6 +10,51 @@ export const DEFAULT_GATEWAY_URL = 'https://api.commands.com';
 
 const LOGIN_TIMEOUT_MS = 300_000;
 const TOKEN_REQUEST_TIMEOUT_MS = 30_000;
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+interface MediationDeviceIdentity {
+  algorithm: 'ed25519';
+  publicKeyDerBase64: string;
+  privateKeyDerBase64: string;
+  publicKeyRawBase64: string;
+}
+
+interface RuntimeLaunchConfig {
+  gatewayUrl: string;
+  accessToken: string;
+  refreshToken: string | null;
+  tokenExpiresAt: string | null;
+  ownerUid: string;
+  ownerEmail: string;
+  deviceId: string;
+  deviceName: string;
+  identity: MediationDeviceIdentity;
+}
+
+function readRawFromSpki(spkiDer: Buffer, prefix: Buffer, label: string): Buffer {
+  if (spkiDer.length !== prefix.length + 32) {
+    throw new Error(`Invalid ${label} SPKI length: ${spkiDer.length}`);
+  }
+  const head = spkiDer.subarray(0, prefix.length);
+  if (!head.equals(prefix)) {
+    throw new Error(`Unexpected ${label} SPKI prefix`);
+  }
+  return spkiDer.subarray(prefix.length);
+}
+
+function generateMediationIdentity(): MediationDeviceIdentity {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const publicKeyDer = Buffer.from(publicKey.export({ format: 'der', type: 'spki' }));
+  const privateKeyDer = Buffer.from(privateKey.export({ format: 'der', type: 'pkcs8' }));
+  const publicKeyRaw = readRawFromSpki(publicKeyDer, ED25519_SPKI_PREFIX, 'ed25519');
+
+  return {
+    algorithm: 'ed25519',
+    publicKeyDerBase64: publicKeyDer.toString('base64'),
+    privateKeyDerBase64: privateKeyDer.toString('base64'),
+    publicKeyRawBase64: publicKeyRaw.toString('base64'),
+  };
+}
 
 interface AuthServiceDeps {
   shell: { openExternal: (url: string) => Promise<void> | void };
@@ -207,6 +253,12 @@ export default function createAuthService(deps: AuthServiceDeps) {
   let email = '';
   let uid = '';
   let gatewayUrl = DEFAULT_GATEWAY_URL;
+  let mediationDeviceId = '';
+  let mediationDeviceName = '';
+  let mediationIdentity: MediationDeviceIdentity | null = null;
+  let mediationRegisteredAt = 0;
+  let mediationOwnerUid = '';
+  let mediationGatewayUrl = '';
 
   let refreshPromise: Promise<void> | null = null;
 
@@ -221,6 +273,32 @@ export default function createAuthService(deps: AuthServiceDeps) {
     return { uid: sub, email: emailValue };
   }
 
+  function generateMediationDeviceId(): string {
+    return `dev_${crypto.randomBytes(16).toString('hex')}`;
+  }
+
+  function generateMediationDeviceName(currentUid: string): string {
+    const host = os.hostname().replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 20);
+    const uidSuffix = currentUid ? currentUid.slice(-8) : crypto.randomBytes(4).toString('hex');
+    return `mediation-${host || 'desktop'}-${uidSuffix}`;
+  }
+
+  function hasValidMediationIdentity(value: unknown): value is MediationDeviceIdentity {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    return (
+      record.algorithm === 'ed25519'
+      && typeof record.publicKeyDerBase64 === 'string'
+      && record.publicKeyDerBase64.length > 0
+      && typeof record.privateKeyDerBase64 === 'string'
+      && record.privateKeyDerBase64.length > 0
+      && typeof record.publicKeyRawBase64 === 'string'
+      && record.publicKeyRawBase64.length > 0
+    );
+  }
+
   function persistAuthState(): void {
     ensureAuthDir();
 
@@ -231,6 +309,14 @@ export default function createAuthService(deps: AuthServiceDeps) {
       tokenExpiresAt,
       uid,
       email,
+      mediationDevice: mediationDeviceId && mediationIdentity ? {
+        deviceId: mediationDeviceId,
+        deviceName: mediationDeviceName,
+        identity: mediationIdentity,
+        registeredAt: mediationRegisteredAt,
+        ownerUid: mediationOwnerUid,
+        gatewayUrl: mediationGatewayUrl,
+      } : null,
       updatedAt: Date.now(),
     };
 
@@ -250,9 +336,7 @@ export default function createAuthService(deps: AuthServiceDeps) {
 
   function clearPersistedAuthState(): void {
     try {
-      if (existsSync(DESKTOP_AUTH_PATH)) {
-        unlinkSync(DESKTOP_AUTH_PATH);
-      }
+      persistAuthState();
       ensureAuthDir();
       writeFileSync(DESKTOP_SIGNOUT_SENTINEL, String(Date.now()), 'utf8');
     } catch {
@@ -284,6 +368,27 @@ export default function createAuthService(deps: AuthServiceDeps) {
     tokenExpiresAt = typeof parsed.tokenExpiresAt === 'number' ? parsed.tokenExpiresAt : 0;
     uid = typeof parsed.uid === 'string' ? parsed.uid : '';
     email = typeof parsed.email === 'string' ? parsed.email : '';
+
+    const mediationRecord = parsed.mediationDevice;
+    if (mediationRecord && typeof mediationRecord === 'object') {
+      const deviceRecord = mediationRecord as Record<string, unknown>;
+      if (typeof deviceRecord.deviceId === 'string' && hasValidMediationIdentity(deviceRecord.identity)) {
+        mediationDeviceId = deviceRecord.deviceId;
+        mediationIdentity = deviceRecord.identity;
+        mediationDeviceName = typeof deviceRecord.deviceName === 'string'
+          ? deviceRecord.deviceName
+          : '';
+        mediationRegisteredAt = typeof deviceRecord.registeredAt === 'number'
+          ? deviceRecord.registeredAt
+          : 0;
+        mediationOwnerUid = typeof deviceRecord.ownerUid === 'string'
+          ? deviceRecord.ownerUid
+          : '';
+        mediationGatewayUrl = typeof deviceRecord.gatewayUrl === 'string'
+          ? normalizeTrustedUrl(deviceRecord.gatewayUrl, DEFAULT_GATEWAY_URL)
+          : '';
+      }
+    }
 
     if (!uid && accessToken) {
       const meta = parseTokenMetadata(accessToken);
@@ -440,9 +545,170 @@ export default function createAuthService(deps: AuthServiceDeps) {
     return refreshPromise;
   }
 
+  async function getAccessToken(options: { forceRefresh?: boolean } = {}): Promise<string> {
+    if (!accessToken) {
+      throw new Error('Not signed in');
+    }
+
+    await performRefreshTokenIfNeeded(Boolean(options.forceRefresh));
+
+    if (!accessToken) {
+      throw new Error('Not signed in');
+    }
+    return accessToken;
+  }
+
+  async function putIdentityKey(
+    gatewayUrlValue: string,
+    token: string,
+    deviceId: string,
+    identity: MediationDeviceIdentity,
+    displayName: string,
+  ): Promise<void> {
+    const response = await fetchWithTimeout(
+      `${gatewayUrlValue}/gateway/v1/devices/${encodeURIComponent(deviceId)}/identity-key`,
+      {
+        method: 'PUT',
+        redirect: 'manual',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          algorithm: 'ed25519',
+          public_key: identity.publicKeyRawBase64,
+          ...(displayName ? { display_name: displayName } : {}),
+        }),
+      },
+      TOKEN_REQUEST_TIMEOUT_MS,
+      'Device registration',
+    );
+
+    const text = await response.text().catch(() => '');
+    if (response.ok) {
+      return;
+    }
+
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = text ? JSON.parse(text) as Record<string, unknown> : {};
+    } catch {
+      parsed = {};
+    }
+
+    const message = (
+      typeof parsed.message === 'string' && parsed.message.trim()
+        ? parsed.message.trim()
+        : (
+          typeof parsed.error === 'string' && parsed.error.trim()
+            ? parsed.error.trim()
+            : text.trim()
+        )
+    ) || `HTTP ${response.status}`;
+
+    const err = new Error(`Device registration failed: ${message}`) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
+  }
+
+  async function registerMediationDeviceIdentity(
+    deviceId: string,
+    identity: MediationDeviceIdentity,
+    displayName: string,
+  ): Promise<void> {
+    const token = await getAccessToken();
+
+    try {
+      await putIdentityKey(gatewayUrl, token, deviceId, identity, displayName);
+      return;
+    } catch (err) {
+      const status = typeof (err as { status?: unknown })?.status === 'number'
+        ? (err as { status: number }).status
+        : 0;
+      if (status !== 401) {
+        throw err;
+      }
+    }
+
+    const refreshed = await getAccessToken({ forceRefresh: true });
+    await putIdentityKey(gatewayUrl, refreshed, deviceId, identity, displayName);
+  }
+
+  async function ensureMediationDeviceRegistered(): Promise<{ deviceId: string; deviceName: string; reused: boolean }> {
+    if (!uid) {
+      throw new Error('Cannot register mediation device without authenticated user');
+    }
+
+    const reusable = Boolean(
+      mediationDeviceId
+      && mediationIdentity
+      && mediationOwnerUid
+      && mediationOwnerUid === uid
+      && mediationGatewayUrl
+      && normalizeTrustedUrl(mediationGatewayUrl, DEFAULT_GATEWAY_URL) === gatewayUrl,
+    );
+
+    const nextIdentity = reusable && mediationIdentity
+      ? mediationIdentity
+      : generateMediationIdentity();
+    const nextDeviceId = reusable && mediationDeviceId
+      ? mediationDeviceId
+      : generateMediationDeviceId();
+    const nextDeviceName = reusable && mediationDeviceName
+      ? mediationDeviceName
+      : generateMediationDeviceName(uid);
+
+    await registerMediationDeviceIdentity(nextDeviceId, nextIdentity, nextDeviceName);
+
+    mediationDeviceId = nextDeviceId;
+    mediationDeviceName = nextDeviceName;
+    mediationIdentity = nextIdentity;
+    mediationRegisteredAt = Date.now();
+    mediationOwnerUid = uid;
+    mediationGatewayUrl = gatewayUrl;
+
+    persistAuthState();
+
+    return {
+      deviceId: mediationDeviceId,
+      deviceName: mediationDeviceName,
+      reused: reusable,
+    };
+  }
+
   async function signIn(input: { gatewayUrl?: string } = {}): Promise<Record<string, unknown>> {
     gatewayUrl = normalizeTrustedUrl(input.gatewayUrl || gatewayUrl, DEFAULT_GATEWAY_URL);
     validateTrustedOrigin(gatewayUrl);
+
+    if (accessToken) {
+      try {
+        await getAccessToken();
+        if (!uid) {
+          const meta = parseTokenMetadata(accessToken);
+          uid = meta.uid;
+          email = meta.email;
+        }
+        const mediationDevice = await ensureMediationDeviceRegistered();
+        persistAuthState();
+        return {
+          ok: true,
+          uid,
+          email,
+          expiresAt: tokenExpiresAt > 0 ? new Date(tokenExpiresAt).toISOString() : null,
+          gatewayUrl,
+          reusedSession: true,
+          mediationDevice: {
+            id: mediationDevice.deviceId,
+            name: mediationDevice.deviceName,
+            reused: mediationDevice.reused,
+            registeredAt: new Date(mediationRegisteredAt).toISOString(),
+          },
+        };
+      } catch {
+        // Fall through to full OAuth if existing session cannot be reused.
+      }
+    }
 
     const state = randomString(16);
     const codeVerifier = randomString(64);
@@ -465,6 +731,7 @@ export default function createAuthService(deps: AuthServiceDeps) {
       uid = meta.uid;
       email = meta.email;
 
+      const mediationDevice = await ensureMediationDeviceRegistered();
       persistAuthState();
 
       return {
@@ -473,6 +740,12 @@ export default function createAuthService(deps: AuthServiceDeps) {
         email,
         expiresAt: new Date(tokenExpiresAt).toISOString(),
         gatewayUrl,
+        mediationDevice: {
+          id: mediationDevice.deviceId,
+          name: mediationDevice.deviceName,
+          reused: mediationDevice.reused,
+          registeredAt: new Date(mediationRegisteredAt).toISOString(),
+        },
       };
     } finally {
       callback.close();
@@ -492,6 +765,7 @@ export default function createAuthService(deps: AuthServiceDeps) {
 
   function getStatus(): Record<string, unknown> {
     const signedIn = Boolean(accessToken);
+    const hasMediationDevice = Boolean(mediationDeviceId && mediationIdentity);
     return {
       ok: true,
       signedIn,
@@ -499,22 +773,49 @@ export default function createAuthService(deps: AuthServiceDeps) {
       email: signedIn ? email : null,
       gatewayUrl,
       expiresAt: signedIn && tokenExpiresAt > 0 ? new Date(tokenExpiresAt).toISOString() : null,
+      mediationDevice: hasMediationDevice ? {
+        id: mediationDeviceId,
+        name: mediationDeviceName || null,
+        ownerUid: mediationOwnerUid || null,
+        gatewayUrl: mediationGatewayUrl || null,
+        registeredAt: mediationRegisteredAt > 0 ? new Date(mediationRegisteredAt).toISOString() : null,
+      } : null,
     };
   }
 
   async function getAuthHeaders(options: { forceRefresh?: boolean } = {}): Promise<Record<string, string>> {
-    if (!accessToken) {
-      throw new Error('Not signed in');
-    }
-
-    await performRefreshTokenIfNeeded(Boolean(options.forceRefresh));
-
-    if (!accessToken) {
-      throw new Error('Not signed in');
-    }
+    const token = await getAccessToken(options);
 
     return {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${token}`,
+    };
+  }
+
+  async function getRuntimeLaunchConfig(): Promise<RuntimeLaunchConfig | null> {
+    if (!accessToken || !uid) {
+      return null;
+    }
+
+    if (!mediationDeviceId || !mediationIdentity) {
+      await ensureMediationDeviceRegistered();
+    }
+
+    if (!mediationDeviceId || !mediationIdentity) {
+      return null;
+    }
+
+    const token = await getAccessToken();
+
+    return {
+      gatewayUrl,
+      accessToken: token,
+      refreshToken,
+      tokenExpiresAt: tokenExpiresAt > 0 ? new Date(tokenExpiresAt).toISOString() : null,
+      ownerUid: uid,
+      ownerEmail: email,
+      deviceId: mediationDeviceId,
+      deviceName: mediationDeviceName,
+      identity: mediationIdentity,
     };
   }
 
@@ -530,5 +831,6 @@ export default function createAuthService(deps: AuthServiceDeps) {
     getStatus,
     getAuthHeaders,
     getGatewayUrl,
+    getRuntimeLaunchConfig,
   };
 }

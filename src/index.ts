@@ -1,5 +1,16 @@
 import { MediationService } from './app/mediation-service';
 
+// Gracefully handle EPIPE errors (broken pipe) instead of crashing.
+// This occurs when stdout/stderr is piped to a process that closes early.
+function handleEpipe(err: NodeJS.ErrnoException): void {
+  if (err.code === 'EPIPE') {
+    process.exit(0);
+  }
+  throw err;
+}
+process.stdout.on('error', handleEpipe);
+process.stderr.on('error', handleEpipe);
+
 function printSection(title: string): void {
   console.log(`\n=== ${title} ===`);
 }

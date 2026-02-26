@@ -61,8 +61,16 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
       create: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_CREATE, payload),
       get: (caseId: string) => ipcRenderer.invoke(CH.MEDIATION_GET, { caseId }),
       list: () => ipcRenderer.invoke(CH.MEDIATION_LIST),
+      peekInvite: (payload: { caseId: string; inviteToken: string }) => ipcRenderer.invoke(CH.MEDIATION_PEEK_INVITE, payload),
       join: (payload: { caseId: string; partyId: string; inviteToken: string }) => ipcRenderer.invoke(CH.MEDIATION_JOIN, payload),
       appendPrivate: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_APPEND_PRIVATE, payload),
+      coachReply: (payload: { caseId: string; partyId: string; prompt: string }) => ipcRenderer.invoke(CH.MEDIATION_COACH_REPLY, payload),
+      setConsent: (payload: {
+        caseId: string;
+        partyId: string;
+        allowSummaryShare: boolean;
+        allowDirectQuote: boolean;
+      }) => ipcRenderer.invoke(CH.MEDIATION_SET_CONSENT, payload),
       setPrivateSummary: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_SET_PRIVATE_SUMMARY, payload),
       runIntakeTemplate: (payload: { caseId: string; partyId: string }) => ipcRenderer.invoke(CH.MEDIATION_RUN_INTAKE_TEMPLATE, payload),
       setReady: (payload: { caseId: string; partyId: string }) => ipcRenderer.invoke(CH.MEDIATION_SET_READY, payload),
@@ -70,6 +78,7 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
       createDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_CREATE_DRAFT, payload),
       appendDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_APPEND_DRAFT, payload),
       suggestDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_SUGGEST_DRAFT, payload),
+      runDraftSuggestion: (payload: { caseId: string; draftId: string }) => ipcRenderer.invoke(CH.MEDIATION_RUN_DRAFT_SUGGESTION, payload),
       approveDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_APPROVE_DRAFT, payload),
       rejectDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_REJECT_DRAFT, payload),
       resolve: (payload: { caseId: string; resolution: string }) => ipcRenderer.invoke(CH.MEDIATION_RESOLVE, payload),
