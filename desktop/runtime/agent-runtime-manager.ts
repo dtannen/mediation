@@ -667,6 +667,7 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
     let prompt = '';
     let conversationId = asString(frame.conversation_id ?? frame.conversationId) || session.conversationId;
     let correlationId = '';
+    let parsedPayload: Record<string, unknown> | null = null;
 
     if (hasEncryptedFields) {
       encryptedRequest = true;
@@ -775,6 +776,7 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
       correlationId = asString(payload.correlation_id ?? payload.correlationId);
 
       prompt = asString(payload.prompt ?? payload.text ?? payload.message);
+      parsedPayload = payload;
       session.nextIncomingSeq += 1;
     } else {
       const payload = asRecord(frame.payload);
@@ -792,6 +794,7 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
         conversationId = payloadConversationId;
       }
       correlationId = asString(payload?.correlation_id ?? payload?.correlationId);
+      parsedPayload = payload;
     }
 
     session.conversationId = conversationId || null;
@@ -818,17 +821,35 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
     // ── Extract transport-authenticated identity from the frame ──────────
     // This MUST happen before event/command branching so both paths have
     // access to the authenticated requester context from the gateway relay.
-    const requesterRecord = asRecord(frame.requester);
+    const frameAuthContext = asRecord(frame.auth_context ?? frame.authContext);
+    const payloadAuthContext = asRecord(parsedPayload?.auth_context ?? parsedPayload?.authContext);
+    const requesterRecord = (
+      asRecord(frame.requester)
+      || asRecord(frameAuthContext?.requester)
+      || asRecord(payloadAuthContext?.requester)
+    );
     const requesterUid = asString(
       frame.requester_uid
       ?? frame.requesterUid
       ?? frame.user_id
       ?? frame.userId
+      ?? frameAuthContext?.requester_uid
+      ?? frameAuthContext?.requesterUid
+      ?? frameAuthContext?.uid
+      ?? payloadAuthContext?.requester_uid
+      ?? payloadAuthContext?.requesterUid
+      ?? payloadAuthContext?.uid
       ?? requesterRecord?.uid,
     ) || 'unknown';
     const requesterEmail = asString(
       frame.requester_email
       ?? frame.requesterEmail
+      ?? frameAuthContext?.requester_email
+      ?? frameAuthContext?.requesterEmail
+      ?? frameAuthContext?.email
+      ?? payloadAuthContext?.requester_email
+      ?? payloadAuthContext?.requesterEmail
+      ?? payloadAuthContext?.email
       ?? requesterRecord?.email,
     );
     const requesterDeviceId = asString(
@@ -836,12 +857,24 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
       ?? frame.requesterDeviceId
       ?? frame.device_id
       ?? frame.deviceId
+      ?? frameAuthContext?.requester_device_id
+      ?? frameAuthContext?.requesterDeviceId
+      ?? frameAuthContext?.device_id
+      ?? frameAuthContext?.deviceId
+      ?? payloadAuthContext?.requester_device_id
+      ?? payloadAuthContext?.requesterDeviceId
+      ?? payloadAuthContext?.device_id
+      ?? payloadAuthContext?.deviceId
       ?? requesterRecord?.device_id
       ?? requesterRecord?.deviceId,
     ) || 'unknown';
     const grantId = asString(
       frame.grant_id
       ?? frame.grantId
+      ?? frameAuthContext?.grant_id
+      ?? frameAuthContext?.grantId
+      ?? payloadAuthContext?.grant_id
+      ?? payloadAuthContext?.grantId
       ?? requesterRecord?.grant_id
       ?? requesterRecord?.grantId,
     );
@@ -849,11 +882,21 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
       frame.requester_role
       ?? frame.requesterRole
       ?? frame.role
+      ?? frameAuthContext?.requester_role
+      ?? frameAuthContext?.requesterRole
+      ?? frameAuthContext?.role
+      ?? payloadAuthContext?.requester_role
+      ?? payloadAuthContext?.requesterRole
+      ?? payloadAuthContext?.role
       ?? requesterRecord?.role,
     );
     const grantStatusRaw = asString(
       frame.grant_status
       ?? frame.grantStatus
+      ?? frameAuthContext?.grant_status
+      ?? frameAuthContext?.grantStatus
+      ?? payloadAuthContext?.grant_status
+      ?? payloadAuthContext?.grantStatus
       ?? requesterRecord?.grant_status
       ?? requesterRecord?.grantStatus,
     );

@@ -129,6 +129,34 @@ function normalizeError(resultOrError, fallback = 'Something went wrong') {
   return fallback;
 }
 
+function buildGatewayAuthContext(input = {}) {
+  const grantId = typeof input.grantId === 'string' ? input.grantId.trim() : '';
+  if (!grantId) {
+    return null;
+  }
+
+  const auth = getState().auth || {};
+  const requesterUid = typeof auth.uid === 'string'
+    ? auth.uid.trim()
+    : (typeof auth.userId === 'string' ? auth.userId.trim() : '');
+  const device = auth.mediationDevice && typeof auth.mediationDevice === 'object'
+    ? auth.mediationDevice
+    : {};
+  const requesterDeviceId = typeof device.id === 'string' ? device.id.trim() : '';
+
+  if (!requesterUid || !requesterDeviceId) {
+    return null;
+  }
+
+  return {
+    requesterUid,
+    requesterDeviceId,
+    grantId,
+    role: input.role === 'owner' ? 'owner' : 'collaborator',
+    grantStatus: input.grantStatus === 'revoked' ? 'revoked' : 'active',
+  };
+}
+
 const REMOTE_MUTATING_COMMANDS = new Set([
   'case.join',
   'case.append_private',
@@ -270,10 +298,18 @@ async function syncRemoteCaseFromResult(input) {
 }
 
 async function sendGatewayMediationCommand(ownerDeviceId, envelope, options = {}) {
+  const authContext = buildGatewayAuthContext({
+    grantId: options.grantId,
+    role: options.role,
+    grantStatus: options.grantStatus,
+  });
+
   const gatewayResult = await api.gateway.sendMediationCommand({
     deviceId: ownerDeviceId,
     command: envelope,
     timeoutMs: options.timeoutMs || 60000,
+    maxRetries: options.maxRetries || 3,
+    ...(authContext ? { authContext } : {}),
   });
   if (!gatewayResult || gatewayResult.ok !== true) {
     return { ok: false, error: normalizeError(gatewayResult, 'Unable to reach remote mediation host') };
@@ -748,6 +784,8 @@ function getShareState() {
       lastCreatedInviteByDevice: {},
       discoveredCasesByGrant: {},
       discoveringCasesByGrant: {},
+      discoveryLoadedByGrant: {},
+      discoveryErrorByGrant: {},
       joiningCaseKeys: {},
     };
     return state.share;
@@ -756,11 +794,13 @@ function getShareState() {
   state.share.devicesLoadedAt = typeof state.share.devicesLoadedAt === 'string' ? state.share.devicesLoadedAt : null;
   state.share.discoveredCasesByGrant = state.share.discoveredCasesByGrant || {};
   state.share.discoveringCasesByGrant = state.share.discoveringCasesByGrant || {};
+  state.share.discoveryLoadedByGrant = state.share.discoveryLoadedByGrant || {};
+  state.share.discoveryErrorByGrant = state.share.discoveryErrorByGrant || {};
   state.share.joiningCaseKeys = state.share.joiningCaseKeys || {};
   return state.share;
 }
 
-async function listRemoteCasesForShare(shareContext) {
+async function listRemoteCasesForShare(shareContext, options = {}) {
   if (!shareContext) {
     return { ok: false, error: 'No active shared device selected' };
   }
@@ -768,16 +808,26 @@ async function listRemoteCasesForShare(shareContext) {
     command: 'case.list',
     payload: {},
   });
-  return sendGatewayMediationCommand(shareContext.ownerDeviceId, envelope);
+  return sendGatewayMediationCommand(shareContext.ownerDeviceId, envelope, {
+    ...options,
+    grantId: shareContext.grantId,
+    role: 'collaborator',
+    grantStatus: 'active',
+  });
 }
 
-async function getRemoteCaseSnapshot(context, caseId) {
+async function getRemoteCaseSnapshot(context, caseId, options = {}) {
   const envelope = buildRemoteCommandEnvelope({
     command: 'case.get',
     caseId,
     payload: {},
   });
-  return sendGatewayMediationCommand(context.ownerDeviceId, envelope);
+  return sendGatewayMediationCommand(context.ownerDeviceId, envelope, {
+    ...options,
+    grantId: context.grantId,
+    role: 'collaborator',
+    grantStatus: 'active',
+  });
 }
 
 async function sendRemoteCaseCommand(input) {
@@ -793,7 +843,13 @@ async function sendRemoteCaseCommand(input) {
     payload: input.payload || {},
   });
 
-  const commandResult = await sendGatewayMediationCommand(context.ownerDeviceId, envelope);
+  const commandResult = await sendGatewayMediationCommand(context.ownerDeviceId, envelope, {
+    grantId: context.grantId,
+    role: 'collaborator',
+    grantStatus: 'active',
+    ...(Number.isFinite(input?.timeoutMs) ? { timeoutMs: Number(input.timeoutMs) } : {}),
+    ...(Number.isFinite(input?.maxRetries) ? { maxRetries: Number(input.maxRetries) } : {}),
+  });
   if (!commandResult.ok) {
     return commandResult;
   }
@@ -829,20 +885,35 @@ async function discoverSharedCases(options = {}) {
     return;
   }
 
-  shareState.discoveringCasesByGrant[shareContext.grantId] = true;
+  const grantId = shareContext.grantId;
+  const discoveryCommandOptions = {
+    timeoutMs: 35_000,
+    maxRetries: 2,
+  };
+
+  shareState.discoveringCasesByGrant[grantId] = true;
+  delete shareState.discoveryErrorByGrant[grantId];
   if (!options.silent) render();
 
   try {
-    const listed = await listRemoteCasesForShare(shareContext);
+    const listed = await listRemoteCasesForShare(shareContext, discoveryCommandOptions);
     if (!listed.ok) {
+      const rawMessage = normalizeError(listed, 'Unable to discover remote cases');
+      const message = rawMessage.includes('remote response timeout')
+        ? 'Owner device did not respond in time. Keep the owner app open and signed in, then try Discover Cases again.'
+        : rawMessage;
+      shareState.discoveryErrorByGrant[grantId] = message;
+      shareState.discoveryLoadedByGrant[grantId] = true;
       if (!options.silent) {
-        showToast(normalizeError(listed, 'Unable to discover remote cases'), 'error');
+        showToast(message, 'error');
       }
       return;
     }
 
     const cases = Array.isArray(listed.result.cases) ? listed.result.cases : [];
-    shareState.discoveredCasesByGrant[shareContext.grantId] = cases;
+    shareState.discoveredCasesByGrant[grantId] = cases;
+    shareState.discoveryLoadedByGrant[grantId] = true;
+    delete shareState.discoveryErrorByGrant[grantId];
 
     for (const entry of cases) {
       if (!entry || typeof entry !== 'object') {
@@ -854,7 +925,7 @@ async function discoverSharedCases(options = {}) {
         continue;
       }
 
-      const fetched = await getRemoteCaseSnapshot(shareContext, caseId);
+      const fetched = await getRemoteCaseSnapshot(shareContext, caseId, discoveryCommandOptions);
       if (!fetched.ok) {
         continue;
       }
@@ -872,7 +943,7 @@ async function discoverSharedCases(options = {}) {
       }
     }
   } finally {
-    shareState.discoveringCasesByGrant[shareContext.grantId] = false;
+    shareState.discoveringCasesByGrant[grantId] = false;
     render();
   }
 }
@@ -1063,6 +1134,12 @@ function renderDashboardView() {
   const discoveringCases = consumeGrantId
     ? shareState.discoveringCasesByGrant[consumeGrantId] === true
     : false;
+  const discoveryLoaded = consumeGrantId
+    ? shareState.discoveryLoadedByGrant[consumeGrantId] === true
+    : false;
+  const discoveryError = consumeGrantId && typeof shareState.discoveryErrorByGrant[consumeGrantId] === 'string'
+    ? shareState.discoveryErrorByGrant[consumeGrantId]
+    : '';
 
   const createForm = state.createFormExpanded
     ? `
@@ -1141,6 +1218,12 @@ function renderDashboardView() {
           ` : ''}
           <button type="button" class="ghost" data-action="clear-share-consume">Clear</button>
         </div>
+        ${discoveryError ? `
+          <div class="small" style="color: var(--danger);">${escapeHtml(discoveryError)}</div>
+        ` : ''}
+        ${discoveryLoaded && !discoveringCases && !discoveryError && discoveredCases.length === 0 ? `
+          <div class="small muted">No shared cases found yet for this device share.</div>
+        ` : ''}
         ${discoveredCases.length > 0 ? `
           <div class="grant-list">
             ${discoveredCases.map((entry) => {
@@ -2319,6 +2402,20 @@ async function sendPrivateMessage(form) {
     }
 
     state.chatDrafts.set(draftKey, '');
+
+    const coachResult = await api.mediation.coachReply({
+      caseId: caseData.id,
+      partyId,
+      prompt: message,
+    });
+
+    if (coachResult && coachResult.ok === true && coachResult.case) {
+      patchState({ caseData: coachResult.case });
+      ensureCaseInList(coachResult.case);
+    } else {
+      showToast('Coach is taking a moment to respond.', 'info');
+    }
+
     render();
     return;
   }
@@ -2362,8 +2459,8 @@ async function runIntakeTemplate() {
   const current = caseData ? getCurrentParty(caseData) : null;
   if (!caseData || !current) return;
 
-  if (isSharedCase(caseData)) {
-    showToast('Summary template is owner-side only for shared cases.', 'info');
+  if (isSharedCase(caseData) && isReadOnlySharedCase(caseData)) {
+    showToast('This shared case is read-only.', 'error');
     return;
   }
 

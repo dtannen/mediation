@@ -7,7 +7,33 @@ if (typeof process.execPath === 'string' && process.execPath.trim()) {
   env.MEDIATION_NODE_PATH = process.execPath.trim();
 }
 
-const child = spawn(electronBinary, ['dist-desktop/desktop/main.js'], {
+const passthroughArgs = [];
+let profileFromArg = '';
+const rawArgs = process.argv.slice(2);
+
+for (let i = 0; i < rawArgs.length; i += 1) {
+  const value = rawArgs[i];
+  if (value.startsWith('--mediation-profile=')) {
+    profileFromArg = value.slice('--mediation-profile='.length).trim();
+    continue;
+  }
+  if (value.startsWith('--profile=')) {
+    profileFromArg = value.slice('--profile='.length).trim();
+    continue;
+  }
+  if ((value === '--mediation-profile' || value === '--profile') && i + 1 < rawArgs.length) {
+    profileFromArg = String(rawArgs[i + 1] || '').trim();
+    i += 1;
+    continue;
+  }
+  passthroughArgs.push(value);
+}
+
+if (profileFromArg && !env.MEDIATION_PROFILE) {
+  env.MEDIATION_PROFILE = profileFromArg;
+}
+
+const child = spawn(electronBinary, ['dist-desktop/desktop/main.js', ...passthroughArgs], {
   stdio: 'inherit',
   env,
 });

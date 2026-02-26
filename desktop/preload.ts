@@ -63,6 +63,14 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
         deviceId: string;
         command: Record<string, unknown>;
         timeoutMs?: number;
+        maxRetries?: number;
+        authContext?: {
+          requesterUid: string;
+          requesterDeviceId: string;
+          grantId: string;
+          role?: 'owner' | 'collaborator';
+          grantStatus?: 'active' | 'revoked';
+        };
       }) => ipcRenderer.invoke(CH.GW_MEDIATION_COMMAND, payload),
       endSession: (deviceId: string) => ipcRenderer.invoke(CH.GW_END_SESSION, { deviceId }),
       consumeShareInvite: (input: string) => ipcRenderer.invoke(CH.GW_SHARE_CONSUME, { input }),

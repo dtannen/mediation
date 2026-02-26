@@ -10,6 +10,8 @@
     "prestart:desktop": "npm run build:desktop",
     "start": "node dist/index.js",
     "start:desktop": "node desktop/scripts/start-desktop.js",
+    "start:desktop:owner": "MEDIATION_PROFILE=owner npm run start:desktop",
+    "start:desktop:collab": "MEDIATION_PROFILE=collab npm run start:desktop",
     "demo": "npm run build && npm run start",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:desktop": "tsc --noEmit --target ES2022 --module CommonJS --moduleResolution Node --strict --esModuleInterop --skipLibCheck desktop/**/*.ts",

@@ -59,6 +59,36 @@ interface SessionState {
   error: string | null;
 }
 
+function normalizeEncryptedFrame(payload: Record<string, unknown>): Record<string, unknown> | null {
+  const nested = payload.encrypted;
+  if (nested && typeof nested === 'object') {
+    return nested as Record<string, unknown>;
+  }
+
+  if (payload.encrypted !== true) {
+    return null;
+  }
+
+  // Support flattened encrypted frame shape where fields are top-level.
+  if (
+    typeof payload.ciphertext !== 'string'
+    || typeof payload.nonce !== 'string'
+    || (typeof payload.tag !== 'string' && typeof payload.auth_tag !== 'string')
+  ) {
+    return null;
+  }
+
+  return {
+    alg: payload.alg,
+    direction: payload.direction,
+    seq: payload.seq,
+    nonce: payload.nonce,
+    ciphertext: payload.ciphertext,
+    tag: typeof payload.tag === 'string' ? payload.tag : payload.auth_tag,
+    aad: payload.aad,
+  };
+}
+
 export default function createSessionManager(deps: SessionManagerDeps) {
   const sessions = new Map<string, SessionState>();
   const sendQueues = new Map<string, Promise<unknown>>();
@@ -366,9 +396,7 @@ export default function createSessionManager(deps: SessionManagerDeps) {
       return;
     }
 
-    const encrypted = payload.encrypted && typeof payload.encrypted === 'object'
-      ? payload.encrypted as Record<string, unknown>
-      : null;
+    const encrypted = normalizeEncryptedFrame(payload);
 
     if (!encrypted) {
       emitChatEvent({
@@ -428,7 +456,16 @@ export default function createSessionManager(deps: SessionManagerDeps) {
     gatewayUrl: string,
     deviceId: string,
     text: string,
-    options: { correlationId?: string } = {},
+    options: {
+      correlationId?: string;
+      authContext?: {
+        requesterUid: string;
+        requesterDeviceId: string;
+        grantId: string;
+        role?: 'owner' | 'collaborator';
+        grantStatus?: 'active' | 'revoked';
+      };
+    } = {},
   ): Promise<Record<string, unknown>> {
     const trimmed = text.trim();
     if (!trimmed) {
@@ -449,6 +486,25 @@ export default function createSessionManager(deps: SessionManagerDeps) {
       }
 
       const messageId = crypto.generateSessionId();
+      const rawAuthContext = (
+        options.authContext
+        && typeof options.authContext === 'object'
+      ) ? options.authContext : null;
+      const authContext = rawAuthContext
+        && typeof rawAuthContext.requesterUid === 'string'
+        && rawAuthContext.requesterUid.trim()
+        && typeof rawAuthContext.requesterDeviceId === 'string'
+        && rawAuthContext.requesterDeviceId.trim()
+        && typeof rawAuthContext.grantId === 'string'
+        && rawAuthContext.grantId.trim()
+        ? {
+          requester_uid: rawAuthContext.requesterUid.trim(),
+          requester_device_id: rawAuthContext.requesterDeviceId.trim(),
+          grant_id: rawAuthContext.grantId.trim(),
+          role: rawAuthContext.role === 'owner' ? 'owner' : 'collaborator',
+          grant_status: rawAuthContext.grantStatus === 'revoked' ? 'revoked' : 'active',
+        }
+        : null;
       const promptPayload = {
         session_id: session.sessionId,
         conversation_id: session.conversationId,
@@ -456,6 +512,7 @@ export default function createSessionManager(deps: SessionManagerDeps) {
         prompt: trimmed,
         correlation_id: options.correlationId,
         hop_count: 0,
+        ...(authContext ? { auth_context: authContext } : {}),
       };
 
       const seq = session.nextOutgoingSeq;
@@ -474,6 +531,7 @@ export default function createSessionManager(deps: SessionManagerDeps) {
         conversation_id: session.conversationId,
         message_id: messageId,
         handshake_id: session.handshakeId,
+        ...(authContext || {}),
         encrypted: true,
         alg: encrypted.alg,
         direction: encrypted.direction,

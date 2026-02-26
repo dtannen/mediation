@@ -64,6 +64,18 @@ interface AuthServiceDeps {
     decryptString: (input: Buffer) => string;
   };
   homedir: string;
+  profileId?: string;
+}
+
+function normalizeProfileId(value: unknown): string {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!raw) {
+    return '';
+  }
+  return raw
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
 }
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number, label: string): Promise<Response> {
@@ -241,12 +253,16 @@ function startCallbackServer(expectedState: string, timeoutMs: number): Promise<
 }
 
 export default function createAuthService(deps: AuthServiceDeps) {
+  const normalizedProfileId = normalizeProfileId(deps.profileId);
+  const authDirSuffix = normalizedProfileId ? `-${normalizedProfileId}` : '';
   // Persist desktop OAuth state and mediation device identity so runtime
   // reconnects can reuse the same session and refresh token lifecycle.
-  const DESKTOP_AUTH_DIR = path.join(deps.homedir, '.mediation-desktop');
+  const DESKTOP_AUTH_DIR = path.join(deps.homedir, `.mediation-desktop${authDirSuffix}`);
   const DESKTOP_AUTH_PATH = path.join(DESKTOP_AUTH_DIR, 'desktop-auth.enc');
   const DESKTOP_SIGNOUT_SENTINEL = path.join(DESKTOP_AUTH_DIR, 'desktop-signed-out');
-  const LEGACY_AUTH_PATH = path.join(deps.homedir, '.commands-agent', 'desktop-auth.enc');
+  const LEGACY_AUTH_PATH = normalizedProfileId
+    ? ''
+    : path.join(deps.homedir, '.commands-agent', 'desktop-auth.enc');
 
   let accessToken: string | null = null;
   let refreshToken: string | null = null;
@@ -281,7 +297,8 @@ export default function createAuthService(deps: AuthServiceDeps) {
   function generateMediationDeviceName(currentUid: string): string {
     const host = os.hostname().replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 20);
     const uidSuffix = currentUid ? currentUid.slice(-8) : crypto.randomBytes(4).toString('hex');
-    return `mediation-${host || 'desktop'}-${uidSuffix}`;
+    const profileSuffix = normalizedProfileId ? `-${normalizedProfileId.slice(0, 12)}` : '';
+    return `mediation-${host || 'desktop'}${profileSuffix}-${uidSuffix}`;
   }
 
   function hasValidMediationIdentity(value: unknown): value is MediationDeviceIdentity {
@@ -348,7 +365,7 @@ export default function createAuthService(deps: AuthServiceDeps) {
   function loadPersistedAuthState(): void {
     const sourcePath = existsSync(DESKTOP_AUTH_PATH)
       ? DESKTOP_AUTH_PATH
-      : (existsSync(LEGACY_AUTH_PATH) ? LEGACY_AUTH_PATH : '');
+      : (LEGACY_AUTH_PATH && existsSync(LEGACY_AUTH_PATH) ? LEGACY_AUTH_PATH : '');
     if (!sourcePath) {
       return;
     }
@@ -789,10 +806,15 @@ export default function createAuthService(deps: AuthServiceDeps) {
 
   async function getAuthHeaders(options: { forceRefresh?: boolean } = {}): Promise<Record<string, string>> {
     const token = await getAccessToken(options);
-
-    return {
+    const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
     };
+    const deviceId = mediationDeviceId.trim();
+    if (deviceId) {
+      headers['X-Device-Id'] = deviceId;
+    }
+
+    return headers;
   }
 
   async function getRuntimeLaunchConfig(): Promise<RuntimeLaunchConfig | null> {

@@ -91,6 +91,7 @@ export function register(
     runIntakeTemplate?: (input: { caseId: string; partyId: string }) => Promise<Record<string, unknown>>;
     runCoachReply?: (input: { caseId: string; partyId: string; prompt: string }) => Promise<Record<string, unknown>>;
     runDraftSuggestion?: (input: { caseId: string; draftId: string }) => Promise<Record<string, unknown>>;
+    runMediatorTurn?: (input: { caseId: string; partyId: string; content: string }) => Promise<Record<string, unknown>>;
     emitMediationEvent?: (payload: Record<string, unknown>) => void;
     emitStructuredLog?: (event: string, fields?: Record<string, unknown>) => void;
   },
@@ -248,6 +249,31 @@ export function register(
       emitCaseUpdate(deps, 'send_direct', mediationCase, {
         partyId: String(payload?.partyId || ''),
       });
+
+      const runner = deps.runMediatorTurn;
+      const caseId = String(payload?.caseId || '');
+      const partyId = String(payload?.partyId || '');
+      const content = String(payload?.text || '');
+      if (typeof runner === 'function' && caseId && partyId && content.trim()) {
+        void runner({
+          caseId,
+          partyId,
+          content,
+        }).then((result) => {
+          if (result.case && typeof result.case === 'object') {
+            emitCaseUpdate(deps, 'mediator_turn', result.case as Record<string, unknown>, {
+              partyId,
+            });
+          }
+        }).catch((err) => {
+          deps.emitStructuredLog?.('mediation.mediator_turn.error', {
+            case_id: caseId,
+            party_id: partyId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+
       return ok({ case: mediationCase });
     } catch (err) {
       return fail(err);

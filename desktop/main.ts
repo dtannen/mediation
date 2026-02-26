@@ -35,11 +35,48 @@ import { FileBackedRouterStatePersistence } from '../src/remote/router-state-per
 import type { GatewayAuthContext, MediationEventEnvelope } from '../src/remote/protocol';
 import { projectCaseForActor } from '../src/remote/projection';
 
+function normalizeDevProfileId(value: unknown): string {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!raw) {
+    return '';
+  }
+  return raw
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+}
+
+function parseProfileArg(argv: string[]): string {
+  for (let i = 0; i < argv.length; i += 1) {
+    const value = argv[i];
+    if (value.startsWith('--mediation-profile=')) {
+      return normalizeDevProfileId(value.slice('--mediation-profile='.length));
+    }
+    if (value.startsWith('--profile=')) {
+      return normalizeDevProfileId(value.slice('--profile='.length));
+    }
+    if ((value === '--mediation-profile' || value === '--profile') && i + 1 < argv.length) {
+      return normalizeDevProfileId(argv[i + 1]);
+    }
+  }
+  return '';
+}
+
+const devProfileId = parseProfileArg(process.argv)
+  || normalizeDevProfileId(process.env.MEDIATION_PROFILE)
+  || normalizeDevProfileId(process.env.MEDIATION_DEV_PROFILE);
+
+if (devProfileId) {
+  const defaultUserDataPath = app.getPath('userData');
+  app.setPath('userData', path.join(defaultUserDataPath, 'profiles', devProfileId));
+}
+
+const enforceSingleInstance = !devProfileId;
 let mainWindow: BrowserWindow | null = null;
 let stopBridgeManager: (() => void) | null = null;
 let stopAgentRuntime: (() => Promise<void>) | null = null;
 let quitDrainState: 'idle' | 'draining' | 'ready' = 'idle';
-const hasSingleInstanceLock = app.requestSingleInstanceLock();
+const hasSingleInstanceLock = enforceSingleInstance ? app.requestSingleInstanceLock() : true;
 const SIGNAL_FORCE_EXIT_MS = 5_000;
 let signalForceExitTimer: NodeJS.Timeout | null = null;
 const launchParentPid = process.ppid;
@@ -379,6 +416,46 @@ function buildDraftSuggestionPrompt(
   ].join('\n');
 }
 
+function buildMediatorTurnPrompt(
+  mediationCase: MediationCase,
+  speakerPartyId: string,
+  latestMessageText: string,
+): string {
+  const speakerName = mediationCase.parties.find((entry) => entry.id === speakerPartyId)?.displayName || speakerPartyId;
+  const participantNames = mediationCase.parties.map((entry) => entry.displayName || entry.id).join(', ');
+  const transcript = mediationCase.groupChat.messages
+    .slice(-14)
+    .map((message) => {
+      if (message.authorType === 'party') {
+        const partyName = mediationCase.parties.find((entry) => entry.id === message.authorPartyId)?.displayName
+          || message.authorPartyId
+          || 'Participant';
+        return `${partyName}: ${message.text}`;
+      }
+      if (message.authorType === 'mediator_llm') {
+        return `Mediator: ${message.text}`;
+      }
+      return `Assistant: ${message.text}`;
+    })
+    .join('\n');
+
+  return [
+    `You are the neutral live mediator for case topic: ${mediationCase.topic}.`,
+    `Participants: ${participantNames}.`,
+    'Use participant display names exactly as listed. Never use generic labels like "Party A" or "Party B".',
+    'Write one concise facilitator response that moves the conversation forward.',
+    'Keep tone neutral and practical, 45-120 words, and ask at most one focused follow-up question.',
+    '',
+    `Latest speaker: ${speakerName}`,
+    `Latest message: ${latestMessageText}`,
+    '',
+    'Recent transcript:',
+    transcript || '(no prior transcript)',
+    '',
+    'Return only the mediator message text.',
+  ].join('\n');
+}
+
 async function ensureRemoteSessionReady(
   sessionManager: {
     getSessionStatus: (deviceId: string) => SessionStatus | null;
@@ -516,6 +593,7 @@ async function bootstrap(): Promise<void> {
     shell,
     safeStorage,
     homedir: os.homedir(),
+    ...(devProfileId ? { profileId: devProfileId } : {}),
   });
 
   const gatewayClient = createGatewayClient({
@@ -555,6 +633,18 @@ async function bootstrap(): Promise<void> {
           payload.command
           && typeof payload.command === 'object'
         ) ? payload.command as Record<string, unknown> : {};
+        const commandName = pickString(command, 'command');
+        const commandCaseId = pickString(command, 'case_id');
+        const commandPartyId = pickString(command, 'party_id');
+        const commandPayload = (
+          command.payload
+          && typeof command.payload === 'object'
+        ) ? command.payload as Record<string, unknown> : {};
+        const commandMessage = (
+          commandPayload.message
+          && typeof commandPayload.message === 'object'
+        ) ? commandPayload.message as Record<string, unknown> : {};
+        const commandContent = pickString(commandMessage, 'content');
 
         // Build auth context: require explicit identity fields for remote collaborators.
         // Fail closed when collaborator context is incomplete instead of defaulting to owner.
@@ -633,10 +723,6 @@ async function bootstrap(): Promise<void> {
             'error.code': typeof errorRecord.code === 'string' ? errorRecord.code.trim() : '',
           });
         }
-        const commandCaseId = (
-          command
-          && typeof command === 'object'
-        ) ? pickString(command as Record<string, unknown>, 'case_id') : '';
         if (commandCaseId) {
           try {
             const canonicalCase = mediationService.getCase(commandCaseId);
@@ -662,6 +748,59 @@ async function bootstrap(): Promise<void> {
           handled.events,
           authContext.requesterDeviceId,
         );
+
+        if (
+          handled.result.ok === true
+          && commandName === 'case.send_group'
+          && commandCaseId
+          && commandPartyId
+          && commandContent
+        ) {
+          void (async () => {
+            try {
+              const followUp = await runMediatorTurn({
+                caseId: commandCaseId,
+                partyId: commandPartyId,
+                content: commandContent,
+              });
+              const updatedCase = (
+                followUp.case
+                && typeof followUp.case === 'object'
+              ) ? followUp.case as MediationCase : null;
+              if (!updatedCase || !remoteRouter) {
+                return;
+              }
+
+              emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+                ts: new Date().toISOString(),
+                type: 'case.updated',
+                action: 'mediator_turn',
+                caseId: commandCaseId,
+                partyId: commandPartyId,
+                case: updatedCase,
+              });
+
+              const nextRemoteVersion = remoteRouter.nextRemoteVersionForSync(commandCaseId);
+              fanoutEventsToCollaborators([
+                {
+                  type: 'mediation.event',
+                  schema_version: 1,
+                  event: 'case.updated',
+                  case_id: commandCaseId,
+                  remote_version: nextRemoteVersion,
+                },
+              ], undefined);
+            } catch (err) {
+              emitStructuredMainLog('mediation.mediator_turn.error', {
+                case_id: commandCaseId,
+                party_id: commandPartyId,
+                source: 'runtime_command',
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          })();
+        }
+
         runtimeManager.sendControlFrame({
           type: 'desktop.mediation.command.response',
           request_id: requestId,
@@ -1066,6 +1205,85 @@ async function bootstrap(): Promise<void> {
     };
   };
 
+  const runMediatorTurn = async (input: {
+    caseId: string;
+    partyId: string;
+    content: string;
+  }): Promise<Record<string, unknown>> => {
+    const caseId = input.caseId.trim();
+    const partyId = input.partyId.trim();
+    const content = input.content.trim();
+    if (!caseId || !partyId || !content) {
+      throw new Error('caseId, partyId, and content are required');
+    }
+
+    const mediationCase = mediationService.getCase(caseId);
+    if (mediationCase.phase !== 'group_chat') {
+      throw new Error('mediator follow-up is only available during group_chat');
+    }
+
+    const party = mediationCase.parties.find((entry) => entry.id === partyId);
+    if (!party) {
+      throw new Error(`party '${partyId}' not found in case`);
+    }
+
+    const profileId = `mediator_${caseId}`;
+    bridgeManager.ensureBridge(profileId);
+
+    const promptTemplate = buildMediatorTurnPrompt(mediationCase, partyId, content);
+    const timeoutMs = 45_000;
+    const result = await localBridge.requestLocalPrompt(
+      profileId,
+      {
+        objective: `Mediator follow-up for ${mediationCase.topic}`,
+        mode: 'manual',
+        text: promptTemplate,
+        constraints: {
+          allow_tool_use: false,
+          max_output_chars: 3_000,
+          max_history_turns: 0,
+          max_history_chars: 0,
+          local_turn_timeout_ms: timeoutMs,
+        },
+      },
+      timeoutMs,
+    );
+
+    const resultRecord = result as Record<string, unknown>;
+    if (resultRecord.ok !== true) {
+      const errorRecord = (
+        resultRecord.error
+        && typeof resultRecord.error === 'object'
+      ) ? resultRecord.error as Record<string, unknown> : undefined;
+      throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
+    }
+
+    const frame = (
+      resultRecord.frame
+      && typeof resultRecord.frame === 'object'
+    ) ? resultRecord.frame as Record<string, unknown> : {};
+    if (pickString(frame, 'status') === 'error') {
+      throw new Error(pickString(frame, 'reason') || 'local prompt error');
+    }
+
+    const mediatorReply = pickString(frame, 'draft_message');
+    if (!mediatorReply) {
+      throw new Error('local prompt returned empty mediator reply');
+    }
+
+    const updatedCase = mediationService.appendGroupMessage({
+      caseId,
+      authorType: 'mediator_llm',
+      text: mediatorReply,
+      tags: ['mediator_followup'],
+    });
+
+    return {
+      case: updatedCase,
+      reply: mediatorReply,
+    };
+  };
+
   const idempotencyStorePath = path.join(app.getPath('userData'), 'mediation-idempotency.json');
   const routerStatePath = path.join(app.getPath('userData'), 'mediation-router-state.json');
   remoteRouter = new RemoteMediationRouter({
@@ -1340,6 +1558,21 @@ async function bootstrap(): Promise<void> {
         && (payload as Record<string, unknown>).command
         && typeof (payload as Record<string, unknown>).command === 'object'
       ) ? (payload as Record<string, unknown>).command : payload;
+      const commandRecord = (command && typeof command === 'object')
+        ? command as Record<string, unknown>
+        : {};
+      const commandName = pickString(commandRecord, 'command');
+      const commandCaseId = pickString(commandRecord, 'case_id');
+      const commandPartyId = pickString(commandRecord, 'party_id');
+      const commandPayload = (
+        commandRecord.payload
+        && typeof commandRecord.payload === 'object'
+      ) ? commandRecord.payload as Record<string, unknown> : {};
+      const commandMessage = (
+        commandPayload.message
+        && typeof commandPayload.message === 'object'
+      ) ? commandPayload.message as Record<string, unknown> : {};
+      const commandContent = pickString(commandMessage, 'content');
 
       const handled = await remoteRouter.handleCommand(context, command);
       for (const eventPayload of handled.events) {
@@ -1353,6 +1586,59 @@ async function bootstrap(): Promise<void> {
         handled.events,
         context.requesterDeviceId,
       );
+
+      if (
+        handled.result.ok === true
+        && commandName === 'case.send_group'
+        && commandCaseId
+        && commandPartyId
+        && commandContent
+      ) {
+        void (async () => {
+          try {
+            const followUp = await runMediatorTurn({
+              caseId: commandCaseId,
+              partyId: commandPartyId,
+              content: commandContent,
+            });
+            const updatedCase = (
+              followUp.case
+              && typeof followUp.case === 'object'
+            ) ? followUp.case as MediationCase : null;
+            if (!updatedCase || !remoteRouter) {
+              return;
+            }
+
+            emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+              ts: new Date().toISOString(),
+              type: 'case.updated',
+              action: 'mediator_turn',
+              caseId: commandCaseId,
+              partyId: commandPartyId,
+              case: updatedCase,
+            });
+
+            const remoteVersion = remoteRouter.nextRemoteVersionForSync(commandCaseId);
+            fanoutEventsToCollaborators([
+              {
+                type: 'mediation.event',
+                schema_version: 1,
+                event: 'case.updated',
+                case_id: commandCaseId,
+                remote_version: remoteVersion,
+              },
+            ], undefined);
+          } catch (err) {
+            emitStructuredMainLog('mediation.mediator_turn.error', {
+              case_id: commandCaseId,
+              party_id: commandPartyId,
+              source: 'remote_command',
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+      }
+
       return handled.result as unknown as Record<string, unknown>;
     } catch (err) {
       return {
@@ -1450,6 +1736,7 @@ async function bootstrap(): Promise<void> {
     runIntakeTemplate,
     runCoachReply,
     runDraftSuggestion,
+    runMediatorTurn,
     emitMediationEvent: (payload) => {
       emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
         ts: new Date().toISOString(),
@@ -1522,17 +1809,19 @@ async function bootstrap(): Promise<void> {
 if (!hasSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
-    const existing = mainWindow || BrowserWindow.getAllWindows()[0] || null;
-    if (existing && !existing.isDestroyed()) {
-      if (existing.isMinimized()) {
-        existing.restore();
+  if (enforceSingleInstance) {
+    app.on('second-instance', () => {
+      const existing = mainWindow || BrowserWindow.getAllWindows()[0] || null;
+      if (existing && !existing.isDestroyed()) {
+        if (existing.isMinimized()) {
+          existing.restore();
+        }
+        existing.focus();
+        return;
       }
-      existing.focus();
-      return;
-    }
-    void createMainWindow();
-  });
+      void createMainWindow();
+    });
+  }
 
   void app.whenReady().then(async () => {
     await bootstrap();

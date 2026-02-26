@@ -42,7 +42,16 @@ interface SessionManager {
     gatewayUrl: string,
     deviceId: string,
     text: string,
-    options?: { correlationId?: string },
+    options?: {
+      correlationId?: string;
+      authContext?: {
+        requesterUid: string;
+        requesterDeviceId: string;
+        grantId: string;
+        role?: 'owner' | 'collaborator';
+        grantStatus?: 'active' | 'revoked';
+      };
+    },
   ) => Promise<Record<string, unknown>>;
   endSession: (deviceId: string) => Promise<Record<string, unknown>>;
   getSessionStatus: (deviceId: string) => Record<string, unknown> | null;
@@ -235,24 +244,88 @@ function extractCorrelationIdFromPayload(payload: Record<string, unknown> | unde
   return pickString(payload, 'correlation_id') || pickString(payload, 'correlationId');
 }
 
+function invalidRemoteResultEnvelope(message: string): Record<string, unknown> {
+  return {
+    type: 'mediation.result',
+    schema_version: 1,
+    request_id: '',
+    ok: false,
+    error: {
+      code: 'invalid_remote_result',
+      message,
+      recoverable: false,
+    },
+  };
+}
+
+function parseRecordOrJsonString(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object') {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return invalidRemoteResultEnvelope(trimmed.length > 1000 ? `${trimmed.slice(0, 1000)}...` : trimmed);
+    }
+  }
+  return null;
+}
+
 function parseResultPayload(payload: Record<string, unknown> | undefined): Record<string, unknown> | null {
   if (!payload) {
     return null;
   }
 
-  const directResult = payload.result;
-  if (directResult && typeof directResult === 'object') {
-    return directResult as Record<string, unknown>;
+  if (pickString(payload, 'type') === 'mediation.result' && typeof payload.ok === 'boolean') {
+    return payload;
   }
-  if (typeof directResult === 'string') {
-    try {
-      const parsed = JSON.parse(directResult) as unknown;
-      if (parsed && typeof parsed === 'object') {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      return null;
+
+  const direct = parseRecordOrJsonString(payload.result);
+  if (direct) {
+    return direct;
+  }
+
+  const response = parseRecordOrJsonString(payload.response);
+  if (response) {
+    return response;
+  }
+
+  const nestedMessage = payload.message;
+  if (nestedMessage && typeof nestedMessage === 'object') {
+    const nested = nestedMessage as Record<string, unknown>;
+    const nestedDirect = parseRecordOrJsonString(nested.result);
+    if (nestedDirect) {
+      return nestedDirect;
     }
+    const nestedResponse = parseRecordOrJsonString(nested.response);
+    if (nestedResponse) {
+      return nestedResponse;
+    }
+    if (pickString(nested, 'type') === 'mediation.result' && typeof nested.ok === 'boolean') {
+      return nested;
+    }
+  }
+
+  if (typeof payload.ok === 'boolean') {
+    return payload;
+  }
+
+  const fallbackText = (
+    pickString(payload, 'result')
+    || pickString(payload, 'response')
+    || pickString(payload, 'message')
+    || pickString(payload, 'error')
+  );
+  if (fallbackText) {
+    return invalidRemoteResultEnvelope(fallbackText.length > 1000 ? `${fallbackText.slice(0, 1000)}...` : fallbackText);
   }
 
   return null;
@@ -270,6 +343,60 @@ function parseEventError(payload: Record<string, unknown> | undefined, fallback 
     }
   }
   return pickString(payload, 'message') || pickString(payload, 'error') || fallback;
+}
+
+function parseMediationTransportAuthContext(
+  payload: Record<string, unknown> | undefined,
+  authStatus: Record<string, unknown>,
+): {
+  requesterUid: string;
+  requesterDeviceId: string;
+  grantId: string;
+  role: 'owner' | 'collaborator';
+  grantStatus: 'active' | 'revoked';
+} | null {
+  const raw = (
+    payload?.authContext
+    && typeof payload.authContext === 'object'
+  ) ? payload.authContext as Record<string, unknown> : {};
+
+  const mediationDevice = (
+    authStatus.mediationDevice
+    && typeof authStatus.mediationDevice === 'object'
+  ) ? authStatus.mediationDevice as Record<string, unknown> : {};
+
+  const requesterUid = (
+    pickString(raw, 'requesterUid')
+    || pickString(raw, 'requester_uid')
+    || pickString(authStatus, 'uid')
+    || pickString(authStatus, 'userId')
+  );
+  const requesterDeviceId = (
+    pickString(raw, 'requesterDeviceId')
+    || pickString(raw, 'requester_device_id')
+    || pickString(mediationDevice, 'id')
+    || pickString(authStatus, 'mediationDeviceId')
+  );
+  const grantId = (
+    pickString(raw, 'grantId')
+    || pickString(raw, 'grant_id')
+    || pickString(payload, 'grantId')
+    || pickString(payload, 'grant_id')
+  );
+
+  if (!requesterUid || !requesterDeviceId || !grantId) {
+    return null;
+  }
+
+  return {
+    requesterUid,
+    requesterDeviceId,
+    grantId,
+    // Messages to remote owner router are collaborator-scoped; never elevate
+    // owner role from renderer-provided context.
+    role: 'collaborator',
+    grantStatus: 'active',
+  };
 }
 
 function waitForMediationResult(
@@ -540,6 +667,11 @@ export function register(
       const maxRetries = Number.isFinite(payload?.maxRetries)
         ? Math.max(1, Math.min(3, Math.trunc(payload.maxRetries)))
         : 3;
+      const authStatus = auth.getStatus();
+      const transportAuthContext = parseMediationTransportAuthContext(
+        (payload && typeof payload === 'object') ? payload as Record<string, unknown> : undefined,
+        authStatus,
+      );
 
       return await runSerializedMediationCommand(deviceId, async () => {
         const terminated = deviceTerminationState.get(deviceId);
@@ -563,7 +695,14 @@ export function register(
           const correlationId = `corr_${randomUUID()}`;
           try {
             await ensureSessionReady(sessionManager, gatewayUrl, deviceId);
-            await sessionManager.sendMessage(gatewayUrl, deviceId, JSON.stringify(command), { correlationId });
+            await sessionManager.sendMessage(
+              gatewayUrl,
+              deviceId,
+              JSON.stringify(command),
+              transportAuthContext
+                ? { correlationId, authContext: transportAuthContext }
+                : { correlationId },
+            );
             const awaited = await waitForMediationResult(sessionManager, deviceId, correlationId, timeoutMs);
             if (awaited.ok) {
               deviceTerminationState.delete(deviceId);

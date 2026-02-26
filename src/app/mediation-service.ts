@@ -439,11 +439,14 @@ export class MediationService {
       ...positionLines,
     ].join('\n');
 
+    const firstPartyName = mediationCase.parties[0]?.displayName || 'First participant';
+    const secondPartyName = mediationCase.parties[1]?.displayName || 'Second participant';
+
     const guidance = [
       'I will facilitate this mediation by asking structured questions to both parties.',
       'Opening questions:',
-      '1. Party A: what are your top 2 goals and top 2 constraints?',
-      '2. Party B: what are your top 2 goals and top 2 constraints?',
+      `1. ${firstPartyName}: what are your top 2 goals and top 2 constraints?`,
+      `2. ${secondPartyName}: what are your top 2 goals and top 2 constraints?`,
       '3. Each party: what is one flexible point you can offer today?',
       'You can answer directly or use your private coach conversation before posting.',
     ].join('\n');
