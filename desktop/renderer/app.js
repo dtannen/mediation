@@ -393,7 +393,7 @@ function parseShareTokenInput(input) {
     }
 
     const tokenFromQuery = parsed.searchParams.get('token');
-    if (tokenFromQuery && !parsed.searchParams.get('caseId')) {
+    if (tokenFromQuery) {
       return tokenFromQuery;
     }
 
@@ -725,6 +725,7 @@ async function loadCase(caseId, options = {}) {
   const shareState = getShareState();
   if (
     ownDeviceId
+    && isOwnerLocalCase
     && !shareState.grantsLoadingByDevice[ownDeviceId]
     && !shareState.grantsByDevice[ownDeviceId]
   ) {
@@ -903,10 +904,19 @@ function normalizeGrantRow(row) {
 
   return {
     grantId,
+    deviceId: typeof row.deviceId === 'string' ? row.deviceId.trim() : '',
+    caseId: typeof row.caseId === 'string'
+      ? row.caseId.trim()
+      : (typeof row.case_id === 'string' ? row.case_id.trim() : ''),
     granteeEmail: typeof row.granteeEmail === 'string' ? row.granteeEmail.trim() : '',
     granteeUid: typeof row.granteeUid === 'string' ? row.granteeUid.trim() : '',
     role: typeof row.role === 'string' ? row.role.trim() : '',
     status: normalizeGrantStatus(row.status),
+    inviteUrl: typeof row.inviteUrl === 'string'
+      ? row.inviteUrl.trim()
+      : (typeof row.invite_url === 'string'
+          ? row.invite_url.trim()
+          : (typeof row.url === 'string' ? row.url.trim() : '')),
     grantExpiresAt: parseEpochSeconds(row.grantExpiresAt),
     acceptedAt: parseEpochSeconds(row.acceptedAt),
     createdAt: parseEpochSeconds(row.createdAt),
@@ -1091,7 +1101,6 @@ function renderDashboardView() {
     ? `
       <form class="panel stack" data-submit-action="preview-or-consume-link">
         <h3 class="section-title">Join from Invite Link</h3>
-        <p class="muted small">Paste the gateway share link you received.</p>
         <label class="stack">
           <span class="small muted">Link</span>
           <input name="inviteLink" value="${escapeHtml(state.joinLinkInput || '')}" placeholder="Paste the link you received..." required />
@@ -1224,7 +1233,7 @@ function renderDashboardView() {
           </div>
           <div class="action-card secondary" data-action="toggle-join-form">
             <div class="action-title">Join from Invite Link</div>
-            <div class="action-desc">Accept a gateway device share link</div>
+            <div class="action-desc">Open a shared mediation</div>
           </div>
         </div>
       </section>
@@ -1257,88 +1266,99 @@ function renderCaseDetailView() {
   const readOnlyShared = isReadOnlySharedCase(caseData);
   const everyoneReady = caseData.parties.every((party) => getPartyState(caseData, party.id) === 'ready');
   const ownDeviceId = getOwnDeviceId();
+  const isOwnerLocalCase = getCaseSource(caseData) === 'owner_local';
   const shareState = getShareState();
   const deviceGrantCache = ownDeviceId ? (shareState.grantsByDevice[ownDeviceId] || null) : null;
-  const grants = deviceGrantCache && Array.isArray(deviceGrantCache.grants) ? deviceGrantCache.grants : [];
   const grantsLoading = Boolean(ownDeviceId && shareState.grantsLoadingByDevice[ownDeviceId] === true);
+  const shouldCheckExistingInvites = Boolean(
+    ownDeviceId
+    && isOwnerLocalCase
+    && !deviceGrantCache
+    && !grantsLoading,
+  );
+  if (shouldCheckExistingInvites) {
+    void refreshShareGrants(ownDeviceId, { silent: true });
+  }
+  const checkingExistingInvites = grantsLoading || shouldCheckExistingInvites;
+  const grants = deviceGrantCache && Array.isArray(deviceGrantCache.grants) ? deviceGrantCache.grants : [];
+  const matchingActiveGrant = grants
+    .filter((grant) => isRevocableGrantStatus(normalizeGrantStatus(grant.status)))
+    .find((grant) => {
+      const grantCaseId = typeof grant.caseId === 'string' ? grant.caseId.trim() : '';
+      return !grantCaseId || grantCaseId === caseData.id;
+    }) || null;
+
   const lastGatewayInvite = ownDeviceId ? shareState.lastCreatedInviteByDevice[ownDeviceId] : null;
+  const cachedInviteStatus = normalizeGrantStatus(lastGatewayInvite?.status || '');
+  const hasActiveCachedInvite = Boolean(
+    lastGatewayInvite
+    && lastGatewayInvite.grantId
+    && isRevocableGrantStatus(cachedInviteStatus),
+  );
+
+  const effectiveInvite = hasActiveCachedInvite
+    ? lastGatewayInvite
+    : (matchingActiveGrant
+        ? {
+          grantId: matchingActiveGrant.grantId,
+          inviteeEmail: matchingActiveGrant.granteeEmail || matchingActiveGrant.granteeUid || 'unknown',
+          inviteUrl: matchingActiveGrant.inviteUrl || '',
+          status: matchingActiveGrant.status,
+        }
+        : null);
+
+  const hasExistingActiveInvite = Boolean(
+    effectiveInvite
+    && effectiveInvite.grantId
+    && isRevocableGrantStatus(normalizeGrantStatus(effectiveInvite.status || 'active')),
+  );
+
+  const inviteMutating = hasExistingActiveInvite
+    ? shareState.mutatingGrantIds[String(effectiveInvite.grantId)] === true
+    : false;
 
   const gatewayInviteSection = ownDeviceId && isOwnerLocalCase
     ? `
       <section class="panel stack">
-        <h3 class="section-title">Invite by Email (Gateway Share)</h3>
-        <p class="muted small">Create a secure share link for this device and send it to a collaborator.</p>
-        <form class="stack" data-submit-action="create-share-invite">
-          <label class="stack">
-            <span class="small muted">Invitee email</span>
-            <input type="email" name="shareEmail" placeholder="name@example.com" required />
-          </label>
-          <div class="grid-2">
-            <label class="stack">
-              <span class="small muted">Grant expires (days, optional)</span>
-              <input type="number" min="1" max="365" name="grantDays" placeholder="30" />
-            </label>
-            <label class="stack">
-              <span class="small muted">Invite token TTL (minutes)</span>
-              <input type="number" min="5" max="10080" name="inviteTtlMinutes" placeholder="1440" />
-            </label>
-          </div>
-          <div class="view-actions">
-            <button type="submit" class="primary">Create Invite Link</button>
-          </div>
-        </form>
-        ${lastGatewayInvite && lastGatewayInvite.inviteUrl ? `
+        ${hasExistingActiveInvite ? `
+          <h3 class="section-title">Invite By Email</h3>
           <div class="invite-card">
-            <div class="invite-link-display">${escapeHtml(String(lastGatewayInvite.inviteUrl || ''))}</div>
-            <div class="small muted">Grant: ${escapeHtml(String(lastGatewayInvite.grantId || 'unknown'))} - Expires: ${escapeHtml(formatGrantTime(lastGatewayInvite.inviteTokenExpiresAt))}</div>
-            <div class="view-actions" style="margin-top: 8px;">
-              <button type="button" class="ghost" data-action="copy-share-invite" data-link="${escapeHtml(String(lastGatewayInvite.inviteUrl || ''))}">Copy Share Link</button>
+            <div class="invite-label">To: ${escapeHtml(String(effectiveInvite.inviteeEmail || 'unknown'))}</div>
+            ${effectiveInvite.inviteUrl
+              ? `<div class="invite-link-display">${escapeHtml(String(effectiveInvite.inviteUrl || ''))}</div>`
+              : '<div class="small muted" style="margin-bottom: 8px;">Invite link already issued.</div>'}
+            <div class="view-actions">
+              ${effectiveInvite.inviteUrl ? `
+                <button
+                  type="button"
+                  class="ghost"
+                  data-action="copy-share-invite"
+                  data-link="${escapeHtml(String(effectiveInvite.inviteUrl || ''))}"
+                >
+                  Copy Link
+                </button>
+              ` : ''}
+              <button
+                type="button"
+                class="ghost"
+                data-action="revoke-share-grant"
+                data-grant-id="${escapeHtml(String(effectiveInvite.grantId || ''))}"
+                data-device-id="${escapeHtml(ownDeviceId)}"
+                ${inviteMutating ? 'disabled' : ''}
+              >
+                ${inviteMutating ? 'Revoking...' : 'Revoke'}
+              </button>
             </div>
           </div>
-        ` : ''}
-      </section>
-    `
-    : '';
-
-  const grantsSection = ownDeviceId && isOwnerLocalCase
-    ? `
-      <section class="panel stack">
-        <div class="row" style="justify-content: space-between; align-items: center;">
-          <h3 class="section-title" style="margin: 0;">View Grants</h3>
-          <button type="button" class="ghost" data-action="refresh-share-grants" data-device-id="${escapeHtml(ownDeviceId)}" ${grantsLoading ? 'disabled' : ''}>
-            ${grantsLoading ? 'Refreshing...' : 'Refresh'}
-          </button>
-        </div>
-        ${grants.length > 0 ? `
-          <div class="grant-list">
-            ${grants.map((grant) => {
-              const status = normalizeGrantStatus(grant.status);
-              const mutating = shareState.mutatingGrantIds[grant.grantId] === true;
-              return `
-                <div class="grant-row">
-                  <div class="grant-main">
-                    <div class="grant-email">${escapeHtml(grant.granteeEmail || grant.granteeUid || 'unknown')}</div>
-                    <div class="small muted">Status: ${escapeHtml(status)} - Created ${escapeHtml(formatGrantTime(grant.createdAt))}</div>
-                  </div>
-                  ${isRevocableGrantStatus(status) ? `
-                    <button
-                      type="button"
-                      class="ghost"
-                      data-action="revoke-share-grant"
-                      data-grant-id="${escapeHtml(grant.grantId)}"
-                      data-device-id="${escapeHtml(ownDeviceId)}"
-                      ${mutating ? 'disabled' : ''}
-                    >
-                      ${mutating ? 'Revoking...' : 'Revoke'}
-                    </button>
-                  ` : '<span class="small muted">No action</span>'}
-                </div>
-              `;
-            }).join('')}
-          </div>
+        ` : (checkingExistingInvites && !deviceGrantCache ? `
+          <div class="small muted">Checking existing invites...</div>
         ` : `
-          <div class="small muted">No gateway share grants yet for this device.</div>
-        `}
+          <form class="share-invite-inline" data-submit-action="create-share-invite">
+            <span class="small muted">Invite By Email</span>
+            <input type="email" name="shareEmail" placeholder="name@example.com" required />
+            <button type="submit" class="primary">Create Invite Link</button>
+          </form>
+        `)}
       </section>
     `
     : '';
@@ -1428,8 +1448,6 @@ function renderCaseDetailView() {
       ${groupCta}
 
       ${gatewayInviteSection}
-
-      ${grantsSection}
     </div>
   `;
 }
@@ -2020,16 +2038,6 @@ async function handleCreateCase(form) {
   render();
 }
 
-function parseOptionalNumber(input, min, max) {
-  const raw = String(input || '').trim();
-  if (!raw) return null;
-  const value = Number(raw);
-  if (!Number.isFinite(value)) return null;
-  const rounded = Math.trunc(value);
-  if (rounded < min || rounded > max) return null;
-  return rounded;
-}
-
 async function refreshShareGrants(deviceId, options = {}) {
   const id = String(deviceId || '').trim();
   if (!id) return;
@@ -2117,9 +2125,6 @@ async function createShareInvite(form) {
     return;
   }
 
-  const grantDays = parseOptionalNumber(form.grantDays?.value, 1, 365);
-  const inviteTtlMinutes = parseOptionalNumber(form.inviteTtlMinutes?.value, 5, 10080);
-
   const payload = {
     deviceId: ownDeviceId,
     email,
@@ -2129,12 +2134,6 @@ async function createShareInvite(form) {
     : '';
   if (activeCaseId) {
     payload.caseId = activeCaseId;
-  }
-  if (grantDays !== null) {
-    payload.grantExpiresAt = Math.trunc(Date.now() / 1000) + (grantDays * 24 * 60 * 60);
-  }
-  if (inviteTtlMinutes !== null) {
-    payload.inviteTokenTtlSeconds = inviteTtlMinutes * 60;
   }
 
   const result = await api.gateway.createShareInvite(payload);
@@ -2147,19 +2146,21 @@ async function createShareInvite(form) {
   shareState.lastCreatedInviteByDevice[ownDeviceId] = {
     inviteUrl: extractInviteUrl(result),
     grantId: typeof result.grantId === 'string' ? result.grantId : '',
+    inviteeEmail: email,
     status: normalizeGrantStatus(result.status || 'pending'),
     inviteTokenExpiresAt: parseEpochSeconds(result.inviteTokenExpiresAt),
     grantExpiresAt: parseEpochSeconds(result.grantExpiresAt),
   };
 
   showToast('Share link created.', 'success');
-  await refreshShareGrants(ownDeviceId, { silent: true });
+  render();
 }
 
 async function revokeShareGrant(grantId, deviceId) {
   const id = String(grantId || '').trim();
   if (!id) return;
 
+  const resolvedDeviceId = String(deviceId || getOwnDeviceId() || '').trim();
   const shareState = getShareState();
   shareState.mutatingGrantIds[id] = true;
   render();
@@ -2170,8 +2171,17 @@ async function revokeShareGrant(grantId, deviceId) {
       showToast(normalizeError(result, 'Unable to revoke grant'), 'error');
       return;
     }
+    if (resolvedDeviceId) {
+      const current = shareState.lastCreatedInviteByDevice[resolvedDeviceId];
+      if (current && String(current.grantId || '') === id) {
+        delete shareState.lastCreatedInviteByDevice[resolvedDeviceId];
+      }
+      const cache = shareState.grantsByDevice[resolvedDeviceId];
+      if (cache && Array.isArray(cache.grants)) {
+        cache.grants = cache.grants.filter((grant) => String(grant?.grantId || '') !== id);
+      }
+    }
     showToast('Grant revoked.', 'success');
-    await refreshShareGrants(deviceId || getOwnDeviceId(), { silent: true });
   } finally {
     delete shareState.mutatingGrantIds[id];
     render();
@@ -3341,11 +3351,31 @@ function onGatewayShareEvent(payload) {
   }
 
   if (type === 'share.revoke.success' || type === 'share.leave.success') {
+    let shouldRender = false;
     const grantId = typeof payload.grantId === 'string' ? payload.grantId : '';
+    const deviceId = typeof payload.deviceId === 'string' ? payload.deviceId : '';
+    if (type === 'share.revoke.success' && deviceId && grantId) {
+      const current = shareState.lastCreatedInviteByDevice[deviceId];
+      if (current && String(current.grantId || '') === grantId) {
+        delete shareState.lastCreatedInviteByDevice[deviceId];
+        shouldRender = true;
+      }
+    }
+    if (grantId) {
+      for (const cache of Object.values(shareState.grantsByDevice || {})) {
+        if (cache && Array.isArray(cache.grants)) {
+          const before = cache.grants.length;
+          cache.grants = cache.grants.filter((grant) => String(grant?.grantId || '') !== grantId);
+          if (cache.grants.length !== before) {
+            shouldRender = true;
+          }
+        }
+      }
+    }
     if (grantId && shareState.consumeResult && shareState.consumeResult.grantId === grantId) {
       shareState.consumeResult = null;
       persistShareConsumeResult(null);
-      render();
+      shouldRender = true;
     }
     if (grantId) {
       const status = type === 'share.leave.success' ? 'left' : 'access_revoked';
@@ -3353,14 +3383,13 @@ function onGatewayShareEvent(payload) {
         .then(() => refreshCases())
         .catch(() => undefined);
     }
+    if (shouldRender) {
+      render();
+    }
     return;
   }
 
   if (type === 'share.create.success') {
-    const deviceId = typeof payload.deviceId === 'string' ? payload.deviceId : '';
-    if (deviceId) {
-      void refreshShareGrants(deviceId, { silent: true });
-    }
     return;
   }
 

@@ -31,7 +31,9 @@ import {
 } from '../src/room/plugin-registry';
 import { IdempotencyStore } from '../src/remote/idempotency-store';
 import { RemoteMediationRouter } from '../src/remote/router';
-import type { GatewayAuthContext } from '../src/remote/protocol';
+import { FileBackedRouterStatePersistence } from '../src/remote/router-state-persistence';
+import type { GatewayAuthContext, MediationEventEnvelope } from '../src/remote/protocol';
+import { projectCaseForActor } from '../src/remote/projection';
 
 let mainWindow: BrowserWindow | null = null;
 let stopBridgeManager: (() => void) | null = null;
@@ -276,11 +278,18 @@ function parseGatewayAuthContext(
 
   const role = pickString(raw, 'role') === 'collaborator' ? 'collaborator' : defaultContext.role;
   const grantStatus = pickString(raw, 'grantStatus') === 'revoked' ? 'revoked' : 'active';
+  const grantId = pickString(raw, 'grantId');
+  const requesterUid = pickString(raw, 'requesterUid');
+
+  // Fail closed: collaborator requests MUST provide grantId and requesterUid explicitly
+  if (role === 'collaborator' && (!grantId || !requesterUid)) {
+    throw new Error('Collaborator auth context requires grantId and requesterUid');
+  }
 
   return {
-    requesterUid: pickString(raw, 'requesterUid') || defaultContext.requesterUid,
+    requesterUid: requesterUid || defaultContext.requesterUid,
     requesterDeviceId: pickString(raw, 'requesterDeviceId') || defaultContext.requesterDeviceId,
-    grantId: pickString(raw, 'grantId') || defaultContext.grantId,
+    grantId: grantId || defaultContext.grantId,
     role,
     grantStatus,
   };
@@ -546,14 +555,42 @@ async function bootstrap(): Promise<void> {
           payload.command
           && typeof payload.command === 'object'
         ) ? payload.command as Record<string, unknown> : {};
-        const authContext = (
+
+        // Build auth context: require explicit identity fields for remote collaborators.
+        // Fail closed when collaborator context is incomplete instead of defaulting to owner.
+        const hasExplicitIdentity = Boolean(
           payload.requesterUid
           || payload.requester_uid
-        ) ? {
+        );
+        const explicitRole = pickString(payload, 'role');
+        const explicitGrantId = pickString(payload, 'grantId') || pickString(payload, 'grant_id');
+        const isCollaboratorRequest = explicitRole === 'collaborator';
+
+        // If the request claims to be from a collaborator but is missing required grant context, reject it
+        if (isCollaboratorRequest && (!hasExplicitIdentity || !explicitGrantId)) {
+          runtimeManager.sendControlFrame({
+            type: 'desktop.mediation.command.response',
+            request_id: requestId,
+            result: {
+              type: 'mediation.result',
+              schema_version: 1,
+              request_id: requestId,
+              ok: false,
+              error: {
+                code: 'unauthorized',
+                message: 'Collaborator requests require requester_uid, grant_id, and role in transport context',
+                recoverable: false,
+              },
+            },
+          });
+          return;
+        }
+
+        const authContext = hasExplicitIdentity ? {
           requesterUid: pickString(payload, 'requesterUid') || pickString(payload, 'requester_uid') || 'unknown',
           requesterDeviceId: pickString(payload, 'requesterDeviceId') || pickString(payload, 'requester_device_id') || 'unknown',
-          grantId: pickString(payload, 'grantId') || pickString(payload, 'grant_id') || '',
-          role: (pickString(payload, 'role') === 'collaborator' ? 'collaborator' : 'owner') as 'owner' | 'collaborator',
+          grantId: explicitGrantId,
+          role: (explicitRole === 'collaborator' ? 'collaborator' : 'owner') as 'owner' | 'collaborator',
           grantStatus: (pickString(payload, 'grantStatus') === 'revoked' ? 'revoked' : 'active') as 'active' | 'revoked',
         } : buildDefaultGatewayAuthContext(auth.getStatus() as Record<string, unknown>);
 
@@ -620,6 +657,11 @@ async function bootstrap(): Promise<void> {
             ...eventPayload,
           });
         }
+        // Fanout events to other bound collaborators (excluding the requester's device)
+        fanoutEventsToCollaborators(
+          handled.events,
+          authContext.requesterDeviceId,
+        );
         runtimeManager.sendControlFrame({
           type: 'desktop.mediation.command.response',
           request_id: requestId,
@@ -635,6 +677,102 @@ async function bootstrap(): Promise<void> {
           },
         });
       });
+    },
+    onMediationEventReceived: (payload) => {
+      // Handle inbound mediation events pushed from the owner device.
+      // Apply the projected case snapshot to local storage and notify the renderer.
+      const eventType = typeof payload.event === 'string' ? payload.event : '';
+      const caseId = typeof payload.case_id === 'string' ? payload.case_id : '';
+      const projectedCase = (payload.case && typeof payload.case === 'object') ? payload.case as Record<string, unknown> : null;
+
+      if (eventType === 'case.updated' && caseId && projectedCase) {
+        // ── Security: derive grant/device context from local state only ──
+        // Never trust event-embedded identity fields (sender_device_id,
+        // grant_id) — they are not transport-authenticated and could be
+        // spoofed. Instead, look up the existing local case metadata that
+        // was established through the authenticated command-response flow.
+        // This also enforces collaborator-side only: owner_local cases are
+        // rejected, preventing a collaborator from spoofing events to
+        // overwrite owner-authoritative state.
+        let existingCase: MediationCase | null = null;
+        try {
+          existingCase = mediationService.getCase(caseId) as MediationCase;
+        } catch {
+          // Case not found — cannot accept push sync for unknown cases
+        }
+
+        const syncMeta = existingCase?.syncMetadata;
+        if (!existingCase || !syncMeta || syncMeta.source !== 'shared_remote') {
+          emitStructuredMainLog('mediation.event.receive.skip', {
+            event: eventType,
+            case_id: caseId,
+            reason: !existingCase
+              ? 'case_not_found'
+              : 'not_shared_remote',
+          });
+          return;
+        }
+
+        const storedGrantId = syncMeta.grantId || '';
+        const storedOwnerDeviceId = syncMeta.ownerDeviceId || '';
+        if (!storedGrantId || !storedOwnerDeviceId) {
+          emitStructuredMainLog('mediation.event.receive.skip', {
+            event: eventType,
+            case_id: caseId,
+            reason: 'incomplete_local_sync_metadata',
+          });
+          return;
+        }
+
+        // When frame-level transport-authenticated context is available,
+        // verify it matches the stored metadata as an additional check.
+        const frameDeviceId = typeof payload.requesterDeviceId === 'string' ? payload.requesterDeviceId : '';
+        const frameGrantId = typeof payload.grantId === 'string' ? payload.grantId : '';
+        if (frameDeviceId && frameDeviceId !== 'unknown' && frameDeviceId !== storedOwnerDeviceId) {
+          emitStructuredMainLog('mediation.event.receive.skip', {
+            event: eventType,
+            case_id: caseId,
+            reason: 'device_id_mismatch',
+            frame_device_id: frameDeviceId,
+          });
+          return;
+        }
+        if (frameGrantId && frameGrantId !== storedGrantId) {
+          emitStructuredMainLog('mediation.event.receive.skip', {
+            event: eventType,
+            case_id: caseId,
+            reason: 'grant_id_mismatch',
+            frame_grant_id: frameGrantId,
+          });
+          return;
+        }
+
+        try {
+          const remoteVersion = typeof payload.remote_version === 'number' ? payload.remote_version : undefined;
+
+          const updatedCase = mediationService.upsertRemoteCaseSnapshot({
+            projectedCase,
+            ownerDeviceId: storedOwnerDeviceId,
+            grantId: storedGrantId,
+            accessRole: 'collaborator',
+            remoteVersion,
+          });
+
+          emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+            ts: new Date().toISOString(),
+            type: 'case.updated',
+            action: 'remote_push_sync',
+            caseId,
+            case: updatedCase,
+          });
+        } catch (err) {
+          emitStructuredMainLog('mediation.event.receive.error', {
+            event: eventType,
+            case_id: caseId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     },
     onGrantTerminated: ({ grantId, mode }) => {
       if (!grantId) {
@@ -929,9 +1067,11 @@ async function bootstrap(): Promise<void> {
   };
 
   const idempotencyStorePath = path.join(app.getPath('userData'), 'mediation-idempotency.json');
+  const routerStatePath = path.join(app.getPath('userData'), 'mediation-router-state.json');
   remoteRouter = new RemoteMediationRouter({
     mediationService: mediationService as any,
     idempotencyStore: new IdempotencyStore(idempotencyStorePath),
+    persistence: new FileBackedRouterStatePersistence(routerStatePath),
     runDraftSuggestion: async ({ caseId, draftId }) => {
       const result = await runDraftSuggestion({ caseId, draftId });
       const mediationCase = result.case as MediationCase | undefined;
@@ -945,6 +1085,89 @@ async function bootstrap(): Promise<void> {
       };
     },
   });
+
+  /**
+   * Fanout mediation events to active collaborator sessions via the gateway.
+   * case.updated payloads are always re-projected per recipient so actor-scoped
+   * private fields never leak across collaborators.
+   */
+  const fanoutEventsToCollaborators = (events: MediationEventEnvelope[], excludeDeviceId?: string): void => {
+    if (!remoteRouter || events.length === 0) {
+      return;
+    }
+
+    const sendFanoutEvent = (deviceId: string, event: MediationEventEnvelope): void => {
+      void (async () => {
+        try {
+          const gatewayUrl = auth.getGatewayUrl();
+          await ensureRemoteSessionReady(sessionManager, gatewayUrl, deviceId);
+          await sessionManager.sendMessage(gatewayUrl, deviceId, JSON.stringify(event));
+        } catch (err) {
+          emitStructuredMainLog('mediation.fanout.error', {
+            device_id: deviceId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+    };
+
+    for (const event of events) {
+      const caseId = typeof event.case_id === 'string' ? event.case_id : '';
+      if (!caseId) {
+        continue;
+      }
+
+      const collaborators = remoteRouter
+        .getActiveBoundCollaborators(caseId)
+        .filter((collab) => collab.actorDeviceId && collab.actorDeviceId !== excludeDeviceId);
+
+      if (collaborators.length === 0) {
+        continue;
+      }
+
+      if (event.event === 'case.updated') {
+        let canonicalCase: MediationCase | null = null;
+        try {
+          canonicalCase = mediationService.getCase(caseId) as MediationCase;
+        } catch {
+          canonicalCase = null;
+        }
+        if (!canonicalCase) {
+          continue;
+        }
+
+        const remoteVersion = typeof event.remote_version === 'number'
+          ? event.remote_version
+          : remoteRouter.currentRemoteVersion(caseId);
+
+        for (const collab of collaborators) {
+          const projected = projectCaseForActor(canonicalCase, collab.partyId, 'collaborator');
+          sendFanoutEvent(collab.actorDeviceId, {
+            type: 'mediation.event',
+            schema_version: 1,
+            event: 'case.updated',
+            case_id: caseId,
+            case: projected,
+            remote_version: remoteVersion,
+          });
+        }
+        continue;
+      }
+
+      const passthroughEvent: MediationEventEnvelope = {
+        type: 'mediation.event',
+        schema_version: 1,
+        event: event.event,
+        ...(event.case_id ? { case_id: event.case_id } : {}),
+        ...(event.party_id ? { party_id: event.party_id } : {}),
+        ...(event.reason ? { reason: event.reason } : {}),
+        ...(typeof event.remote_version === 'number' ? { remote_version: event.remote_version } : {}),
+      };
+      for (const collab of collaborators) {
+        sendFanoutEvent(collab.actorDeviceId, passthroughEvent);
+      }
+    }
+  };
 
   const roomRuntime = createGroupChatRuntime({
     requestLocalPrompt: async (profileId, payload, timeoutMs) => {
@@ -1125,6 +1348,11 @@ async function bootstrap(): Promise<void> {
           ...eventPayload,
         });
       }
+      // Fanout events to bound collaborator sessions
+      fanoutEventsToCollaborators(
+        handled.events,
+        context.requesterDeviceId,
+      );
       return handled.result as unknown as Record<string, unknown>;
     } catch (err) {
       return {
@@ -1227,6 +1455,53 @@ async function bootstrap(): Promise<void> {
         ts: new Date().toISOString(),
         ...payload,
       });
+      // Fanout owner-initiated local case updates to bound collaborators.
+      // Each collaborator receives a projected (redacted) view of the case
+      // filtered through projectCaseForActor so private intake data is never leaked.
+      const caseId = typeof payload.caseId === 'string' ? payload.caseId : '';
+      if (caseId && remoteRouter && payload.type === 'case.updated') {
+        try {
+          const mediationCase = mediationService.getCase(caseId) as MediationCase;
+          const collaborators = remoteRouter.getActiveBoundCollaborators(caseId);
+          // Bump remote version for each owner-initiated sync event so
+          // collaborator devices always see a monotonically increasing version
+          // and don't reject the update as stale.
+          const remoteVersion = collaborators.length > 0
+            ? remoteRouter.nextRemoteVersionForSync(caseId)
+            : remoteRouter.currentRemoteVersion(caseId);
+          for (const collab of collaborators) {
+            if (!collab.actorDeviceId) {
+              continue;
+            }
+            const projected = projectCaseForActor(mediationCase, collab.partyId, 'collaborator');
+            // Do NOT embed grant_id / sender_device_id in the event payload.
+            // The collaborator derives grant/device context from its locally
+            // stored authenticated case metadata, not from unverified payload fields.
+            const syncEvent = {
+              type: 'mediation.event',
+              schema_version: 1,
+              event: 'case.updated',
+              case_id: caseId,
+              case: projected,
+              remote_version: remoteVersion,
+            };
+            void (async () => {
+              try {
+                const gatewayUrl = auth.getGatewayUrl();
+                await ensureRemoteSessionReady(sessionManager, gatewayUrl, collab.actorDeviceId);
+                await sessionManager.sendMessage(gatewayUrl, collab.actorDeviceId, JSON.stringify(syncEvent));
+              } catch (err) {
+                emitStructuredMainLog('mediation.fanout.error', {
+                  device_id: collab.actorDeviceId,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            })();
+          }
+        } catch {
+          // best-effort fanout; case may not exist or other non-critical error
+        }
+      }
     },
     emitStructuredLog: emitStructuredMainLog,
   });

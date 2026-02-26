@@ -50,6 +50,7 @@ interface RuntimeManagerDeps {
   emitLog?: (message: string) => void;
   onStatusChanged?: (status: RuntimeStatus) => void;
   onMediationCommandRequest?: (payload: Record<string, unknown>) => void;
+  onMediationEventReceived?: (payload: Record<string, unknown>) => void;
   onGrantTerminated?: (input: {
     grantId: string;
     mode: 'revoke' | 'leave';
@@ -168,6 +169,31 @@ function parseMediationCommandPrompt(prompt: string): Record<string, unknown> | 
   }
 
   if (asString(record.type) !== 'mediation.command') {
+    return null;
+  }
+
+  return record;
+}
+
+function parseMediationEventPrompt(prompt: string): Record<string, unknown> | null {
+  const trimmed = prompt.trim();
+  if (!trimmed.startsWith('{')) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+
+  const record = asRecord(parsed);
+  if (!record) {
+    return null;
+  }
+
+  if (asString(record.type) !== 'mediation.event') {
     return null;
   }
 
@@ -789,19 +815,9 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
       encrypted: encryptedRequest,
     });
 
-    const mediationCommand = parseMediationCommandPrompt(prompt);
-    if (!mediationCommand) {
-      sendSessionError(session, {
-        sessionId,
-        messageId,
-        conversationId,
-        correlationId,
-        error: 'unsupported_prompt',
-        encrypted: encryptedRequest,
-      });
-      return;
-    }
-
+    // ── Extract transport-authenticated identity from the frame ──────────
+    // This MUST happen before event/command branching so both paths have
+    // access to the authenticated requester context from the gateway relay.
     const requesterRecord = asRecord(frame.requester);
     const requesterUid = asString(
       frame.requester_uid
@@ -842,10 +858,56 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
       ?? requesterRecord?.grantStatus,
     );
 
-    const role = roleRaw === 'collaborator'
-      ? 'collaborator'
-      : (grantId ? 'collaborator' : 'owner');
+    // Fail closed: messages arriving via gateway WebSocket sessions are from remote
+    // devices. If the gateway relay doesn't provide explicit role='owner', default to
+    // 'collaborator'. The downstream router will reject collaborator requests missing
+    // grantId, preventing unauthorized owner-privilege escalation.
+    const role: 'owner' | 'collaborator' = roleRaw === 'owner'
+      ? 'owner'
+      : 'collaborator';
     const grantStatus = grantStatusRaw === 'revoked' ? 'revoked' : 'active';
+
+    // ── Try parsing as a mediation event (push sync from owner device) ──
+    // Events are fire-and-forget — we acknowledge receipt but don't send a
+    // command result, so handle them before attempting command parsing.
+    // Transport-authenticated identity fields are propagated so the
+    // receiver can persist correct grant/device metadata.
+    const mediationEvent = parseMediationEventPrompt(prompt);
+    if (mediationEvent) {
+      deps.onMediationEventReceived?.({
+        ...mediationEvent,
+        sessionId,
+        messageId,
+        requesterUid,
+        requesterDeviceId,
+        grantId,
+        role,
+        grantStatus,
+      });
+      // Acknowledge receipt so the sender doesn't see a timeout
+      sendSessionResult(session, {
+        sessionId,
+        messageId,
+        conversationId,
+        correlationId,
+        encrypted: encryptedRequest,
+        result: { ok: true, type: 'mediation.event.ack' },
+      });
+      return;
+    }
+
+    const mediationCommand = parseMediationCommandPrompt(prompt);
+    if (!mediationCommand) {
+      sendSessionError(session, {
+        sessionId,
+        messageId,
+        conversationId,
+        correlationId,
+        error: 'unsupported_prompt',
+        encrypted: encryptedRequest,
+      });
+      return;
+    }
 
     try {
       const result = await waitForDesktopMediationResult({

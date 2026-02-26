@@ -15,7 +15,7 @@ import { projectCaseForActor } from './projection';
 
 type BindingStatus = 'active' | 'revoked' | 'left';
 
-interface PartyBinding {
+export interface PartyBinding {
   actorUid: string;
   actorDeviceId: string;
   grantId: string;
@@ -60,10 +60,23 @@ interface MediationServiceLike {
   closeCase: (caseId: string) => MediationCase;
 }
 
+export interface PersistedRouterState {
+  grantCaseAccess: Array<{ grantId: string; allowedCaseIds: string[] }>;
+  caseBindings: Array<{ caseId: string; bindings: Array<{ partyId: string; binding: PartyBinding }> }>;
+  caseRemoteVersions: Array<{ caseId: string; version: number }>;
+  savedAt: string;
+}
+
+export interface RouterStatePersistence {
+  load(): PersistedRouterState | null;
+  save(state: PersistedRouterState): void;
+}
+
 interface RouterDeps {
   mediationService: MediationServiceLike;
   idempotencyStore: IdempotencyStore;
   runDraftSuggestion?: (input: { caseId: string; draftId: string }) => Promise<{ case: MediationCase; suggestedText: string }>;
+  persistence?: RouterStatePersistence;
 }
 
 interface HandleResult {
@@ -176,7 +189,105 @@ export class RemoteMediationRouter {
   private readonly caseRemoteVersions = new Map<string, number>();
   private readonly draftSuggestionInFlight = new Set<string>();
 
-  constructor(private readonly deps: RouterDeps) {}
+  constructor(private readonly deps: RouterDeps) {
+    this.rehydrateState();
+  }
+
+  private rehydrateState(): void {
+    const persistence = this.deps.persistence;
+    if (!persistence) {
+      return;
+    }
+    const saved = persistence.load();
+    if (!saved) {
+      return;
+    }
+
+    // Rehydrate grant-to-case access
+    if (Array.isArray(saved.grantCaseAccess)) {
+      for (const entry of saved.grantCaseAccess) {
+        if (entry.grantId && Array.isArray(entry.allowedCaseIds)) {
+          const access: GrantCaseAccess = {
+            defaultPolicy: 'deny',
+            allowedCaseIds: new Set(entry.allowedCaseIds),
+          };
+          this.grantCaseAccess.set(entry.grantId, access);
+        }
+      }
+    }
+
+    // Rehydrate party bindings
+    if (Array.isArray(saved.caseBindings)) {
+      for (const caseEntry of saved.caseBindings) {
+        if (caseEntry.caseId && Array.isArray(caseEntry.bindings)) {
+          const bindings = new Map<string, PartyBinding>();
+          for (const bindingEntry of caseEntry.bindings) {
+            if (bindingEntry.partyId && bindingEntry.binding) {
+              bindings.set(bindingEntry.partyId, {
+                actorUid: String(bindingEntry.binding.actorUid || ''),
+                actorDeviceId: String(bindingEntry.binding.actorDeviceId || ''),
+                grantId: String(bindingEntry.binding.grantId || ''),
+                boundAt: String(bindingEntry.binding.boundAt || ''),
+                status: (['active', 'revoked', 'left'].includes(bindingEntry.binding.status)
+                  ? bindingEntry.binding.status
+                  : 'active') as BindingStatus,
+              });
+            }
+          }
+          if (bindings.size > 0) {
+            this.caseBindings.set(caseEntry.caseId, bindings);
+          }
+        }
+      }
+    }
+
+    // Rehydrate remote version counters
+    if (Array.isArray(saved.caseRemoteVersions)) {
+      for (const entry of saved.caseRemoteVersions) {
+        if (entry.caseId && typeof entry.version === 'number' && entry.version > 0) {
+          this.caseRemoteVersions.set(entry.caseId, entry.version);
+        }
+      }
+    }
+  }
+
+  private persistState(): void {
+    const persistence = this.deps.persistence;
+    if (!persistence) {
+      return;
+    }
+
+    const grantCaseAccessArr: PersistedRouterState['grantCaseAccess'] = [];
+    for (const [grantId, access] of this.grantCaseAccess.entries()) {
+      grantCaseAccessArr.push({
+        grantId,
+        allowedCaseIds: [...access.allowedCaseIds],
+      });
+    }
+
+    const caseBindingsArr: PersistedRouterState['caseBindings'] = [];
+    for (const [caseId, bindings] of this.caseBindings.entries()) {
+      const bindingEntries: Array<{ partyId: string; binding: PartyBinding }> = [];
+      for (const [partyId, binding] of bindings.entries()) {
+        bindingEntries.push({ partyId, binding: { ...binding } });
+      }
+      if (bindingEntries.length > 0) {
+        caseBindingsArr.push({ caseId, bindings: bindingEntries });
+      }
+    }
+
+    const caseRemoteVersionsArr: PersistedRouterState['caseRemoteVersions'] = [];
+    for (const [caseId, version] of this.caseRemoteVersions.entries()) {
+      caseRemoteVersionsArr.push({ caseId, version });
+    }
+
+    persistence.save({
+      grantCaseAccess: grantCaseAccessArr,
+      caseBindings: caseBindingsArr,
+      caseRemoteVersions: caseRemoteVersionsArr,
+      savedAt: nowIso(),
+    });
+  }
 
   grantCaseVisibility(grantId: string, caseId: string): void {
     if (!grantId || !caseId) {
@@ -184,6 +295,7 @@ export class RemoteMediationRouter {
     }
     const access = this.ensureGrantAccess(grantId);
     access.allowedCaseIds.add(caseId);
+    this.persistState();
   }
 
   revokeGrant(grantId: string): MediationEventEnvelope[] {
@@ -719,6 +831,13 @@ export class RemoteMediationRouter {
     }
     const caseId = envelope.case_id || '';
     this.assertCasePhase(caseId, ['group_chat']);
+
+    // Spec requires at least one group message before resolving
+    const mediationCase = this.deps.mediationService.getCase(caseId);
+    if (!mediationCase.groupChat.messages || mediationCase.groupChat.messages.length === 0) {
+      return { result: errorEnvelope(envelope.request_id, 'invalid_phase', 'at least one group message is required before resolving', true), events: [] };
+    }
+
     const resolutionText = asString(envelope.payload.resolution_text);
     if (!resolutionText) {
       return { result: errorEnvelope(envelope.request_id, 'invalid_payload', 'resolution_text is required'), events: [] };
@@ -846,6 +965,7 @@ export class RemoteMediationRouter {
       boundAt: nowIso(),
       status: 'active',
     });
+    this.persistState();
   }
 
   private assertPartyUnbound(caseId: string, partyId: string, auth: GatewayAuthContext): void {
@@ -927,13 +1047,24 @@ export class RemoteMediationRouter {
     return asString(envelope.payload.idempotency_key);
   }
 
-  private currentRemoteVersion(caseId: string): number {
+  currentRemoteVersion(caseId: string): number {
     return this.caseRemoteVersions.get(caseId) || 0;
+  }
+
+  /**
+   * Atomically increment and return the next remote version for a case.
+   * Use this for owner-initiated push sync events so collaborator devices
+   * always receive a monotonically increasing version and don't reject
+   * the update as stale.
+   */
+  nextRemoteVersionForSync(caseId: string): number {
+    return this.bumpRemoteVersion(caseId);
   }
 
   private bumpRemoteVersion(caseId: string): number {
     const next = this.currentRemoteVersion(caseId) + 1;
     this.caseRemoteVersions.set(caseId, next);
+    this.persistState();
     return next;
   }
 
@@ -963,6 +1094,46 @@ export class RemoteMediationRouter {
       access.allowedCaseIds.clear();
     }
 
+    this.persistState();
     return events;
+  }
+
+  /**
+   * Returns all active bound collaborator sessions for a given case.
+   * Used for outbound event fanout from owner to collaborators.
+   */
+  getActiveBoundCollaborators(caseId: string): Array<{ partyId: string; grantId: string; actorDeviceId: string; actorUid: string }> {
+    const bindings = this.caseBindings.get(caseId);
+    if (!bindings) {
+      return [];
+    }
+    const result: Array<{ partyId: string; grantId: string; actorDeviceId: string; actorUid: string }> = [];
+    for (const [partyId, binding] of bindings.entries()) {
+      if (binding.status === 'active' && binding.grantId) {
+        result.push({
+          partyId,
+          grantId: binding.grantId,
+          actorDeviceId: binding.actorDeviceId,
+          actorUid: binding.actorUid,
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Returns all case IDs that have active collaborator bindings.
+   */
+  getCasesWithActiveCollaborators(): string[] {
+    const result: string[] = [];
+    for (const [caseId, bindings] of this.caseBindings.entries()) {
+      for (const binding of bindings.values()) {
+        if (binding.status === 'active' && binding.grantId) {
+          result.push(caseId);
+          break;
+        }
+      }
+    }
+    return result;
   }
 }

@@ -696,6 +696,11 @@ export class MediationService {
     const mediationCase = this.getCase(caseId);
     assertGroupChatPhase(mediationCase);
 
+    // Spec requires at least one group message before resolving
+    if (!mediationCase.groupChat.messages || mediationCase.groupChat.messages.length === 0) {
+      throw new DomainError('invalid_phase', 'at least one group message is required before resolving');
+    }
+
     this.transition(caseId, 'resolved');
     const updated = this.getCase(caseId);
     updated.resolution = resolution.trim();

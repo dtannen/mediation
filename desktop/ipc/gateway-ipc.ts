@@ -337,6 +337,17 @@ function waitForMediationResult(
 
 function isRetryableSessionError(message: string): boolean {
   const normalized = message.toLowerCase();
+  // Never retry explicit grant/session termination signals - these are terminal
+  if (
+    normalized.includes('grant_revoked')
+    || normalized.includes('grant revoked')
+    || normalized.includes('grant_expired')
+    || normalized.includes('grant expired')
+    || normalized.includes('session_terminated')
+    || normalized.includes('session terminated')
+  ) {
+    return false;
+  }
   return (
     normalized.includes('timeout')
     || normalized.includes('handshake')
@@ -360,6 +371,15 @@ function parseTerminationError(message: string): { code: 'grant_revoked' | 'sess
   if (normalized.includes('session_terminated') || normalized.includes('session terminated')) {
     return {
       code: 'session_terminated',
+      message,
+    };
+  }
+  // Only treat explicit grant-specific error codes as terminal.
+  // Generic 403/forbidden/unauthorized may be transient auth issues and should
+  // not permanently terminate the device session.
+  if (normalized.includes('grant_expired') || normalized.includes('grant expired')) {
+    return {
+      code: 'grant_revoked',
       message,
     };
   }
@@ -555,19 +575,17 @@ export function register(
             }
 
             lastMessage = awaited.error;
-            if (lastMessage.includes('grant_revoked') || lastMessage.includes('session_terminated')) {
-              const terminatedState = parseTerminationError(lastMessage);
-              if (terminatedState) {
-                deviceTerminationState.set(deviceId, {
-                  code: terminatedState.code,
-                  message: terminatedState.message,
-                  atMs: Date.now(),
-                });
-              }
+            const awaitedTermination = parseTerminationError(lastMessage);
+            if (awaitedTermination) {
+              deviceTerminationState.set(deviceId, {
+                code: awaitedTermination.code,
+                message: awaitedTermination.message,
+                atMs: Date.now(),
+              });
               return {
                 ok: false,
                 error: {
-                  code: lastMessage.includes('grant_revoked') ? 'grant_revoked' : 'session_terminated',
+                  code: awaitedTermination.code,
                   message: lastMessage,
                   recoverable: false,
                 },

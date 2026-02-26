@@ -274,6 +274,32 @@
   margin-bottom: var(--sp-3);
 }
 
+.share-invite-inline {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.share-invite-inline input {
+  flex: 1 1 260px;
+}
+
+.share-invite-inline button {
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .share-invite-inline {
+    align-items: stretch;
+  }
+
+  .share-invite-inline input,
+  .share-invite-inline button {
+    flex: 1 1 100%;
+  }
+}
+
 .grant-list {
   display: grid;
   gap: var(--sp-2);
