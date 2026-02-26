@@ -746,8 +746,9 @@ function renderCaseDetailView() {
         <div class="cta-heading">${escapeHtml(intakeHeading)}</div>
         <div class="cta-desc">${escapeHtml(intakeDesc)}</div>
         <button class="cta" data-action="open-intake">${escapeHtml(intakeHeading)}</button>
-        ${waitingText}
       </section>
+
+      ${waitingText}
 
       ${groupCta}
 
@@ -887,16 +888,10 @@ function renderPrivateIntakeView() {
         <form class="chat-input-area" data-submit-action="send-private-message">
           <textarea data-draft-key="${escapeHtml(draftKey)}" name="privateMessage" placeholder="Share your thoughts..." rows="1">${escapeHtml(draftValue)}</textarea>
           <div class="chat-input-actions">
+            ${messages.length >= 2 ? `<span class="ready-prompt-btn"><span class="ready-prompt-label">Ready to move forward?</span> <button type="button" class="primary" data-action="open-intake-summary">Summarize My Perspective</button></span>` : ''}
             <button type="submit" class="primary">Send</button>
           </div>
         </form>
-
-        ${messages.length >= 2 ? `
-          <section class="ready-prompt">
-            <span class="ready-prompt-text">Ready to move forward?</span>
-            <button class="primary" data-action="open-intake-summary">Summarize My Perspective</button>
-          </section>
-        ` : ''}
       `}
     </div>
   `;
@@ -2035,6 +2030,10 @@ async function handleClick(event) {
   if (action === 'run-intake-template') { await runIntakeTemplate(); return; }
 
   if (action === 'open-intake-summary') {
+    const btn = target.closest('.ready-prompt-btn');
+    if (btn) {
+      btn.innerHTML = '<span class="summarizing-indicator"><span class="summarizing-spinner"></span> Summarizing...</span>';
+    }
     await runIntakeTemplate();
     state.activeSubview = 'intake-summary';
     render();

@@ -201,22 +201,36 @@
 }
 
 /* ============================================================
-   READY PROMPT (bottom of intake chat)
+   READY PROMPT (inline in chat input actions)
    ============================================================ */
-.ready-prompt {
-  display: flex;
+.ready-prompt-btn {
+  margin-right: auto;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-  border: 1px solid rgba(102, 126, 234, 0.25);
-  border-radius: var(--radius-md);
-  background: var(--brand-gradient-subtle);
+  gap: var(--sp-2);
 }
-.ready-prompt-text {
+.ready-prompt-label {
   font-size: var(--text-sm);
-  font-weight: 600;
-  color: var(--ink-strong);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.summarizing-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--brand);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.summarizing-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(102, 126, 234, 0.2);
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
 }
 
 /* ============================================================

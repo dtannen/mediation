@@ -1,11 +1,19 @@
-import path from 'node:path';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createInterface } from 'node:readline';
+import {
+  executeLocalPromptRequest,
+  type LocalPromptBridgeOptions,
+  type LocalPromptRequestFrame,
+} from '../../src/llm/local-prompt-bridge';
+import { registerBuiltInProviders } from '../../src/llm/providers';
+import { listProviderIds } from '../../src/llm/provider-registry';
 
 interface LocalPromptBridge {
-  registerLocalPromptBridge: (profileId: string, child: ChildProcessWithoutNullStreams) => void;
+  registerLocalPromptBridge: (
+    profileId: string,
+    bridge: {
+      executor: (frame: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    },
+  ) => void;
   closeLocalPromptBridge: (profileId: string, reason?: string) => void;
-  maybeHandleLocalPromptResponseLine: (profileId: string, line: string) => boolean;
 }
 
 export interface BridgeProfileRuntimeConfig {
@@ -21,10 +29,21 @@ interface BridgeManagerDeps {
 }
 
 export default function createBridgeManager(deps: BridgeManagerDeps) {
-  const children = new Map<string, ChildProcessWithoutNullStreams>();
-  const outReaders = new Map<string, ReturnType<typeof createInterface>>();
-  const errReaders = new Map<string, ReturnType<typeof createInterface>>();
-  const bridgeScriptPath = path.join(__dirname, 'bridge-child.js');
+  const profiles = new Map<string, BridgeProfileRuntimeConfig>();
+  let providersReady = false;
+
+  function ensureProvidersRegistered(): void {
+    if (providersReady) {
+      return;
+    }
+
+    const existing = new Set(listProviderIds());
+    if (!existing.has('claude') || !existing.has('ollama')) {
+      registerBuiltInProviders();
+    }
+
+    providersReady = true;
+  }
 
   function resolveRuntimeConfig(profileId: string): BridgeProfileRuntimeConfig {
     if (deps.resolveProfileRuntimeConfig) {
@@ -38,134 +57,48 @@ export default function createBridgeManager(deps: BridgeManagerDeps) {
     };
   }
 
-  function cleanupReaders(profileId: string): void {
-    const out = outReaders.get(profileId);
-    if (out) {
-      try {
-        out.removeAllListeners();
-        out.close();
-      } catch {
-        // best-effort
-      }
-      outReaders.delete(profileId);
-    }
-
-    const err = errReaders.get(profileId);
-    if (err) {
-      try {
-        err.removeAllListeners();
-        err.close();
-      } catch {
-        // best-effort
-      }
-      errReaders.delete(profileId);
-    }
-  }
-
   function stopBridge(profileId: string, reason = 'bridge_stopped'): void {
-    const child = children.get(profileId);
-    if (!child) {
+    if (!profiles.has(profileId)) {
       deps.localBridge.closeLocalPromptBridge(profileId, reason);
-      cleanupReaders(profileId);
       return;
     }
 
-    children.delete(profileId);
-    cleanupReaders(profileId);
+    profiles.delete(profileId);
     deps.localBridge.closeLocalPromptBridge(profileId, reason);
+    deps.emitLog?.(profileId, `[bridge:stop] reason=${reason}`);
+  }
 
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      // no-op
+  function ensureBridge(profileId: string): void {
+    if (profiles.has(profileId)) {
+      return;
     }
-  }
 
-  function wireChildStreams(profileId: string, child: ChildProcessWithoutNullStreams): void {
-    const stdoutReader = createInterface({
-      input: child.stdout,
-      crlfDelay: Infinity,
-      terminal: false,
-    });
-    outReaders.set(profileId, stdoutReader);
+    ensureProvidersRegistered();
 
-    stdoutReader.on('line', (line: string) => {
-      if (!deps.localBridge.maybeHandleLocalPromptResponseLine(profileId, line)) {
-        const trimmed = line.trim();
-        if (trimmed) {
-          deps.emitLog?.(profileId, `[bridge:stdout] ${trimmed}`);
-        }
-      }
-    });
-
-    const stderrReader = createInterface({
-      input: child.stderr,
-      crlfDelay: Infinity,
-      terminal: false,
-    });
-    errReaders.set(profileId, stderrReader);
-
-    stderrReader.on('line', (line: string) => {
-      const trimmed = line.trim();
-      if (trimmed) {
-        deps.emitLog?.(profileId, `[bridge:stderr] ${trimmed}`);
-      }
-    });
-  }
-
-  function spawnBridge(profileId: string): ChildProcessWithoutNullStreams {
     const cfg = resolveRuntimeConfig(profileId);
-    const env = {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
-      MEDIATION_BRIDGE_PROFILE_ID: profileId,
-      MEDIATION_BRIDGE_PROVIDER: cfg.provider,
-      MEDIATION_BRIDGE_MODEL: cfg.model,
-      MEDIATION_BRIDGE_CWD: cfg.cwd,
+    const options: LocalPromptBridgeOptions = {
+      profileId,
+      provider: cfg.provider,
+      model: cfg.model,
+      defaultCwd: cfg.cwd,
     };
 
-    const child = spawn(process.execPath, [bridgeScriptPath], {
-      env,
-      cwd: cfg.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
+    deps.localBridge.registerLocalPromptBridge(profileId, {
+      executor: async (frame) => {
+        const response = await executeLocalPromptRequest(
+          frame as unknown as LocalPromptRequestFrame,
+          options,
+        );
+        return response as unknown as Record<string, unknown>;
+      },
     });
 
-    deps.localBridge.registerLocalPromptBridge(profileId, child);
-    wireChildStreams(profileId, child);
-
-    child.on('error', (err) => {
-      deps.emitLog?.(profileId, `[bridge:error] ${err.message}`);
-      children.delete(profileId);
-      cleanupReaders(profileId);
-      deps.localBridge.closeLocalPromptBridge(profileId, 'bridge_error');
-    });
-
-    child.on('close', (code, signal) => {
-      children.delete(profileId);
-      cleanupReaders(profileId);
-      deps.localBridge.closeLocalPromptBridge(profileId, 'bridge_exit');
-      deps.emitLog?.(
-        profileId,
-        `[bridge:exit] code=${code == null ? 'null' : String(code)} signal=${signal || 'none'}`,
-      );
-    });
-
-    children.set(profileId, child);
-    deps.emitLog?.(profileId, `[bridge:start] provider=${cfg.provider} model=${cfg.model}`);
-    return child;
-  }
-
-  function ensureBridge(profileId: string): ChildProcessWithoutNullStreams {
-    const existing = children.get(profileId);
-    if (existing && !existing.killed) {
-      return existing;
-    }
-    return spawnBridge(profileId);
+    profiles.set(profileId, cfg);
+    deps.emitLog?.(profileId, `[bridge:start] provider=${cfg.provider} model=${cfg.model} mode=in-process`);
   }
 
   function stopAll(reason = 'bridge_manager_stopped'): void {
-    for (const profileId of [...children.keys()]) {
+    for (const profileId of [...profiles.keys()]) {
       stopBridge(profileId, reason);
     }
   }
@@ -176,4 +109,3 @@ export default function createBridgeManager(deps: BridgeManagerDeps) {
     stopAll,
   };
 }
-

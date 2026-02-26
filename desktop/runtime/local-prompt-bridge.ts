@@ -3,13 +3,28 @@ import { randomBytes } from 'node:crypto';
 const LOCAL_PROMPT_REQUEST_TYPE = 'desktop.local_prompt.request';
 const LOCAL_PROMPT_RESPONSE_TYPE = 'desktop.local_prompt.response';
 
-interface LocalPromptBridgeState {
-  child: {
+interface LocalPromptExecutor {
+  (frame: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown>;
+}
+
+interface LocalPromptBridgeRegistration {
+  child?: {
     stdin?: {
       write: (text: string, encoding: BufferEncoding, cb?: (err?: Error | null) => void) => boolean;
       once?: (event: string, handler: () => void) => void;
     };
   };
+  executor?: LocalPromptExecutor;
+}
+
+interface LocalPromptBridgeState {
+  child?: {
+    stdin?: {
+      write: (text: string, encoding: BufferEncoding, cb?: (err?: Error | null) => void) => boolean;
+      once?: (event: string, handler: () => void) => void;
+    };
+  };
+  executor?: LocalPromptExecutor;
   activeRequestId: string | null;
   pending: Map<string, {
     resolve: (result: Record<string, unknown>) => void;
@@ -40,14 +55,36 @@ export default function createLocalPromptBridge() {
     localPromptBridges.delete(profileId);
   }
 
-  function registerLocalPromptBridge(profileId: string, child: LocalPromptBridgeState['child']): void {
+  function registerLocalPromptBridge(
+    profileId: string,
+    bridgeOrChild: LocalPromptBridgeRegistration | LocalPromptBridgeState['child'],
+  ): void {
+    const registration = (
+      bridgeOrChild
+      && typeof bridgeOrChild === 'object'
+      && ('child' in bridgeOrChild || 'executor' in bridgeOrChild)
+    )
+      ? bridgeOrChild as LocalPromptBridgeRegistration
+      : { child: bridgeOrChild as LocalPromptBridgeState['child'] };
+
+    if (!registration.child && typeof registration.executor !== 'function') {
+      throw new Error('registerLocalPromptBridge requires a child transport or executor');
+    }
+
     const existing = localPromptBridges.get(profileId);
-    if (existing && existing.child !== child) {
+    if (
+      existing
+      && (
+        existing.child !== registration.child
+        || existing.executor !== registration.executor
+      )
+    ) {
       closeLocalPromptBridge(profileId, 'bridge_replaced');
     }
 
     localPromptBridges.set(profileId, {
-      child,
+      child: registration.child,
+      executor: registration.executor,
       activeRequestId: null,
       pending: new Map(),
     });
@@ -142,8 +179,6 @@ export default function createLocalPromptBridge() {
       bridge.pending.set(requestId, { resolve, timeoutId });
       bridge.activeRequestId = requestId;
 
-      const frameText = `${JSON.stringify(frame)}\n`;
-
       const onWriteDone = (err?: Error | null): void => {
         if (!err) {
           return;
@@ -162,12 +197,38 @@ export default function createLocalPromptBridge() {
       };
 
       try {
-        const writable = bridge.child.stdin;
+        if (bridge.executor) {
+          Promise.resolve(bridge.executor(frame as Record<string, unknown>))
+            .then((response) => {
+              if (!response || typeof response !== 'object') {
+                onWriteDone(new Error('bridge executor returned invalid response'));
+                return;
+              }
+
+              const handled = maybeHandleLocalPromptResponseLine(profileId, JSON.stringify(response));
+              if (!handled) {
+                onWriteDone(new Error('bridge executor returned unrecognized response frame'));
+              }
+            })
+            .catch((err) => {
+              onWriteDone(err instanceof Error ? err : new Error(String(err)));
+            });
+          return;
+        }
+
+        const child = bridge.child;
+        if (!child) {
+          onWriteDone(new Error('bridge child transport is unavailable'));
+          return;
+        }
+
+        const writable = child.stdin;
         if (!writable || typeof writable.write !== 'function') {
           onWriteDone(new Error('agent stdin is unavailable'));
           return;
         }
 
+        const frameText = `${JSON.stringify(frame)}\n`;
         const writeResult = writable.write(frameText, 'utf8', onWriteDone);
         if (writeResult === false && typeof writable.once === 'function') {
           writable.once('drain', () => undefined);

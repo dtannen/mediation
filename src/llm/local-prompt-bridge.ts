@@ -30,7 +30,7 @@ interface LocalPromptConstraints {
   local_turn_timeout_ms: number;
 }
 
-interface LocalPromptRequestFrame {
+export interface LocalPromptRequestFrame {
   type: typeof REQUEST_TYPE;
   request_id: string;
   profile_id?: string;
@@ -48,7 +48,7 @@ interface LocalPromptRequestFrame {
   probe?: boolean;
 }
 
-interface LocalPromptResponseFrame {
+export interface LocalPromptResponseFrame {
   type: typeof RESPONSE_TYPE;
   request_id: string;
   status: 'ok' | 'error';
@@ -292,6 +292,145 @@ async function runLocalDraft(
     const wrapped = new Error(message || 'provider session resume failed') as Error & { code?: string };
     wrapped.code = 'provider_session_invalid';
     throw wrapped;
+  }
+}
+
+function buildResponseFrame(input: {
+  requestId: string;
+  status: 'ok' | 'error';
+  startedAt: number;
+  correlationId?: string;
+  providerSessionId?: string;
+  draftMessage?: string;
+  reason?: string;
+  code?: string;
+  metrics?: Partial<LocalPromptResponseFrame['metrics']>;
+}): LocalPromptResponseFrame {
+  return {
+    type: RESPONSE_TYPE,
+    request_id: input.requestId,
+    status: input.status,
+    ...(input.correlationId ? { correlation_id: input.correlationId } : {}),
+    ...(input.providerSessionId ? { provider_session_id: input.providerSessionId } : {}),
+    ...(input.draftMessage ? { draft_message: input.draftMessage } : {}),
+    ...(input.reason ? { reason: input.reason } : {}),
+    ...(input.code ? { code: input.code } : {}),
+    metrics: {
+      latency_ms: Math.max(0, Date.now() - input.startedAt),
+      ...(typeof input.metrics?.turns === 'number' ? { turns: input.metrics.turns } : {}),
+      ...(typeof input.metrics?.cost_usd === 'number' ? { cost_usd: input.metrics.cost_usd } : {}),
+      ...(typeof input.metrics?.model === 'string' && input.metrics.model.trim()
+        ? { model: input.metrics.model.trim() }
+        : {}),
+    },
+  };
+}
+
+export async function executeLocalPromptRequest(
+  request: LocalPromptRequestFrame,
+  options: LocalPromptBridgeOptions,
+): Promise<LocalPromptResponseFrame> {
+  const startedAt = Date.now();
+  const requestId = normalizeText(request.request_id);
+  if (!requestId) {
+    return buildResponseFrame({
+      requestId: '',
+      status: 'error',
+      startedAt,
+      reason: 'request_id is required',
+      code: 'invalid_request',
+    });
+  }
+
+  const requestProfileId = normalizeText(request.profile_id);
+  if (requestProfileId && requestProfileId !== options.profileId) {
+    return buildResponseFrame({
+      requestId,
+      status: 'error',
+      startedAt,
+      reason: `profile mismatch (expected ${options.profileId}, got ${requestProfileId})`,
+      code: 'profile_mismatch',
+    });
+  }
+
+  const correlationId = normalizeText(request.correlation_id);
+  if (request.probe) {
+    return buildResponseFrame({
+      requestId,
+      status: 'ok',
+      startedAt,
+      correlationId,
+    });
+  }
+
+  const constraints = normalizeConstraints(request.constraints);
+  let timeoutId: NodeJS.Timeout | null = null;
+
+  try {
+    const timeoutPromise = new Promise<ProviderRunResult>((_resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        const err = new Error(`local prompt timeout after ${constraints.local_turn_timeout_ms}ms`) as Error & { code?: string };
+        err.code = 'local_prompt_timeout';
+        reject(err);
+      }, constraints.local_turn_timeout_ms);
+      if (typeof timeoutId.unref === 'function') {
+        timeoutId.unref();
+      }
+    });
+
+    const result = await Promise.race([
+      runLocalDraft(request, constraints, options),
+      timeoutPromise,
+    ]);
+
+    const resultText = truncateChars(result.result || '', constraints.max_output_chars);
+    if (!resultText.trim()) {
+      return buildResponseFrame({
+        requestId,
+        status: 'error',
+        startedAt,
+        correlationId,
+        reason: 'local prompt produced empty draft message',
+        code: 'local_prompt_empty',
+      });
+    }
+
+    return buildResponseFrame({
+      requestId,
+      status: 'ok',
+      startedAt,
+      correlationId,
+      providerSessionId: result.sessionId,
+      draftMessage: resultText,
+      metrics: {
+        turns: result.turns,
+        cost_usd: result.costUsd,
+        model: result.model,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const code = (
+      err
+      && typeof err === 'object'
+      && typeof (err as { code?: unknown }).code === 'string'
+      && (err as { code?: string }).code?.trim()
+    )
+      ? (err as { code: string }).code.trim()
+      : 'local_prompt_failed';
+
+    return buildResponseFrame({
+      requestId,
+      status: 'error',
+      startedAt,
+      correlationId,
+      reason: message || 'local prompt execution failed',
+      code,
+    });
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
   }
 }
 

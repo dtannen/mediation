@@ -3,6 +3,9 @@ const electronBinary = require('electron');
 
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE;
+if (typeof process.execPath === 'string' && process.execPath.trim()) {
+  env.MEDIATION_NODE_PATH = process.execPath.trim();
+}
 
 const child = spawn(electronBinary, ['dist-desktop/desktop/main.js'], {
   stdio: 'inherit',

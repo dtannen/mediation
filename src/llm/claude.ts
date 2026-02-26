@@ -89,12 +89,42 @@ function normalizeModelForSdk(model: string): string {
   return model;
 }
 
+function resolveNodeRuntimeCommand(): string | null {
+  const candidates = [
+    process.env.MEDIATION_NODE_PATH,
+    process.env.DESKTOP_NODE_PATH,
+    process.env.NODE_BINARY,
+    process.env.npm_node_execpath,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') {
+      continue;
+    }
+    const trimmed = candidate.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed.toLowerCase().includes('electron')) {
+      continue;
+    }
+    return trimmed;
+  }
+
+  return null;
+}
+
 function resolveClaudeRuntimeCommand(defaultCommand: string): {
   command: string;
   forceElectronNodeMode: boolean;
 } {
   if (defaultCommand !== 'node') {
     return { command: defaultCommand, forceElectronNodeMode: false };
+  }
+
+  const preferredNode = resolveNodeRuntimeCommand();
+  if (preferredNode) {
+    return { command: preferredNode, forceElectronNodeMode: false };
   }
 
   const execPath = process.execPath;
@@ -254,4 +284,3 @@ export async function runClaudeSdkPrompt(input: ProviderRunInput): Promise<Provi
     sessionId: detectedSessionId || input.resumeSessionId,
   };
 }
-
