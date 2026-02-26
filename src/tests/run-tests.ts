@@ -2,6 +2,7 @@ import { runDomainTests } from './domain.test';
 import { runConsentTests } from './consent.test';
 import { runTransportTests } from './transport.test';
 import { runPersistenceTests } from './persistence.test';
+import { runRemoteRouterTests } from './remote-router.test';
 
 async function main(): Promise<void> {
   const suites = [
@@ -9,6 +10,7 @@ async function main(): Promise<void> {
     await runConsentTests(),
     await runTransportTests(),
     await runPersistenceTests(),
+    await runRemoteRouterTests(),
   ];
 
   const passed = suites.reduce((sum, suite) => sum + suite.passed, 0);

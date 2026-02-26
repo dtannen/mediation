@@ -43,6 +43,17 @@ export interface InviteLink {
   expiresAt?: string;
 }
 
+export interface CaseSyncMetadata {
+  source: 'owner_local' | 'shared_remote';
+  ownerDeviceId?: string;
+  grantId?: string;
+  accessRole?: 'owner' | 'collaborator';
+  localPartyId?: string;
+  remoteVersion?: number;
+  syncUpdatedAt?: string;
+  syncStatus?: 'live' | 'stale' | 'reconnecting' | 'access_revoked' | 'left' | 'removed';
+}
+
 export interface ConsentGrant {
   allowSummaryShare: boolean;
   allowDirectQuote: boolean;
@@ -112,6 +123,7 @@ export interface MediationCase {
   description: string;
   createdAt: string;
   updatedAt: string;
+  syncMetadata?: CaseSyncMetadata;
   phase: MediationPhase;
   parties: Party[];
   inviteLink: InviteLink;

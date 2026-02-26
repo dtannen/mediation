@@ -57,8 +57,8 @@ function main(): void {
     inviteLink: mediationCase.inviteLink.url,
   });
 
-  service.joinWithInvite(mediationCase.id, 'party_a', mediationCase.inviteLink.token);
-  service.joinWithInvite(mediationCase.id, 'party_b', mediationCase.inviteLink.token);
+  service.joinParty(mediationCase.id, 'party_a');
+  service.joinParty(mediationCase.id, 'party_b');
 
   printSection('Both Parties Joined (Private Intake Active)');
   console.log({

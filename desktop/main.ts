@@ -29,6 +29,9 @@ import {
   isRegistryReady,
   getAvailablePluginManifests,
 } from '../src/room/plugin-registry';
+import { IdempotencyStore } from '../src/remote/idempotency-store';
+import { RemoteMediationRouter } from '../src/remote/router';
+import type { GatewayAuthContext } from '../src/remote/protocol';
 
 let mainWindow: BrowserWindow | null = null;
 let stopBridgeManager: (() => void) | null = null;
@@ -134,6 +137,18 @@ function emitToAllWindows(channel: string, payload: Record<string, unknown>): vo
   }
 }
 
+function emitStructuredMainLog(event: string, fields: Record<string, unknown> = {}): void {
+  try {
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      ...fields,
+    }));
+  } catch {
+    // best effort
+  }
+}
+
 async function createMainWindow(): Promise<void> {
   const preloadPath = path.join(__dirname, 'preload-main.js');
 
@@ -232,6 +247,43 @@ function extractRemoteError(payload: Record<string, unknown> | undefined, fallba
     || pickString(payload, 'message')
     || fallback
   );
+}
+
+function buildDefaultGatewayAuthContext(authStatus: Record<string, unknown>): GatewayAuthContext {
+  const mediationDevice = (
+    authStatus.mediationDevice
+    && typeof authStatus.mediationDevice === 'object'
+  ) ? authStatus.mediationDevice as Record<string, unknown> : {};
+
+  return {
+    requesterUid: pickString(authStatus, 'uid') || pickString(authStatus, 'userId') || 'owner_local',
+    requesterDeviceId: pickString(mediationDevice, 'id') || 'owner_device',
+    grantId: 'owner_local',
+    role: 'owner',
+    grantStatus: 'active',
+  };
+}
+
+function parseGatewayAuthContext(
+  payload: Record<string, unknown>,
+  authStatus: Record<string, unknown>,
+): GatewayAuthContext {
+  const defaultContext = buildDefaultGatewayAuthContext(authStatus);
+  const raw = (
+    payload.authContext
+    && typeof payload.authContext === 'object'
+  ) ? payload.authContext as Record<string, unknown> : {};
+
+  const role = pickString(raw, 'role') === 'collaborator' ? 'collaborator' : defaultContext.role;
+  const grantStatus = pickString(raw, 'grantStatus') === 'revoked' ? 'revoked' : 'active';
+
+  return {
+    requesterUid: pickString(raw, 'requesterUid') || defaultContext.requesterUid,
+    requesterDeviceId: pickString(raw, 'requesterDeviceId') || defaultContext.requesterDeviceId,
+    grantId: pickString(raw, 'grantId') || defaultContext.grantId,
+    role,
+    grantStatus,
+  };
 }
 
 function buildIntakePromptTemplate(mediationCase: MediationCase, partyId: string): string {
@@ -449,6 +501,7 @@ async function bootstrap(): Promise<void> {
 
   const mediationStorePath = path.join(app.getPath('userData'), 'mediation-cases.json');
   const mediationService = new MediationService(new FileBackedMediationStore(mediationStorePath));
+  mediationService.purgeExpiredRemoteTombstones();
 
   const auth = createAuthService({
     shell,
@@ -466,6 +519,7 @@ async function bootstrap(): Promise<void> {
   });
 
   let emitAuthChanged = (): void => {};
+  let remoteRouter: RemoteMediationRouter | null = null;
 
   const runtimeManager = createAgentRuntimeManager({
     homedir: os.homedir(),
@@ -480,6 +534,140 @@ async function bootstrap(): Promise<void> {
     },
     onStatusChanged: () => {
       emitAuthChanged();
+    },
+    onMediationCommandRequest: (payload) => {
+      void (async () => {
+        const requestId = pickString(payload, 'request_id');
+        if (!requestId || !remoteRouter) {
+          return;
+        }
+
+        const command = (
+          payload.command
+          && typeof payload.command === 'object'
+        ) ? payload.command as Record<string, unknown> : {};
+        const authContext = (
+          payload.requesterUid
+          || payload.requester_uid
+        ) ? {
+          requesterUid: pickString(payload, 'requesterUid') || pickString(payload, 'requester_uid') || 'unknown',
+          requesterDeviceId: pickString(payload, 'requesterDeviceId') || pickString(payload, 'requester_device_id') || 'unknown',
+          grantId: pickString(payload, 'grantId') || pickString(payload, 'grant_id') || '',
+          role: (pickString(payload, 'role') === 'collaborator' ? 'collaborator' : 'owner') as 'owner' | 'collaborator',
+          grantStatus: (pickString(payload, 'grantStatus') === 'revoked' ? 'revoked' : 'active') as 'active' | 'revoked',
+        } : buildDefaultGatewayAuthContext(auth.getStatus() as Record<string, unknown>);
+
+        emitStructuredMainLog('mediation.command.received', {
+          request_id: pickString(command, 'request_id') || requestId,
+          command: pickString(command, 'command'),
+          case_id: pickString(command, 'case_id'),
+          party_id: pickString(command, 'party_id'),
+          device_id: authContext.requesterDeviceId || '',
+          grant_id: authContext.grantId || '',
+        });
+
+        const handled = await remoteRouter.handleCommand(authContext, command);
+        const remoteVersion = (
+          handled.result.ok === true
+            ? Number((handled.result as { remote_version?: unknown }).remote_version || 0)
+            : 0
+        );
+        if (handled.result.ok === true) {
+          emitStructuredMainLog('mediation.command.applied', {
+            request_id: pickString(command, 'request_id') || requestId,
+            command: pickString(command, 'command'),
+            case_id: pickString(command, 'case_id'),
+            party_id: pickString(command, 'party_id'),
+            device_id: authContext.requesterDeviceId || '',
+            grant_id: authContext.grantId || '',
+            remote_version: remoteVersion > 0 ? remoteVersion : undefined,
+          });
+        } else {
+          const errorRecord = (handled.result.error && typeof handled.result.error === 'object')
+            ? handled.result.error as { code?: unknown }
+            : { code: '' };
+          emitStructuredMainLog('mediation.command.denied', {
+            request_id: pickString(command, 'request_id') || requestId,
+            command: pickString(command, 'command'),
+            case_id: pickString(command, 'case_id'),
+            party_id: pickString(command, 'party_id'),
+            device_id: authContext.requesterDeviceId || '',
+            grant_id: authContext.grantId || '',
+            'error.code': typeof errorRecord.code === 'string' ? errorRecord.code.trim() : '',
+          });
+        }
+        const commandCaseId = (
+          command
+          && typeof command === 'object'
+        ) ? pickString(command as Record<string, unknown>, 'case_id') : '';
+        if (commandCaseId) {
+          try {
+            const canonicalCase = mediationService.getCase(commandCaseId);
+            emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+              ts: new Date().toISOString(),
+              type: 'case.updated',
+              action: 'remote_command',
+              caseId: commandCaseId,
+              case: canonicalCase,
+            });
+          } catch {
+            // best effort only
+          }
+        }
+        for (const eventPayload of handled.events) {
+          emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+            ts: new Date().toISOString(),
+            ...eventPayload,
+          });
+        }
+        runtimeManager.sendControlFrame({
+          type: 'desktop.mediation.command.response',
+          request_id: requestId,
+          result: handled.result,
+        });
+      })().catch((err) => {
+        runtimeManager.sendControlFrame({
+          type: 'desktop.mediation.command.response',
+          request_id: pickString(payload, 'request_id'),
+          error: {
+            code: 'session_error',
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      });
+    },
+    onGrantTerminated: ({ grantId, mode }) => {
+      if (!grantId) {
+        return;
+      }
+
+      const events = !remoteRouter
+        ? []
+        : (mode === 'revoke' ? remoteRouter.revokeGrant(grantId) : remoteRouter.leaveGrant(grantId));
+
+      for (const eventPayload of events) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          ...eventPayload,
+        });
+      }
+
+      const syncedCases = mediationService.markRemoteGrantStatus(grantId, mode === 'revoke' ? 'access_revoked' : 'left');
+      for (const mediationCase of syncedCases) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          type: 'case.updated',
+          action: 'mark_remote_grant_status',
+          caseId: mediationCase.id,
+          case: mediationCase,
+          grantId,
+        });
+      }
+
+      emitToAllWindows(CH.OUT_GATEWAY_SHARE_EVENT, {
+        type: mode === 'revoke' ? 'access.revoked' : 'access.left',
+        grantId,
+      });
     },
   });
   stopAgentRuntime = () => runtimeManager.ensureStopped();
@@ -740,6 +928,24 @@ async function bootstrap(): Promise<void> {
     };
   };
 
+  const idempotencyStorePath = path.join(app.getPath('userData'), 'mediation-idempotency.json');
+  remoteRouter = new RemoteMediationRouter({
+    mediationService: mediationService as any,
+    idempotencyStore: new IdempotencyStore(idempotencyStorePath),
+    runDraftSuggestion: async ({ caseId, draftId }) => {
+      const result = await runDraftSuggestion({ caseId, draftId });
+      const mediationCase = result.case as MediationCase | undefined;
+      const suggestedText = typeof result.suggestedText === 'string' ? result.suggestedText : '';
+      if (!mediationCase || !suggestedText) {
+        throw new Error('draft suggestion failed');
+      }
+      return {
+        case: mediationCase,
+        suggestedText,
+      };
+    },
+  });
+
   const roomRuntime = createGroupChatRuntime({
     requestLocalPrompt: async (profileId, payload, timeoutMs) => {
       bridgeManager.ensureBridge(profileId);
@@ -847,6 +1053,94 @@ async function bootstrap(): Promise<void> {
 
   await initPluginRegistry(path.join(app.getPath('userData'), 'room-plugins')).catch(() => undefined);
 
+  registry.handle(ipcMain, CH.MEDIATION_REMOTE_GRANT_CASE, async (_event, payload) => {
+    try {
+      const grantId = pickString(payload || {}, 'grantId');
+      const caseId = pickString(payload || {}, 'caseId');
+      if (!grantId || !caseId) {
+        return {
+          ok: false,
+          error: {
+            code: 'invalid_payload',
+            message: 'grantId and caseId are required',
+            recoverable: true,
+          },
+        };
+      }
+      remoteRouter.grantCaseVisibility(grantId, caseId);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  registry.handle(ipcMain, CH.MEDIATION_REMOTE_TERMINATE_GRANT, async (_event, payload) => {
+    try {
+      const grantId = pickString(payload || {}, 'grantId');
+      const mode = pickString(payload || {}, 'mode');
+      if (!grantId || (mode !== 'revoke' && mode !== 'leave')) {
+        return {
+          ok: false,
+          error: {
+            code: 'invalid_payload',
+            message: 'grantId and mode (revoke|leave) are required',
+            recoverable: true,
+          },
+        };
+      }
+
+      const events = mode === 'revoke'
+        ? remoteRouter.revokeGrant(grantId)
+        : remoteRouter.leaveGrant(grantId);
+      for (const eventPayload of events) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          ...eventPayload,
+        });
+      }
+      return { ok: true, events };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  registry.handle(ipcMain, CH.MEDIATION_REMOTE_COMMAND, async (_event, payload) => {
+    try {
+      const authStatus = auth.getStatus() as Record<string, unknown>;
+      const context = parseGatewayAuthContext(
+        (payload && typeof payload === 'object') ? payload as Record<string, unknown> : {},
+        authStatus,
+      );
+      const command = (
+        payload
+        && typeof payload === 'object'
+        && (payload as Record<string, unknown>).command
+        && typeof (payload as Record<string, unknown>).command === 'object'
+      ) ? (payload as Record<string, unknown>).command : payload;
+
+      const handled = await remoteRouter.handleCommand(context, command);
+      for (const eventPayload of handled.events) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          ...eventPayload,
+        });
+      }
+      return handled.result as unknown as Record<string, unknown>;
+    } catch (err) {
+      return {
+        ok: false,
+        type: 'mediation.result',
+        schema_version: 1,
+        request_id: '',
+        error: {
+          code: 'session_error',
+          message: err instanceof Error ? err.message : String(err),
+          recoverable: true,
+        },
+      };
+    }
+  });
+
   registerAuthIpc(ipcMain, {
     registry: registry as any,
     auth,
@@ -861,6 +1155,65 @@ async function bootstrap(): Promise<void> {
     auth,
     gatewayClient,
     sessionManager,
+    emitToAllWindows,
+    emitStructuredLog: emitStructuredMainLog,
+    onShareGrantLinked: (grantId, caseId) => {
+      remoteRouter?.grantCaseVisibility(grantId, caseId);
+    },
+    onShareGrantRevoked: (grantId) => {
+      if (!grantId) {
+        return;
+      }
+      if (!remoteRouter) {
+        return;
+      }
+      const events = remoteRouter.revokeGrant(grantId);
+      for (const eventPayload of events) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          ...eventPayload,
+        });
+      }
+
+      const syncedCases = mediationService.markRemoteGrantStatus(grantId, 'access_revoked');
+      for (const mediationCase of syncedCases) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          type: 'case.updated',
+          action: 'mark_remote_grant_status',
+          caseId: mediationCase.id,
+          case: mediationCase,
+          grantId,
+        });
+      }
+    },
+    onShareGrantLeft: (grantId) => {
+      if (!grantId) {
+        return;
+      }
+      if (!remoteRouter) {
+        return;
+      }
+      const events = remoteRouter.leaveGrant(grantId);
+      for (const eventPayload of events) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          ...eventPayload,
+        });
+      }
+
+      const syncedCases = mediationService.markRemoteGrantStatus(grantId, 'left');
+      for (const mediationCase of syncedCases) {
+        emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+          ts: new Date().toISOString(),
+          type: 'case.updated',
+          action: 'mark_remote_grant_status',
+          caseId: mediationCase.id,
+          case: mediationCase,
+          grantId,
+        });
+      }
+    },
   });
 
   registerMediationIpc(ipcMain, {
@@ -875,6 +1228,7 @@ async function bootstrap(): Promise<void> {
         ...payload,
       });
     },
+    emitStructuredLog: emitStructuredMainLog,
   });
 
   registerRoomIpc(ipcMain, {

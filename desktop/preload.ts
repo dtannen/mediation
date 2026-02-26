@@ -7,6 +7,35 @@ interface IpcRendererLike {
   send?: (channel: string, payload?: unknown) => void;
 }
 
+type GatewayShareCreateInvitePayload = {
+  deviceId: string;
+  email: string;
+  caseId?: string;
+  grantExpiresAt?: number;
+  inviteTokenTtlSeconds?: number;
+};
+
+type GatewayShareEventType =
+  | 'share.consume.success'
+  | 'share.consume.requires-auth'
+  | 'share.consume.error'
+  | 'share.create.success'
+  | 'share.create.error'
+  | 'share.revoke.success'
+  | 'share.revoke.error'
+  | 'share.leave.success'
+  | 'share.leave.error'
+  | 'access.revoked'
+  | 'access.left';
+
+type GatewayShareEventPayload = {
+  type: GatewayShareEventType;
+  source?: string;
+  deviceId?: string | null;
+  grantId?: string | null;
+  error?: string;
+};
+
 export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, unknown> {
   return {
     auth: {
@@ -30,7 +59,17 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
         CH.GW_SEND_MESSAGE,
         { deviceId, text, ...(correlationId ? { correlationId } : {}) },
       ),
+      sendMediationCommand: (payload: {
+        deviceId: string;
+        command: Record<string, unknown>;
+        timeoutMs?: number;
+      }) => ipcRenderer.invoke(CH.GW_MEDIATION_COMMAND, payload),
       endSession: (deviceId: string) => ipcRenderer.invoke(CH.GW_END_SESSION, { deviceId }),
+      consumeShareInvite: (input: string) => ipcRenderer.invoke(CH.GW_SHARE_CONSUME, { input }),
+      createShareInvite: (payload: GatewayShareCreateInvitePayload) => ipcRenderer.invoke(CH.GW_SHARE_CREATE, payload),
+      listShareGrants: (deviceId: string) => ipcRenderer.invoke(CH.GW_SHARE_LIST_GRANTS, { deviceId }),
+      revokeShareGrant: (grantId: string) => ipcRenderer.invoke(CH.GW_SHARE_REVOKE, { grantId }),
+      leaveShareGrant: (grantId: string) => ipcRenderer.invoke(CH.GW_SHARE_LEAVE, { grantId }),
       onChatEvent: (handler: (payload: unknown) => void) => {
         if (typeof handler !== 'function') {
           return () => {};
@@ -47,11 +86,11 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
         ipcRenderer.on(CH.OUT_GATEWAY_DEVICE_EVENT, listener);
         return () => ipcRenderer.removeListener(CH.OUT_GATEWAY_DEVICE_EVENT, listener);
       },
-      onShareEvent: (handler: (payload: unknown) => void) => {
+      onShareEvent: (handler: (payload: GatewayShareEventPayload) => void) => {
         if (typeof handler !== 'function') {
           return () => {};
         }
-        const listener = (_event: unknown, payload: unknown) => handler(payload);
+        const listener = (_event: unknown, payload: unknown) => handler(payload as GatewayShareEventPayload);
         ipcRenderer.on(CH.OUT_GATEWAY_SHARE_EVENT, listener);
         return () => ipcRenderer.removeListener(CH.OUT_GATEWAY_SHARE_EVENT, listener);
       },
@@ -61,8 +100,7 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
       create: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_CREATE, payload),
       get: (caseId: string) => ipcRenderer.invoke(CH.MEDIATION_GET, { caseId }),
       list: () => ipcRenderer.invoke(CH.MEDIATION_LIST),
-      peekInvite: (payload: { caseId: string; inviteToken: string }) => ipcRenderer.invoke(CH.MEDIATION_PEEK_INVITE, payload),
-      join: (payload: { caseId: string; partyId: string; inviteToken: string }) => ipcRenderer.invoke(CH.MEDIATION_JOIN, payload),
+      join: (payload: { caseId: string; partyId: string }) => ipcRenderer.invoke(CH.MEDIATION_JOIN, payload),
       appendPrivate: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_APPEND_PRIVATE, payload),
       coachReply: (payload: { caseId: string; partyId: string; prompt: string }) => ipcRenderer.invoke(CH.MEDIATION_COACH_REPLY, payload),
       setConsent: (payload: {
@@ -83,6 +121,26 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
       rejectDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_REJECT_DRAFT, payload),
       resolve: (payload: { caseId: string; resolution: string }) => ipcRenderer.invoke(CH.MEDIATION_RESOLVE, payload),
       close: (payload: { caseId: string }) => ipcRenderer.invoke(CH.MEDIATION_CLOSE, payload),
+      remoteCommand: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_REMOTE_COMMAND, payload),
+      grantRemoteCaseAccess: (payload: { grantId: string; caseId: string }) => ipcRenderer.invoke(CH.MEDIATION_REMOTE_GRANT_CASE, payload),
+      terminateRemoteGrant: (payload: { grantId: string; mode: 'revoke' | 'leave' }) => ipcRenderer.invoke(CH.MEDIATION_REMOTE_TERMINATE_GRANT, payload),
+      syncRemoteCase: (payload: {
+        projectedCase: Record<string, unknown>;
+        ownerDeviceId: string;
+        grantId: string;
+        accessRole: 'owner' | 'collaborator';
+        localPartyId?: string;
+        remoteVersion?: number;
+        syncStatus?: string;
+      }) => ipcRenderer.invoke(CH.MEDIATION_SYNC_REMOTE_CASE, payload),
+      markRemoteGrantStatus: (payload: {
+        grantId: string;
+        status: 'access_revoked' | 'left';
+      }) => ipcRenderer.invoke(CH.MEDIATION_MARK_REMOTE_GRANT_STATUS, payload),
+      removeRemoteCase: (payload: {
+        grantId: string;
+        caseId: string;
+      }) => ipcRenderer.invoke(CH.MEDIATION_REMOVE_REMOTE_CASE, payload),
       onMediationEvent: (handler: (payload: unknown) => void) => {
         if (typeof handler !== 'function') {
           return () => {};

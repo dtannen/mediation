@@ -2,6 +2,8 @@ import { getState, patchState, resetState, upsertCase, setToast, removeToast } f
 import { escapeHtml, renderMarkdownUntrusted } from './markdown.js';
 
 const api = window.mediationDesktop;
+const SHARE_TOKEN_RE = /^[A-Za-z0-9_-]{16,512}$/;
+const SHARE_CONTEXT_STORAGE_KEY = 'mediation.share.consume_result.v1';
 
 const startScreen = document.getElementById('start-screen');
 const startButton = document.getElementById('start-btn');
@@ -53,6 +55,18 @@ function formatRelativeTime(iso) {
   return formatShortDate(iso);
 }
 
+function parseEpochSeconds(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return Math.trunc(num);
+}
+
+function formatEpochSeconds(value) {
+  const seconds = parseEpochSeconds(value);
+  if (!seconds) return '';
+  return formatRelativeTime(new Date(seconds * 1000).toISOString());
+}
+
 function getInitial(name) {
   if (!name) return '?';
   return name.charAt(0).toUpperCase();
@@ -81,6 +95,26 @@ function phasePillClass(phase) {
   return 'active';
 }
 
+function getCaseSource(caseData) {
+  const source = caseData?.syncMetadata?.source;
+  return source === 'shared_remote' ? 'shared_remote' : 'owner_local';
+}
+
+function sourceLabel(caseData) {
+  return getCaseSource(caseData) === 'shared_remote' ? 'Shared' : 'Owned';
+}
+
+function friendlySyncStatus(caseData) {
+  const status = String(caseData?.syncMetadata?.syncStatus || '').trim().toLowerCase();
+  if (!status) return getCaseSource(caseData) === 'shared_remote' ? 'Stale' : 'Live';
+  if (status === 'reconnecting') return 'Reconnecting';
+  if (status === 'access_revoked') return 'Access Revoked';
+  if (status === 'left') return 'Left';
+  if (status === 'removed') return 'Removed';
+  if (status === 'stale') return 'Stale';
+  return 'Live';
+}
+
 function normalizeError(resultOrError, fallback = 'Something went wrong') {
   if (!resultOrError) return fallback;
   if (typeof resultOrError === 'string') return resultOrError;
@@ -93,6 +127,168 @@ function normalizeError(resultOrError, fallback = 'Something went wrong') {
   }
   if (resultOrError instanceof Error) return resultOrError.message;
   return fallback;
+}
+
+const REMOTE_MUTATING_COMMANDS = new Set([
+  'case.join',
+  'case.append_private',
+  'case.set_consent',
+  'case.set_private_summary',
+  'case.set_ready',
+  'case.send_group',
+  'case.create_draft',
+  'case.append_draft',
+  'case.run_draft_suggestion',
+  'case.submit_suggestion',
+  'case.approve_draft',
+  'case.reject_draft',
+  'case.resolve',
+  'case.close',
+]);
+
+function makeRequestId(prefix = 'req') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function makeIdempotencyKey(prefix = 'idem') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 12)}`;
+}
+
+function isSharedCase(caseData) {
+  return getCaseSource(caseData) === 'shared_remote';
+}
+
+function isReadOnlySharedCase(caseData) {
+  const status = String(caseData?.syncMetadata?.syncStatus || '').trim().toLowerCase();
+  return status === 'access_revoked' || status === 'left' || status === 'removed';
+}
+
+function normalizeShareConsumeResult(input) {
+  if (!input || typeof input !== 'object') return null;
+  const grantId = typeof input.grantId === 'string' ? input.grantId.trim() : '';
+  const deviceId = typeof input.deviceId === 'string' ? input.deviceId.trim() : '';
+  if (!grantId || !deviceId) return null;
+  const status = normalizeGrantStatus(input.status || 'active');
+  return {
+    grantId,
+    deviceId,
+    role: typeof input.role === 'string' ? input.role : 'collaborator',
+    status,
+    acceptedAt: typeof input.acceptedAt === 'string' && input.acceptedAt.trim()
+      ? input.acceptedAt.trim()
+      : nowIso(),
+  };
+}
+
+function persistShareConsumeResult(input) {
+  try {
+    const normalized = normalizeShareConsumeResult(input);
+    if (!normalized) {
+      localStorage.removeItem(SHARE_CONTEXT_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(SHARE_CONTEXT_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // best effort
+  }
+}
+
+function loadPersistedShareConsumeResult() {
+  try {
+    const raw = localStorage.getItem(SHARE_CONTEXT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return normalizeShareConsumeResult(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function buildRemoteCommandEnvelope(input) {
+  const payload = input && input.payload && typeof input.payload === 'object'
+    ? { ...input.payload }
+    : {};
+  if (
+    input
+    && typeof input.command === 'string'
+    && REMOTE_MUTATING_COMMANDS.has(input.command)
+    && typeof payload.idempotency_key !== 'string'
+  ) {
+    payload.idempotency_key = makeIdempotencyKey(input.command.replace(/\./g, '_'));
+  }
+
+  return {
+    type: 'mediation.command',
+    schema_version: 1,
+    request_id: input?.requestId || makeRequestId('med'),
+    command: String(input?.command || ''),
+    ...(input?.caseId ? { case_id: String(input.caseId) } : {}),
+    ...(input?.partyId ? { party_id: String(input.partyId) } : {}),
+    payload,
+  };
+}
+
+function getRemoteContextFromCase(caseData) {
+  if (!caseData || typeof caseData !== 'object') return null;
+  const metadata = caseData.syncMetadata && typeof caseData.syncMetadata === 'object'
+    ? caseData.syncMetadata
+    : {};
+  const ownerDeviceId = typeof metadata.ownerDeviceId === 'string' ? metadata.ownerDeviceId.trim() : '';
+  const grantId = typeof metadata.grantId === 'string' ? metadata.grantId.trim() : '';
+  const localPartyId = typeof metadata.localPartyId === 'string' ? metadata.localPartyId.trim() : '';
+  if (!ownerDeviceId || !grantId) return null;
+  return { ownerDeviceId, grantId, localPartyId };
+}
+
+function getRemoteContextFromShare() {
+  const shareState = getShareState();
+  const consume = shareState.consumeResult || {};
+  const ownerDeviceId = typeof consume.deviceId === 'string' ? consume.deviceId.trim() : '';
+  const grantId = typeof consume.grantId === 'string' ? consume.grantId.trim() : '';
+  if (!ownerDeviceId || !grantId) return null;
+  return { ownerDeviceId, grantId };
+}
+
+async function syncRemoteCaseFromResult(input) {
+  if (!input || typeof input !== 'object') return null;
+  const projectedCase = input.projectedCase;
+  if (!projectedCase || typeof projectedCase !== 'object') return null;
+
+  const result = await api.mediation.syncRemoteCase({
+    projectedCase,
+    ownerDeviceId: input.ownerDeviceId,
+    grantId: input.grantId,
+    accessRole: 'collaborator',
+    localPartyId: input.localPartyId || undefined,
+    remoteVersion: input.remoteVersion,
+    syncStatus: input.syncStatus || 'live',
+  });
+  if (!result || result.ok !== true || !result.case) {
+    return null;
+  }
+  return result.case;
+}
+
+async function sendGatewayMediationCommand(ownerDeviceId, envelope, options = {}) {
+  const gatewayResult = await api.gateway.sendMediationCommand({
+    deviceId: ownerDeviceId,
+    command: envelope,
+    timeoutMs: options.timeoutMs || 60000,
+  });
+  if (!gatewayResult || gatewayResult.ok !== true) {
+    return { ok: false, error: normalizeError(gatewayResult, 'Unable to reach remote mediation host') };
+  }
+
+  const result = gatewayResult.result && typeof gatewayResult.result === 'object'
+    ? gatewayResult.result
+    : null;
+  if (!result) {
+    return { ok: false, error: 'Remote mediation host returned an invalid response' };
+  }
+  if (result.ok !== true) {
+    return { ok: false, error: normalizeError(result, 'Remote mediation command failed'), result };
+  }
+  return { ok: true, result };
 }
 
 /* ============================================================
@@ -181,56 +377,56 @@ function updateStartVisibility() {
 }
 
 /* ============================================================
-   INVITE LINK PARSING
+   SHARE LINK PARSING
    ============================================================ */
 
-function parseInviteLink(input) {
+function parseShareTokenInput(input) {
   const raw = String(input || '').trim();
   if (!raw) return null;
 
-  try {
-    const url = new URL(raw);
-    const caseId = url.searchParams.get('caseId') || '';
-    const token = url.searchParams.get('token') || '';
-    if (!caseId || !token) return null;
-    return {
-      caseId,
-      token,
-      ownerDeviceId: url.searchParams.get('ownerDeviceId') || '',
-      gatewayUrl: url.searchParams.get('gatewayUrl') || '',
-      raw,
-    };
-  } catch {
-    const tokenMatch = raw.match(/token=([^&\s]+)/i);
-    const caseMatch = raw.match(/caseId=([^&\s]+)/i);
-    if (!tokenMatch || !caseMatch) return null;
+  const parseTokenFromUrl = (urlString) => {
+    let parsed;
+    try {
+      parsed = new URL(urlString);
+    } catch {
+      return null;
+    }
 
-    const ownerMatch = raw.match(/ownerDeviceId=([^&\s]+)/i);
-    const gatewayMatch = raw.match(/gatewayUrl=([^&\s]+)/i);
+    const tokenFromQuery = parsed.searchParams.get('token');
+    if (tokenFromQuery && !parsed.searchParams.get('caseId')) {
+      return tokenFromQuery;
+    }
 
-    return {
-      caseId: decodeURIComponent(caseMatch[1]),
-      token: decodeURIComponent(tokenMatch[1]),
-      ownerDeviceId: ownerMatch ? decodeURIComponent(ownerMatch[1]) : '',
-      gatewayUrl: gatewayMatch ? decodeURIComponent(gatewayMatch[1]) : '',
-      raw,
-    };
+    const sharePrefix = '/share/';
+    if (typeof parsed.pathname === 'string' && parsed.pathname.startsWith(sharePrefix)) {
+      const tokenPart = parsed.pathname.slice(sharePrefix.length).split('/')[0];
+      if (tokenPart) return tokenPart;
+    }
+
+    if (parsed.protocol === 'commands-desktop:' && parsed.hostname === 'share' && parsed.pathname.length > 1) {
+      return parsed.pathname.slice(1).split('/')[0] || null;
+    }
+
+    return null;
+  };
+
+  const token = String(parseTokenFromUrl(raw) || raw).trim();
+  if (!SHARE_TOKEN_RE.test(token)) {
+    return null;
   }
+
+  return { token, raw };
 }
 
-function enrichInviteLink(baseLink) {
-  const ownDeviceId = getOwnDeviceId();
-  const state = getState();
-  const gatewayUrl = state.auth && typeof state.auth.gatewayUrl === 'string' ? state.auth.gatewayUrl : '';
-
+function extractLaunchLinkInput() {
   try {
-    const url = new URL(baseLink);
-    if (ownDeviceId) url.searchParams.set('ownerDeviceId', ownDeviceId);
-    if (gatewayUrl) url.searchParams.set('gatewayUrl', gatewayUrl);
-    return url.toString();
+    const url = new URL(window.location.href);
+    const shareParsed = parseShareTokenInput(url.toString());
+    if (shareParsed) return shareParsed.raw;
   } catch {
-    return baseLink;
+    // ignore malformed launch url
   }
+  return '';
 }
 
 /* ============================================================
@@ -246,6 +442,14 @@ function getPartyState(caseData, partyId) {
 function choosePartyForCase(caseData) {
   const state = getState();
   if (!caseData || !caseData.id || !Array.isArray(caseData.parties) || caseData.parties.length === 0) return '';
+
+  const localPartyId = typeof caseData?.syncMetadata?.localPartyId === 'string'
+    ? caseData.syncMetadata.localPartyId.trim()
+    : '';
+  if (localPartyId && caseData.parties.some((party) => party.id === localPartyId)) {
+    state.partyByCase[caseData.id] = localPartyId;
+    return localPartyId;
+  }
 
   const selected = state.partyByCase[caseData.id];
   if (selected && caseData.parties.some((party) => party.id === selected)) return selected;
@@ -350,6 +554,11 @@ async function startFlow() {
     state.startMessage = '';
     showToast('Welcome back!', 'success');
     await refreshCases();
+    if (state.pendingInvite && state.pendingInvite.type === 'share' && state.pendingInvite.input) {
+      const pendingInput = String(state.pendingInvite.input);
+      state.pendingInvite = null;
+      await consumeShareInviteLink(pendingInput, { silent: true });
+    }
     render();
   } catch (err) {
     state.startMessage = normalizeError(err, 'Unable to connect. Please try again.');
@@ -367,6 +576,7 @@ async function signOutFlow() {
     return;
   }
 
+  persistShareConsumeResult(null);
   resetState();
   patchState({ startBusy: false, startMessage: '' });
   await refreshAuthStatus({ silent: true });
@@ -385,7 +595,11 @@ async function refreshCases() {
   }
 
   const state = getState();
-  state.cases = Array.isArray(result.cases) ? result.cases.slice() : [];
+  const incoming = Array.isArray(result.cases) ? result.cases.slice() : [];
+  state.cases = incoming.filter((entry) => {
+    const status = String(entry?.syncMetadata?.syncStatus || '').trim().toLowerCase();
+    return status !== 'left' && status !== 'removed';
+  });
   state.cases.sort((a, b) => {
     const at = new Date(a.updatedAt || a.createdAt || 0).getTime();
     const bt = new Date(b.updatedAt || b.createdAt || 0).getTime();
@@ -403,6 +617,70 @@ async function refreshCases() {
       state.activeSubview = null;
     }
   }
+
+  hydrateShareContextFromCases(state.cases);
+}
+
+function deriveShareContextFromCases(cases) {
+  if (!Array.isArray(cases)) return null;
+  const sharedLive = cases
+    .filter((entry) => getCaseSource(entry) === 'shared_remote' && !isReadOnlySharedCase(entry))
+    .filter((entry) => {
+      const metadata = entry?.syncMetadata;
+      return metadata && typeof metadata.ownerDeviceId === 'string' && typeof metadata.grantId === 'string';
+    })
+    .sort((a, b) => {
+      const at = Date.parse(a?.syncMetadata?.syncUpdatedAt || a?.updatedAt || a?.createdAt || '');
+      const bt = Date.parse(b?.syncMetadata?.syncUpdatedAt || b?.updatedAt || b?.createdAt || '');
+      return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+    });
+  const first = sharedLive[0];
+  if (!first) return null;
+  return normalizeShareConsumeResult({
+    grantId: first.syncMetadata.grantId,
+    deviceId: first.syncMetadata.ownerDeviceId,
+    role: 'collaborator',
+    status: 'active',
+    acceptedAt: first.syncMetadata.syncUpdatedAt || first.updatedAt || first.createdAt || nowIso(),
+  });
+}
+
+function hydrateShareContextFromCases(cases) {
+  const shareState = getShareState();
+  if (shareState.consumeResult) {
+    return;
+  }
+  const derived = deriveShareContextFromCases(cases);
+  if (!derived) {
+    return;
+  }
+  shareState.consumeResult = derived;
+  persistShareConsumeResult(derived);
+}
+
+function hydrateShareContextFromStorage() {
+  const shareState = getShareState();
+  if (shareState.consumeResult) {
+    return;
+  }
+  const persisted = loadPersistedShareConsumeResult();
+  if (persisted) {
+    shareState.consumeResult = persisted;
+  }
+}
+
+async function refreshGatewayDevices(options = {}) {
+  const result = await api.gateway.fetchDevices();
+  if (!result || result.ok !== true) {
+    if (!options.silent) {
+      showToast(normalizeError(result, 'Unable to refresh shared devices'), 'error');
+    }
+    return;
+  }
+
+  const shareState = getShareState();
+  shareState.devices = Array.isArray(result.devices) ? result.devices : [];
+  shareState.devicesLoadedAt = nowIso();
 }
 
 async function loadCase(caseId, options = {}) {
@@ -413,6 +691,28 @@ async function loadCase(caseId, options = {}) {
   }
 
   setCaseData(result.case);
+  if (isSharedCase(result.case) && !isReadOnlySharedCase(result.case)) {
+    const context = getRemoteContextFromCase(result.case);
+    if (context) {
+      const fetched = await getRemoteCaseSnapshot(context, result.case.id);
+      if (fetched.ok && fetched.result.case && typeof fetched.result.case === 'object') {
+        const syncedCase = await syncRemoteCaseFromResult({
+          projectedCase: fetched.result.case,
+          ownerDeviceId: context.ownerDeviceId,
+          grantId: context.grantId,
+          localPartyId: context.localPartyId || undefined,
+          remoteVersion: Number.isFinite(fetched.result.remote_version) ? Number(fetched.result.remote_version) : undefined,
+          syncStatus: 'live',
+        });
+        if (syncedCase) {
+          setCaseData(syncedCase);
+          if (syncedCase.syncMetadata?.localPartyId) {
+            getState().partyByCase[syncedCase.id] = syncedCase.syncMetadata.localPartyId;
+          }
+        }
+      }
+    }
+  }
 
   const state = getState();
   if (options.activeSubview !== undefined) {
@@ -420,7 +720,202 @@ async function loadCase(caseId, options = {}) {
   }
 
   render();
+  const ownDeviceId = getOwnDeviceId();
+  const isOwnerLocalCase = getCaseSource(state.caseData) === 'owner_local';
+  const shareState = getShareState();
+  if (
+    ownDeviceId
+    && !shareState.grantsLoadingByDevice[ownDeviceId]
+    && !shareState.grantsByDevice[ownDeviceId]
+  ) {
+    void refreshShareGrants(ownDeviceId, { silent: true });
+  }
   return result.case;
+}
+
+function getShareState() {
+  const state = getState();
+  if (!state.share || typeof state.share !== 'object') {
+    state.share = {
+      consumeInput: '',
+      consumeResult: null,
+      devices: [],
+      devicesLoadedAt: null,
+      grantsByDevice: {},
+      grantsLoadingByDevice: {},
+      mutatingGrantIds: {},
+      lastCreatedInviteByDevice: {},
+      discoveredCasesByGrant: {},
+      discoveringCasesByGrant: {},
+      joiningCaseKeys: {},
+    };
+    return state.share;
+  }
+  state.share.devices = Array.isArray(state.share.devices) ? state.share.devices : [];
+  state.share.devicesLoadedAt = typeof state.share.devicesLoadedAt === 'string' ? state.share.devicesLoadedAt : null;
+  state.share.discoveredCasesByGrant = state.share.discoveredCasesByGrant || {};
+  state.share.discoveringCasesByGrant = state.share.discoveringCasesByGrant || {};
+  state.share.joiningCaseKeys = state.share.joiningCaseKeys || {};
+  return state.share;
+}
+
+async function listRemoteCasesForShare(shareContext) {
+  if (!shareContext) {
+    return { ok: false, error: 'No active shared device selected' };
+  }
+  const envelope = buildRemoteCommandEnvelope({
+    command: 'case.list',
+    payload: {},
+  });
+  return sendGatewayMediationCommand(shareContext.ownerDeviceId, envelope);
+}
+
+async function getRemoteCaseSnapshot(context, caseId) {
+  const envelope = buildRemoteCommandEnvelope({
+    command: 'case.get',
+    caseId,
+    payload: {},
+  });
+  return sendGatewayMediationCommand(context.ownerDeviceId, envelope);
+}
+
+async function sendRemoteCaseCommand(input) {
+  const context = input?.context || getRemoteContextFromCase(input?.caseData) || getRemoteContextFromShare();
+  if (!context) {
+    return { ok: false, error: 'Remote case context is unavailable' };
+  }
+
+  const envelope = buildRemoteCommandEnvelope({
+    command: input.command,
+    caseId: input.caseId,
+    partyId: input.partyId,
+    payload: input.payload || {},
+  });
+
+  const commandResult = await sendGatewayMediationCommand(context.ownerDeviceId, envelope);
+  if (!commandResult.ok) {
+    return commandResult;
+  }
+
+  const result = commandResult.result;
+  let syncedCase = null;
+  if (result.case && typeof result.case === 'object') {
+    syncedCase = await syncRemoteCaseFromResult({
+      projectedCase: result.case,
+      ownerDeviceId: context.ownerDeviceId,
+      grantId: context.grantId,
+      localPartyId: input.localPartyId || context.localPartyId || '',
+      remoteVersion: Number.isFinite(result.remote_version) ? Number(result.remote_version) : undefined,
+      syncStatus: 'live',
+    });
+  }
+
+  return {
+    ok: true,
+    result,
+    case: syncedCase,
+    context,
+  };
+}
+
+async function discoverSharedCases(options = {}) {
+  const shareContext = getRemoteContextFromShare();
+  const shareState = getShareState();
+  if (!shareContext) {
+    if (!options.silent) {
+      showToast('Accept a share link first.', 'error');
+    }
+    return;
+  }
+
+  shareState.discoveringCasesByGrant[shareContext.grantId] = true;
+  if (!options.silent) render();
+
+  try {
+    const listed = await listRemoteCasesForShare(shareContext);
+    if (!listed.ok) {
+      if (!options.silent) {
+        showToast(normalizeError(listed, 'Unable to discover remote cases'), 'error');
+      }
+      return;
+    }
+
+    const cases = Array.isArray(listed.result.cases) ? listed.result.cases : [];
+    shareState.discoveredCasesByGrant[shareContext.grantId] = cases;
+
+    for (const entry of cases) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const caseId = typeof entry.case_id === 'string' ? entry.case_id.trim() : '';
+      const role = typeof entry.role === 'string' ? entry.role.trim() : '';
+      if (!caseId || role !== 'joined') {
+        continue;
+      }
+
+      const fetched = await getRemoteCaseSnapshot(shareContext, caseId);
+      if (!fetched.ok) {
+        continue;
+      }
+      const syncedCase = await syncRemoteCaseFromResult({
+        projectedCase: fetched.result.case,
+        ownerDeviceId: shareContext.ownerDeviceId,
+        grantId: shareContext.grantId,
+        remoteVersion: Number.isFinite(fetched.result.remote_version) ? Number(fetched.result.remote_version) : undefined,
+      });
+      if (syncedCase) {
+        ensureCaseInList(syncedCase);
+        if (syncedCase.syncMetadata?.localPartyId) {
+          getState().partyByCase[syncedCase.id] = syncedCase.syncMetadata.localPartyId;
+        }
+      }
+    }
+  } finally {
+    shareState.discoveringCasesByGrant[shareContext.grantId] = false;
+    render();
+  }
+}
+
+function normalizeGrantStatus(value) {
+  const status = String(value || '').trim().toLowerCase();
+  if (!status) return 'unknown';
+  return status;
+}
+
+function isRevocableGrantStatus(status) {
+  return status === 'pending' || status === 'active' || status === 'suspended';
+}
+
+function extractInviteUrl(result) {
+  if (!result || typeof result !== 'object') return '';
+  if (typeof result.inviteUrl === 'string' && result.inviteUrl.trim()) return result.inviteUrl.trim();
+  if (typeof result.invite_url === 'string' && result.invite_url.trim()) return result.invite_url.trim();
+  if (typeof result.url === 'string' && result.url.trim()) return result.url.trim();
+  return '';
+}
+
+function normalizeGrantRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const grantId = typeof row.grantId === 'string' && row.grantId.trim()
+    ? row.grantId.trim()
+    : '';
+  if (!grantId) return null;
+
+  return {
+    grantId,
+    granteeEmail: typeof row.granteeEmail === 'string' ? row.granteeEmail.trim() : '',
+    granteeUid: typeof row.granteeUid === 'string' ? row.granteeUid.trim() : '',
+    role: typeof row.role === 'string' ? row.role.trim() : '',
+    status: normalizeGrantStatus(row.status),
+    grantExpiresAt: parseEpochSeconds(row.grantExpiresAt),
+    acceptedAt: parseEpochSeconds(row.acceptedAt),
+    createdAt: parseEpochSeconds(row.createdAt),
+  };
+}
+
+function formatGrantTime(seconds) {
+  if (!seconds) return 'never';
+  return formatEpochSeconds(seconds) || 'just now';
 }
 
 /* ============================================================
@@ -429,6 +924,11 @@ async function loadCase(caseId, options = {}) {
 
 function caseStatusLine(caseData, partyId) {
   if (!caseData) return '';
+
+  const syncStatus = String(caseData?.syncMetadata?.syncStatus || '').trim().toLowerCase();
+  if (syncStatus === 'access_revoked') return 'Access revoked';
+  if (syncStatus === 'left') return 'You left this shared case';
+  if (syncStatus === 'removed') return 'Case removed';
 
   if (caseData.phase === 'group_chat') return 'Mediation in progress';
   if (caseData.phase === 'resolved') return 'Successfully resolved';
@@ -501,6 +1001,7 @@ function renderCaseCard(caseData) {
   const currentPartyId = state.partyByCase[caseData.id]
     || (caseData.parties[0] ? caseData.parties[0].id : '');
   const status = caseStatusLine(caseData, currentPartyId);
+  const source = sourceLabel(caseData);
 
   const avatars = caseData.parties.map((party) => {
     const cls = getAvatarClass(party.id);
@@ -514,7 +1015,10 @@ function renderCaseCard(caseData) {
     <button class="case-card ${phaseClass}" data-action="open-case" data-case-id="${escapeHtml(caseData.id)}">
       <div class="case-head">
         <p class="case-topic">${escapeHtml(caseData.topic)}</p>
-        <span class="phase-pill ${phasePillClass(caseData.phase)}">${escapeHtml(friendlyPhase(caseData.phase))}</span>
+        <div class="row" style="gap: 8px;">
+          <span class="source-pill">${escapeHtml(source)}</span>
+          <span class="phase-pill ${phasePillClass(caseData.phase)}">${escapeHtml(friendlyPhase(caseData.phase))}</span>
+        </div>
       </div>
       <div class="status-line">${escapeHtml(status)}</div>
       <div class="case-card-footer">
@@ -531,10 +1035,24 @@ function renderCaseCard(caseData) {
 
 function renderDashboardView() {
   const state = getState();
+  const shareState = getShareState();
+  const consumeResult = shareState.consumeResult;
   const auth = state.auth || {};
   const email = auth.email || '';
   const userInitial = email ? email.charAt(0).toUpperCase() : 'U';
   const isOnline = isRuntimeReady(auth);
+  const consumeMutating = consumeResult && consumeResult.grantId
+    ? shareState.mutatingGrantIds[String(consumeResult.grantId)] === true
+    : false;
+  const consumeGrantId = consumeResult && typeof consumeResult.grantId === 'string'
+    ? consumeResult.grantId
+    : '';
+  const discoveredCases = consumeGrantId && Array.isArray(shareState.discoveredCasesByGrant[consumeGrantId])
+    ? shareState.discoveredCasesByGrant[consumeGrantId]
+    : [];
+  const discoveringCases = consumeGrantId
+    ? shareState.discoveringCasesByGrant[consumeGrantId] === true
+    : false;
 
   const createForm = state.createFormExpanded
     ? `
@@ -571,12 +1089,12 @@ function renderDashboardView() {
 
   const joinForm = state.joinFormExpanded
     ? `
-      <form class="panel stack" data-submit-action="preview-invite">
-        <h3 class="section-title">Join a Mediation</h3>
-        <p class="muted small">Paste the invite link you received.</p>
+      <form class="panel stack" data-submit-action="preview-or-consume-link">
+        <h3 class="section-title">Join from Invite Link</h3>
+        <p class="muted small">Paste the gateway share link you received.</p>
         <label class="stack">
-          <span class="small muted">Invite link</span>
-          <input name="inviteLink" value="${escapeHtml(state.joinLinkInput || '')}" placeholder="Paste your invite link here..." required />
+          <span class="small muted">Link</span>
+          <input name="inviteLink" value="${escapeHtml(state.joinLinkInput || '')}" placeholder="Paste the link you received..." required />
         </label>
         <div class="view-actions">
           <button type="submit" class="primary">Continue</button>
@@ -586,24 +1104,90 @@ function renderDashboardView() {
     `
     : '';
 
-  const preview = state.joinPreview
+  const consumedShare = consumeResult && typeof consumeResult === 'object'
     ? `
-      <div class="join-preview panel">
-        <h4 style="margin: 0 0 8px; font-size: var(--text-base);">You've been invited</h4>
-        <div class="muted small">Topic: <strong style="color: var(--ink);">${escapeHtml(state.joinPreview.topic || '(unknown)')}</strong></div>
-        <label class="stack" style="margin-top: 8px;">
-          <span class="small muted">Join as</span>
-          <select name="joinParty" id="join-party-select">
-            ${(state.joinPreview.parties || []).map((party) => {
-              const disabled = party.state === 'ready' ? 'disabled' : '';
-              const selected = state.joinPartyId === party.id ? 'selected' : '';
-              return `<option value="${escapeHtml(party.id)}" ${disabled} ${selected}>${escapeHtml(party.displayName)}${party.state === 'ready' ? ' (already joined)' : ''}</option>`;
-            }).join('')}
-          </select>
-        </label>
-        <div class="view-actions" style="margin-top: 8px;">
-          <button type="button" class="primary" data-action="join-preview">Join Mediation</button>
+      <div class="panel stack">
+        <h3 class="section-title">Gateway Share Accepted</h3>
+        <div class="small muted">Owner device: <code>${escapeHtml(String(consumeResult.deviceId || 'unknown'))}</code></div>
+        <div class="small muted">Grant: <code>${escapeHtml(String(consumeResult.grantId || 'unknown'))}</code></div>
+        <div class="view-actions">
+          <button
+            type="button"
+            class="ghost"
+            data-action="discover-shared-cases"
+            ${discoveringCases ? 'disabled' : ''}
+          >
+            ${discoveringCases ? 'Discovering...' : 'Discover Cases'}
+          </button>
+          ${consumeResult.grantId ? `
+            <button
+              type="button"
+              class="ghost"
+              data-action="leave-share-grant"
+              data-grant-id="${escapeHtml(String(consumeResult.grantId))}"
+              ${consumeMutating ? 'disabled' : ''}
+            >
+              ${consumeMutating ? 'Leaving...' : 'Leave Share'}
+            </button>
+          ` : ''}
+          <button type="button" class="ghost" data-action="clear-share-consume">Clear</button>
         </div>
+        ${discoveredCases.length > 0 ? `
+          <div class="grant-list">
+            ${discoveredCases.map((entry) => {
+              if (!entry || typeof entry !== 'object') return '';
+              const caseId = typeof entry.case_id === 'string' ? entry.case_id.trim() : '';
+              if (!caseId) return '';
+              const title = typeof entry.title === 'string' ? entry.title : caseId;
+              const role = typeof entry.role === 'string' ? entry.role : 'available';
+              const partyRows = Array.isArray(entry.parties) ? entry.parties : [];
+              const joinButtons = role === 'joined'
+                ? `
+                  <button
+                    type="button"
+                    class="ghost"
+                    data-action="open-remote-case"
+                    data-case-id="${escapeHtml(caseId)}"
+                  >
+                    Open
+                  </button>
+                `
+                : partyRows.map((party) => {
+                  if (!party || typeof party !== 'object') return '';
+                  const partyId = typeof party.party_id === 'string' ? party.party_id.trim() : '';
+                  const joined = party.joined === true;
+                  if (!partyId || joined) return '';
+                  const joinKey = `${caseId}:${partyId}`;
+                  const joining = shareState.joiningCaseKeys[joinKey] === true;
+                  const label = typeof party.label === 'string' ? party.label : partyId;
+                  return `
+                    <button
+                      type="button"
+                      class="ghost"
+                      data-action="join-remote-case"
+                      data-case-id="${escapeHtml(caseId)}"
+                      data-party-id="${escapeHtml(partyId)}"
+                      ${joining ? 'disabled' : ''}
+                    >
+                      ${joining ? 'Joining...' : `Join ${escapeHtml(label)}`}
+                    </button>
+                  `;
+                }).join('');
+
+              return `
+                <div class="grant-row">
+                  <div class="grant-main">
+                    <div class="grant-email">${escapeHtml(title)}</div>
+                    <div class="small muted">Phase: ${escapeHtml(String(entry.phase || 'unknown'))} · Role: ${escapeHtml(role)}</div>
+                  </div>
+                  <div class="row" style="gap: 6px;">
+                    ${joinButtons || '<span class="small muted">No open slots</span>'}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        ` : ''}
       </div>
     `
     : '';
@@ -613,7 +1197,7 @@ function renderDashboardView() {
     : `
       <div class="empty-state">
         <div class="empty-title">No mediations yet</div>
-        <div class="empty-desc">Start a new mediation or join one from an invite link to get going.</div>
+        <div class="empty-desc">Start a new mediation or accept a share link to get going.</div>
       </div>
     `;
 
@@ -639,15 +1223,15 @@ function renderDashboardView() {
             <div class="action-desc">Start a guided mediation session</div>
           </div>
           <div class="action-card secondary" data-action="toggle-join-form">
-            <div class="action-title">Join from Invite</div>
-            <div class="action-desc">Have an invite link? Join here</div>
+            <div class="action-title">Join from Invite Link</div>
+            <div class="action-desc">Accept a gateway device share link</div>
           </div>
         </div>
       </section>
 
       ${createForm}
       ${joinForm}
-      ${preview}
+      ${consumedShare}
 
       <section class="panel">
         <h3 class="section-title">Your Mediations</h3>
@@ -670,9 +1254,94 @@ function renderCaseDetailView() {
   const currentPartyId = current ? current.partyId : '';
   const thread = current ? getPrivateThread(caseData, currentPartyId) : { messages: [], summary: '', resolved: false };
   const ownState = current ? getPartyState(caseData, currentPartyId) : 'invited';
+  const readOnlyShared = isReadOnlySharedCase(caseData);
   const everyoneReady = caseData.parties.every((party) => getPartyState(caseData, party.id) === 'ready');
-  const anyoneInvited = caseData.parties.some((party) => getPartyState(caseData, party.id) === 'invited');
-  const inviteLink = enrichInviteLink(caseData.inviteLink?.url || '');
+  const ownDeviceId = getOwnDeviceId();
+  const shareState = getShareState();
+  const deviceGrantCache = ownDeviceId ? (shareState.grantsByDevice[ownDeviceId] || null) : null;
+  const grants = deviceGrantCache && Array.isArray(deviceGrantCache.grants) ? deviceGrantCache.grants : [];
+  const grantsLoading = Boolean(ownDeviceId && shareState.grantsLoadingByDevice[ownDeviceId] === true);
+  const lastGatewayInvite = ownDeviceId ? shareState.lastCreatedInviteByDevice[ownDeviceId] : null;
+
+  const gatewayInviteSection = ownDeviceId && isOwnerLocalCase
+    ? `
+      <section class="panel stack">
+        <h3 class="section-title">Invite by Email (Gateway Share)</h3>
+        <p class="muted small">Create a secure share link for this device and send it to a collaborator.</p>
+        <form class="stack" data-submit-action="create-share-invite">
+          <label class="stack">
+            <span class="small muted">Invitee email</span>
+            <input type="email" name="shareEmail" placeholder="name@example.com" required />
+          </label>
+          <div class="grid-2">
+            <label class="stack">
+              <span class="small muted">Grant expires (days, optional)</span>
+              <input type="number" min="1" max="365" name="grantDays" placeholder="30" />
+            </label>
+            <label class="stack">
+              <span class="small muted">Invite token TTL (minutes)</span>
+              <input type="number" min="5" max="10080" name="inviteTtlMinutes" placeholder="1440" />
+            </label>
+          </div>
+          <div class="view-actions">
+            <button type="submit" class="primary">Create Invite Link</button>
+          </div>
+        </form>
+        ${lastGatewayInvite && lastGatewayInvite.inviteUrl ? `
+          <div class="invite-card">
+            <div class="invite-link-display">${escapeHtml(String(lastGatewayInvite.inviteUrl || ''))}</div>
+            <div class="small muted">Grant: ${escapeHtml(String(lastGatewayInvite.grantId || 'unknown'))} - Expires: ${escapeHtml(formatGrantTime(lastGatewayInvite.inviteTokenExpiresAt))}</div>
+            <div class="view-actions" style="margin-top: 8px;">
+              <button type="button" class="ghost" data-action="copy-share-invite" data-link="${escapeHtml(String(lastGatewayInvite.inviteUrl || ''))}">Copy Share Link</button>
+            </div>
+          </div>
+        ` : ''}
+      </section>
+    `
+    : '';
+
+  const grantsSection = ownDeviceId && isOwnerLocalCase
+    ? `
+      <section class="panel stack">
+        <div class="row" style="justify-content: space-between; align-items: center;">
+          <h3 class="section-title" style="margin: 0;">View Grants</h3>
+          <button type="button" class="ghost" data-action="refresh-share-grants" data-device-id="${escapeHtml(ownDeviceId)}" ${grantsLoading ? 'disabled' : ''}>
+            ${grantsLoading ? 'Refreshing...' : 'Refresh'}
+          </button>
+        </div>
+        ${grants.length > 0 ? `
+          <div class="grant-list">
+            ${grants.map((grant) => {
+              const status = normalizeGrantStatus(grant.status);
+              const mutating = shareState.mutatingGrantIds[grant.grantId] === true;
+              return `
+                <div class="grant-row">
+                  <div class="grant-main">
+                    <div class="grant-email">${escapeHtml(grant.granteeEmail || grant.granteeUid || 'unknown')}</div>
+                    <div class="small muted">Status: ${escapeHtml(status)} - Created ${escapeHtml(formatGrantTime(grant.createdAt))}</div>
+                  </div>
+                  ${isRevocableGrantStatus(status) ? `
+                    <button
+                      type="button"
+                      class="ghost"
+                      data-action="revoke-share-grant"
+                      data-grant-id="${escapeHtml(grant.grantId)}"
+                      data-device-id="${escapeHtml(ownDeviceId)}"
+                      ${mutating ? 'disabled' : ''}
+                    >
+                      ${mutating ? 'Revoking...' : 'Revoke'}
+                    </button>
+                  ` : '<span class="small muted">No action</span>'}
+                </div>
+              `;
+            }).join('')}
+          </div>
+        ` : `
+          <div class="small muted">No gateway share grants yet for this device.</div>
+        `}
+      </section>
+    `
+    : '';
 
   // Progress stepper
   const steps = [
@@ -707,6 +1376,9 @@ function renderCaseDetailView() {
     ? '<div class="waiting-panel">You\'re all set. Waiting for the other party to finish preparing.</div>'
     : '';
 
+  const source = sourceLabel(caseData);
+  const syncStatus = friendlySyncStatus(caseData);
+
   const groupCta = everyoneReady
     ? `
       <section class="cta-section">
@@ -728,6 +1400,7 @@ function renderCaseDetailView() {
           <div>
             <h2>${escapeHtml(caseData.topic)}</h2>
             <div class="meta">${escapeHtml(caseData.description || '')}</div>
+            <div class="small muted">Source: ${escapeHtml(source)} · Sync: ${escapeHtml(syncStatus)}</div>
           </div>
         </div>
         <span class="phase-pill ${phasePillClass(caseData.phase)}">${escapeHtml(friendlyPhase(caseData.phase))}</span>
@@ -745,26 +1418,18 @@ function renderCaseDetailView() {
       <section class="cta-section">
         <div class="cta-heading">${escapeHtml(intakeHeading)}</div>
         <div class="cta-desc">${escapeHtml(intakeDesc)}</div>
-        <button class="cta" data-action="open-intake">${escapeHtml(intakeHeading)}</button>
+        ${readOnlyShared
+          ? '<div class="small muted">This shared case is read-only.</div>'
+          : `<button class="cta" data-action="open-intake">${escapeHtml(intakeHeading)}</button>`}
       </section>
 
       ${waitingText}
 
       ${groupCta}
 
-      ${anyoneInvited ? `
-        <section class="panel stack">
-          <h3 class="section-title">Invite the Other Party</h3>
-          <p class="muted small">Share this link so the other party can join.</p>
-          <div class="invite-card">
-            <div class="invite-link-display">${escapeHtml(inviteLink)}</div>
-            <div class="view-actions">
-              <button class="primary" data-action="copy-invite">Copy Link</button>
-              <button class="ghost" data-action="open-share-modal">Share</button>
-            </div>
-          </div>
-        </section>
-      ` : ''}
+      ${gatewayInviteSection}
+
+      ${grantsSection}
     </div>
   `;
 }
@@ -1239,23 +1904,6 @@ function renderModal() {
     return;
   }
 
-  if (state.modal.type === 'share-invite') {
-    modalRoot.innerHTML = `
-      <div class="modal-backdrop">
-        <div class="modal stack">
-          <h3 class="section-title">Share Invite Link</h3>
-          <p class="muted small">Send this link to the other party so they can join the mediation.</p>
-          <div class="invite-box">${escapeHtml(state.modal.link || '')}</div>
-          <div class="view-actions">
-            <button class="primary" data-action="copy-modal-invite">Copy Link</button>
-            <button class="ghost" data-action="close-modal">Done</button>
-          </div>
-        </div>
-      </div>
-    `;
-    return;
-  }
-
   if (state.modal.type === 'resolve-case') {
     modalRoot.innerHTML = `
       <div class="modal-backdrop">
@@ -1321,77 +1969,6 @@ async function copyToClipboard(text) {
 }
 
 /* ============================================================
-   GATEWAY CORRELATION
-   ============================================================ */
-
-function extractCorrelationId(payload) {
-  if (!payload || typeof payload !== 'object') return '';
-
-  if (typeof payload.correlationId === 'string' && payload.correlationId.trim()) return payload.correlationId.trim();
-  if (typeof payload.correlation_id === 'string' && payload.correlation_id.trim()) return payload.correlation_id.trim();
-
-  const nested = payload.payload;
-  if (nested && typeof nested === 'object') {
-    if (typeof nested.correlationId === 'string' && nested.correlationId.trim()) return nested.correlationId.trim();
-    if (typeof nested.correlation_id === 'string' && nested.correlation_id.trim()) return nested.correlation_id.trim();
-    if (nested.message && typeof nested.message === 'object') {
-      if (typeof nested.message.correlationId === 'string' && nested.message.correlationId.trim()) return nested.message.correlationId.trim();
-      if (typeof nested.message.correlation_id === 'string' && nested.message.correlation_id.trim()) return nested.message.correlation_id.trim();
-    }
-  }
-  return '';
-}
-
-function waitForGatewayReply(deviceId, correlationId, timeoutMs = 30_000) {
-  const state = getState();
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      state.waitingGatewayReplies.delete(correlationId);
-      reject(new Error('The other device did not respond.'));
-    }, timeoutMs);
-
-    state.waitingGatewayReplies.set(correlationId, {
-      deviceId,
-      resolve: (payload) => {
-        clearTimeout(timeoutId);
-        resolve(payload);
-      },
-    });
-  });
-}
-
-async function notifyOwnerDeviceJoin(parsedInvite, partyId) {
-  if (!parsedInvite || !parsedInvite.ownerDeviceId) return;
-
-  const ownerDeviceId = String(parsedInvite.ownerDeviceId || '').trim();
-  if (!ownerDeviceId) return;
-  if (ownerDeviceId === getOwnDeviceId()) return;
-
-  const message = [
-    'MEDIATION_JOIN_REQUEST',
-    `case_id: ${parsedInvite.caseId}`,
-    `invite_token: ${parsedInvite.token}`,
-    `party_id: ${partyId}`,
-    `joined_at: ${nowIso()}`,
-    'Reply with case details and current phase.',
-  ].join('\n');
-
-  const correlationId = `join_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  const sendResult = await api.gateway.sendMessage(ownerDeviceId, message, correlationId);
-  if (!sendResult || sendResult.ok !== true) {
-    showToast(normalizeError(sendResult, 'Unable to notify the other device'), 'error');
-    return;
-  }
-
-  try {
-    await waitForGatewayReply(ownerDeviceId, correlationId, 30_000);
-    showToast('Connected successfully.', 'success');
-  } catch (err) {
-    showToast('Joined, but the other device hasn\'t responded yet.', 'info');
-  }
-}
-
-/* ============================================================
    ACTION HANDLERS
    ============================================================ */
 
@@ -1426,7 +2003,6 @@ async function handleCreateCase(form) {
   const joinResult = await api.mediation.join({
     caseId: createdCase.id,
     partyId: 'party_a',
-    inviteToken: createdCase.inviteLink.token,
   });
 
   if (!joinResult || joinResult.ok !== true) {
@@ -1440,87 +2016,244 @@ async function handleCreateCase(form) {
   state.createFormExpanded = false;
   state.activeSubview = 'private-intake';
 
-  const inviteLink = enrichInviteLink(createdCase.inviteLink.url || '');
-  state.modal = { type: 'share-invite', link: inviteLink };
-
   await refreshCases();
   render();
 }
 
-async function previewInvite(linkValue) {
-  const state = getState();
-  state.joinLinkInput = linkValue;
+function parseOptionalNumber(input, min, max) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  const rounded = Math.trunc(value);
+  if (rounded < min || rounded > max) return null;
+  return rounded;
+}
 
-  const parsed = parseInviteLink(linkValue);
+async function refreshShareGrants(deviceId, options = {}) {
+  const id = String(deviceId || '').trim();
+  if (!id) return;
+
+  const shareState = getShareState();
+  shareState.grantsLoadingByDevice[id] = true;
+  if (!options.silent) render();
+
+  try {
+    const result = await api.gateway.listShareGrants(id);
+    if (!result || result.ok !== true) {
+      if (!options.silent) {
+        showToast(normalizeError(result, 'Unable to load grants'), 'error');
+      }
+      return;
+    }
+
+    const grants = Array.isArray(result.grants)
+      ? result.grants.map((row) => normalizeGrantRow(row)).filter(Boolean)
+      : [];
+    shareState.grantsByDevice[id] = {
+      grants,
+      loadedAt: nowIso(),
+    };
+  } finally {
+    shareState.grantsLoadingByDevice[id] = false;
+    render();
+  }
+}
+
+async function consumeShareInviteLink(linkValue, options = {}) {
+  const state = getState();
+  const parsed = parseShareTokenInput(linkValue);
   if (!parsed) {
-    state.joinPreview = null;
-    state.joinPartyId = '';
-    showToast('That doesn\'t look like a valid invite link.', 'error');
-    render();
+    showToast('That does not look like a valid share link.', 'error');
     return;
   }
 
-  const result = await api.mediation.peekInvite({
-    caseId: parsed.caseId,
-    inviteToken: parsed.token,
-  });
+  const shareState = getShareState();
+  shareState.consumeInput = parsed.raw;
 
+  const result = await api.gateway.consumeShareInvite(parsed.raw);
   if (!result || result.ok !== true) {
-    state.joinPreview = null;
-    state.joinPartyId = '';
-    showToast(normalizeError(result, 'Unable to find this mediation'), 'error');
+    if (result && result.requiresAuth) {
+      state.pendingInvite = { type: 'share', input: parsed.raw };
+      if (!options.silent) {
+        showToast('Sign in required to accept this share link.', 'info');
+      }
+      render();
+      return;
+    }
+
+    showToast(normalizeError(result, 'Unable to accept share link'), 'error');
     render();
     return;
   }
 
-  const preview = result.preview || {};
-  state.joinPreview = { ...preview, parsedInvite: parsed };
+  shareState.consumeResult = {
+    grantId: typeof result.grantId === 'string' ? result.grantId : '',
+    deviceId: typeof result.deviceId === 'string' ? result.deviceId : '',
+    role: typeof result.role === 'string' ? result.role : '',
+    status: normalizeGrantStatus(result.status || 'active'),
+    acceptedAt: nowIso(),
+  };
+  persistShareConsumeResult(shareState.consumeResult);
+  state.pendingInvite = null;
+  state.joinFormExpanded = false;
 
-  const available = Array.isArray(preview.availablePartyIds) ? preview.availablePartyIds : [];
-  state.joinPartyId = available[0]
-    || (Array.isArray(preview.parties) && preview.parties[0] ? preview.parties[0].id : '');
-
+  showToast('Share access granted.', 'success');
+  await discoverSharedCases({ silent: true });
   render();
 }
 
-async function joinFromPreview() {
+async function createShareInvite(form) {
   const state = getState();
-  const preview = state.joinPreview;
-  if (!preview) {
-    showToast('Please preview the invite first.', 'error');
+  const ownDeviceId = getOwnDeviceId();
+  if (!ownDeviceId) {
+    showToast('No mediation device is available for sharing yet.', 'error');
     return;
   }
 
-  const partyId = state.joinPartyId || '';
-  if (!partyId) {
-    showToast('Please select which party to join as.', 'error');
+  const email = String(form.shareEmail?.value || '').trim();
+  if (!email) {
+    showToast('Invitee email is required.', 'error');
     return;
   }
 
-  const parsed = preview.parsedInvite;
-  const joinResult = await api.mediation.join({
-    caseId: preview.caseId,
-    partyId,
-    inviteToken: parsed.token,
-  });
+  const grantDays = parseOptionalNumber(form.grantDays?.value, 1, 365);
+  const inviteTtlMinutes = parseOptionalNumber(form.inviteTtlMinutes?.value, 5, 10080);
 
-  if (!joinResult || joinResult.ok !== true) {
-    showToast(normalizeError(joinResult, 'Unable to join'), 'error');
+  const payload = {
+    deviceId: ownDeviceId,
+    email,
+  };
+  const activeCaseId = state.caseData && typeof state.caseData.id === 'string'
+    ? state.caseData.id.trim()
+    : '';
+  if (activeCaseId) {
+    payload.caseId = activeCaseId;
+  }
+  if (grantDays !== null) {
+    payload.grantExpiresAt = Math.trunc(Date.now() / 1000) + (grantDays * 24 * 60 * 60);
+  }
+  if (inviteTtlMinutes !== null) {
+    payload.inviteTokenTtlSeconds = inviteTtlMinutes * 60;
+  }
+
+  const result = await api.gateway.createShareInvite(payload);
+  if (!result || result.ok !== true) {
+    showToast(normalizeError(result, 'Unable to create share link'), 'error');
     return;
   }
 
-  state.partyByCase[preview.caseId] = partyId;
-  state.joinFormExpanded = false;
-  state.joinPreview = null;
-  state.joinPartyId = '';
-  state.joinLinkInput = '';
-  state.caseId = preview.caseId;
-  state.caseData = joinResult.case;
-  state.activeSubview = 'private-intake';
+  const shareState = getShareState();
+  shareState.lastCreatedInviteByDevice[ownDeviceId] = {
+    inviteUrl: extractInviteUrl(result),
+    grantId: typeof result.grantId === 'string' ? result.grantId : '',
+    status: normalizeGrantStatus(result.status || 'pending'),
+    inviteTokenExpiresAt: parseEpochSeconds(result.inviteTokenExpiresAt),
+    grantExpiresAt: parseEpochSeconds(result.grantExpiresAt),
+  };
 
-  await notifyOwnerDeviceJoin(parsed, partyId);
-  await refreshCases();
+  showToast('Share link created.', 'success');
+  await refreshShareGrants(ownDeviceId, { silent: true });
+}
+
+async function revokeShareGrant(grantId, deviceId) {
+  const id = String(grantId || '').trim();
+  if (!id) return;
+
+  const shareState = getShareState();
+  shareState.mutatingGrantIds[id] = true;
   render();
+
+  try {
+    const result = await api.gateway.revokeShareGrant(id);
+    if (!result || result.ok !== true) {
+      showToast(normalizeError(result, 'Unable to revoke grant'), 'error');
+      return;
+    }
+    showToast('Grant revoked.', 'success');
+    await refreshShareGrants(deviceId || getOwnDeviceId(), { silent: true });
+  } finally {
+    delete shareState.mutatingGrantIds[id];
+    render();
+  }
+}
+
+async function leaveShareGrant(grantId) {
+  const id = String(grantId || '').trim();
+  if (!id) return;
+
+  const shareState = getShareState();
+  shareState.mutatingGrantIds[id] = true;
+  render();
+
+  try {
+    const result = await api.gateway.leaveShareGrant(id);
+    if (!result || result.ok !== true) {
+      showToast(normalizeError(result, 'Unable to leave share'), 'error');
+      return;
+    }
+    if (shareState.consumeResult && shareState.consumeResult.grantId === id) {
+      shareState.consumeResult = null;
+    }
+    showToast('Left shared access.', 'success');
+  } finally {
+    delete shareState.mutatingGrantIds[id];
+    render();
+  }
+}
+
+async function joinRemoteCase(caseId, partyId) {
+  const normalizedCaseId = String(caseId || '').trim();
+  const normalizedPartyId = String(partyId || '').trim();
+  if (!normalizedCaseId || !normalizedPartyId) {
+    return;
+  }
+
+  const shareContext = getRemoteContextFromShare();
+  if (!shareContext) {
+    showToast('Accept a share link first.', 'error');
+    return;
+  }
+
+  const joinKey = `${normalizedCaseId}:${normalizedPartyId}`;
+  const shareState = getShareState();
+  shareState.joiningCaseKeys[joinKey] = true;
+  render();
+
+  try {
+    const joined = await sendRemoteCaseCommand({
+      context: shareContext,
+      command: 'case.join',
+      caseId: normalizedCaseId,
+      partyId: normalizedPartyId,
+      payload: {},
+      localPartyId: normalizedPartyId,
+    });
+    if (!joined.ok) {
+      showToast(normalizeError(joined, 'Unable to join remote case'), 'error');
+      return;
+    }
+
+    if (joined.case) {
+      const state = getState();
+      ensureCaseInList(joined.case);
+      state.partyByCase[joined.case.id] = normalizedPartyId;
+      setCaseData(joined.case);
+      state.activeSubview = 'private-intake';
+      showToast('Joined remote case.', 'success');
+      await refreshCases();
+      return;
+    }
+
+    showToast('Joined, but case sync is pending. Refresh to continue.', 'info');
+  } finally {
+    delete shareState.joiningCaseKeys[joinKey];
+    render();
+  }
+}
+
+async function previewOrConsumeLink(linkValue) {
+  await consumeShareInviteLink(linkValue);
 }
 
 async function sendPrivateMessage(form) {
@@ -1534,6 +2267,51 @@ async function sendPrivateMessage(form) {
 
   const partyId = current.partyId;
   const draftKey = `private:${caseData.id}:${partyId}`;
+
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.append_private',
+      caseId: caseData.id,
+      partyId,
+      payload: {
+        message: {
+          role: 'user',
+          content: message,
+        },
+      },
+      localPartyId: partyId,
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to send message'), 'error');
+      return;
+    }
+
+    const localEcho = await api.mediation.appendPrivate({
+      caseId: caseData.id,
+      partyId,
+      authorType: 'party',
+      text: message,
+      tags: ['remote_private_local'],
+    });
+
+    if (localEcho && localEcho.ok === true && localEcho.case) {
+      patchState({ caseData: localEcho.case });
+      ensureCaseInList(localEcho.case);
+    } else if (remote.case) {
+      patchState({ caseData: remote.case });
+      ensureCaseInList(remote.case);
+    }
+
+    state.chatDrafts.set(draftKey, '');
+    render();
+    return;
+  }
 
   const appendResult = await api.mediation.appendPrivate({
     caseId: caseData.id,
@@ -1574,6 +2352,11 @@ async function runIntakeTemplate() {
   const current = caseData ? getCurrentParty(caseData) : null;
   if (!caseData || !current) return;
 
+  if (isSharedCase(caseData)) {
+    showToast('Summary template is owner-side only for shared cases.', 'info');
+    return;
+  }
+
   const result = await api.mediation.runIntakeTemplate({
     caseId: caseData.id,
     partyId: current.partyId,
@@ -1611,6 +2394,72 @@ async function saveSummaryAndReady() {
 
   const consentShareEl = document.getElementById('consent-share-summary');
   const consentQuoteEl = document.getElementById('consent-direct-quote');
+
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    const consentRemote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.set_consent',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: {
+        consent: {
+          allowSummaryShare: Boolean(consentShareEl && consentShareEl.checked),
+          allowDirectQuote: Boolean(consentQuoteEl && consentQuoteEl.checked),
+          allowedTags: ['summary'],
+        },
+      },
+      localPartyId: current.partyId,
+    });
+    if (!consentRemote.ok) {
+      showToast(normalizeError(consentRemote, 'Unable to save preferences'), 'error');
+      return;
+    }
+
+    const summaryRemote = await sendRemoteCaseCommand({
+      caseData: consentRemote.case || caseData,
+      command: 'case.set_private_summary',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: { summary },
+      localPartyId: current.partyId,
+    });
+    if (!summaryRemote.ok) {
+      showToast(normalizeError(summaryRemote, 'Unable to save summary'), 'error');
+      return;
+    }
+
+    const readyRemote = await sendRemoteCaseCommand({
+      caseData: summaryRemote.case || caseData,
+      command: 'case.set_ready',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: { ready: true },
+      localPartyId: current.partyId,
+    });
+    if (!readyRemote.ok) {
+      showToast(normalizeError(readyRemote, 'Unable to mark as ready'), 'error');
+      return;
+    }
+
+    const updatedCase = readyRemote.case || summaryRemote.case || consentRemote.case;
+    if (updatedCase) {
+      patchState({ caseData: updatedCase });
+      ensureCaseInList(updatedCase);
+      if (updatedCase.phase === 'group_chat') {
+        state.activeSubview = 'group-chat';
+        showToast('Both parties are ready. Starting mediation.', 'success');
+      } else {
+        showToast('You\'re marked as ready!', 'success');
+      }
+      render();
+    }
+    return;
+  }
 
   const setConsentResult = await api.mediation.setConsent({
     caseId: caseData.id,
@@ -1665,6 +2514,40 @@ async function sendGroupMessage(form) {
   const text = String(form.groupMessage.value || '').trim();
   if (!text) return;
 
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.send_group',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: {
+        message: {
+          role: 'user',
+          content: text,
+        },
+      },
+      localPartyId: current.partyId,
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to send message'), 'error');
+      return;
+    }
+
+    const draftKey = `group:${caseData.id}:${current.partyId}`;
+    state.chatDrafts.set(draftKey, '');
+    if (remote.case) {
+      patchState({ caseData: remote.case });
+      ensureCaseInList(remote.case);
+    }
+    render();
+    return;
+  }
+
   const result = await api.mediation.sendDirect({
     caseId: caseData.id,
     partyId: current.partyId,
@@ -1694,6 +2577,70 @@ async function sendDraftMessage(form) {
   const draftKey = `draft:${caseData.id}:${current.partyId}`;
   let draft = findActiveDraft(caseData, current.partyId);
   let latestCase = caseData;
+
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    if (!draft) {
+      const created = await sendRemoteCaseCommand({
+        caseData,
+        command: 'case.create_draft',
+        caseId: caseData.id,
+        partyId: current.partyId,
+        payload: { content: text },
+        localPartyId: current.partyId,
+      });
+      if (!created.ok) {
+        showToast(normalizeError(created, 'Unable to start draft'), 'error');
+        return;
+      }
+      latestCase = created.case || caseData;
+      draft = findActiveDraft(latestCase, current.partyId);
+    } else {
+      const appended = await sendRemoteCaseCommand({
+        caseData,
+        command: 'case.append_draft',
+        caseId: caseData.id,
+        partyId: current.partyId,
+        payload: {
+          draft_id: draft.id,
+          content: text,
+        },
+        localPartyId: current.partyId,
+      });
+      if (!appended.ok) {
+        showToast(normalizeError(appended, 'Unable to send draft message'), 'error');
+        return;
+      }
+      latestCase = appended.case || caseData;
+    }
+
+    state.chatDrafts.set(draftKey, '');
+    patchState({ caseData: latestCase });
+    ensureCaseInList(latestCase);
+
+    const activeDraft = findActiveDraft(latestCase, current.partyId);
+    if (activeDraft) {
+      const suggested = await sendRemoteCaseCommand({
+        caseData: latestCase,
+        command: 'case.run_draft_suggestion',
+        caseId: caseData.id,
+        partyId: current.partyId,
+        payload: { draft_id: activeDraft.id },
+        localPartyId: current.partyId,
+      });
+      if (suggested.ok && suggested.case) {
+        patchState({ caseData: suggested.case });
+        ensureCaseInList(suggested.case);
+      }
+    }
+
+    render();
+    return;
+  }
 
   if (!draft) {
     const createResult = await api.mediation.createDraft({
@@ -1758,6 +2705,32 @@ async function runDraftSuggestion() {
     return;
   }
 
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.run_draft_suggestion',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: { draft_id: draft.id },
+      localPartyId: current.partyId,
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to generate suggestion'), 'error');
+      return;
+    }
+    if (remote.case) {
+      patchState({ caseData: remote.case });
+      ensureCaseInList(remote.case);
+      render();
+    }
+    return;
+  }
+
   const result = await api.mediation.runDraftSuggestion({
     caseId: caseData.id,
     draftId: draft.id,
@@ -1786,6 +2759,38 @@ async function approveDraft() {
 
   const approvedTextInput = document.getElementById('draft-approved-text');
   const approvedText = approvedTextInput ? String(approvedTextInput.value || '').trim() : '';
+
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.approve_draft',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: {
+        draft_id: draft.id,
+        ...(approvedText ? { approved_text: approvedText } : { use_suggestion: true }),
+      },
+      localPartyId: current.partyId,
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to send draft'), 'error');
+      return;
+    }
+    if (remote.case) {
+      patchState({ caseData: remote.case });
+      ensureCaseInList(remote.case);
+    }
+    state.coachPanelOpen = false;
+    delete state.activeDraftByCase[caseData.id];
+    showToast('Message sent to the group.', 'success');
+    render();
+    return;
+  }
 
   const result = await api.mediation.approveDraft({
     caseId: caseData.id,
@@ -1818,6 +2823,37 @@ async function rejectDraft() {
     return;
   }
 
+  if (isSharedCase(caseData)) {
+    if (isReadOnlySharedCase(caseData)) {
+      showToast('This shared case is read-only.', 'error');
+      return;
+    }
+
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.reject_draft',
+      caseId: caseData.id,
+      partyId: current.partyId,
+      payload: {
+        draft_id: draft.id,
+        reason: 'continue_drafting',
+      },
+      localPartyId: current.partyId,
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to discard draft'), 'error');
+      return;
+    }
+    if (remote.case) {
+      patchState({ caseData: remote.case });
+      ensureCaseInList(remote.case);
+    }
+    delete state.activeDraftByCase[caseData.id];
+    showToast('Draft discarded. You can start a new one.', 'info');
+    render();
+    return;
+  }
+
   const result = await api.mediation.rejectDraft({
     caseId: caseData.id,
     draftId: draft.id,
@@ -1847,6 +2883,35 @@ async function resolveCaseFromModal(form) {
     return;
   }
 
+  if (isSharedCase(caseData)) {
+    const current = getCurrentParty(caseData);
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.resolve',
+      caseId: caseData.id,
+      partyId: current ? current.partyId : '',
+      payload: {
+        resolution_text: resolution,
+      },
+      localPartyId: current ? current.partyId : '',
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to resolve'), 'error');
+      return;
+    }
+
+    if (remote.case) {
+      patchState({
+        caseData: remote.case,
+        modal: null,
+        activeSubview: null,
+      });
+      ensureCaseInList(remote.case);
+      render();
+    }
+    return;
+  }
+
   const result = await api.mediation.resolve({ caseId: caseData.id, resolution });
   if (!result || result.ok !== true) {
     showToast(normalizeError(result, 'Unable to resolve'), 'error');
@@ -1866,6 +2931,29 @@ async function closeCurrentCase() {
   const state = getState();
   const caseData = state.caseData;
   if (!caseData) return;
+
+  if (isSharedCase(caseData)) {
+    const current = getCurrentParty(caseData);
+    const remote = await sendRemoteCaseCommand({
+      caseData,
+      command: 'case.close',
+      caseId: caseData.id,
+      partyId: current ? current.partyId : '',
+      payload: {},
+      localPartyId: current ? current.partyId : '',
+    });
+    if (!remote.ok) {
+      showToast(normalizeError(remote, 'Unable to close'), 'error');
+      return;
+    }
+    if (remote.case) {
+      patchState({ caseData: remote.case, activeSubview: null });
+      ensureCaseInList(remote.case);
+      showToast('Case closed.', 'success');
+      render();
+    }
+    return;
+  }
 
   const result = await api.mediation.close({ caseId: caseData.id });
   if (!result || result.ok !== true) {
@@ -1920,10 +3008,6 @@ function handleInput(event) {
     const key = target.getAttribute('data-draft-key');
     if (key) getState().chatDrafts.set(key, target.value);
   }
-
-  if (target.id === 'join-party-select') {
-    getState().joinPartyId = target.value;
-  }
 }
 
 async function handleSubmit(event) {
@@ -1934,7 +3018,8 @@ async function handleSubmit(event) {
 
   const action = form.dataset.submitAction;
   if (action === 'create-case') { await handleCreateCase(form); return; }
-  if (action === 'preview-invite') { await previewInvite(String(form.inviteLink.value || '')); return; }
+  if (action === 'preview-or-consume-link') { await previewOrConsumeLink(String(form.inviteLink.value || '')); return; }
+  if (action === 'create-share-invite') { await createShareInvite(form); return; }
   if (action === 'send-private-message') { await sendPrivateMessage(form); return; }
   if (action === 'send-group-message') { await sendGroupMessage(form); return; }
   if (action === 'send-draft-message') { await sendDraftMessage(form); return; }
@@ -1957,8 +3042,6 @@ async function handleClick(event) {
   if (action === 'toggle-join-form') {
     state.joinFormExpanded = !state.joinFormExpanded;
     if (!state.joinFormExpanded) {
-      state.joinPreview = null;
-      state.joinPartyId = '';
       state.joinLinkInput = '';
     }
     render();
@@ -2005,28 +3088,77 @@ async function handleClick(event) {
     return;
   }
 
-  if (action === 'copy-invite') {
-    const caseData = state.caseData;
-    if (caseData?.inviteLink?.url) await copyToClipboard(enrichInviteLink(caseData.inviteLink.url));
-    return;
-  }
-
-  if (action === 'open-share-modal') {
-    const caseData = state.caseData;
-    if (caseData?.inviteLink?.url) {
-      state.modal = { type: 'share-invite', link: enrichInviteLink(caseData.inviteLink.url) };
-      render();
+  if (action === 'copy-share-invite') {
+    const link = target.getAttribute('data-link') || '';
+    if (link) {
+      await copyToClipboard(link);
     }
     return;
   }
 
   if (action === 'close-modal') { state.modal = null; render(); return; }
-  if (action === 'copy-modal-invite') {
-    if (state.modal && state.modal.link) await copyToClipboard(state.modal.link);
+
+  if (action === 'refresh-share-grants') {
+    const deviceId = target.getAttribute('data-device-id') || getOwnDeviceId();
+    await refreshShareGrants(deviceId);
     return;
   }
 
-  if (action === 'join-preview') { await joinFromPreview(); return; }
+  if (action === 'revoke-share-grant') {
+    const grantId = target.getAttribute('data-grant-id') || '';
+    const deviceId = target.getAttribute('data-device-id') || getOwnDeviceId();
+    await revokeShareGrant(grantId, deviceId);
+    return;
+  }
+
+  if (action === 'leave-share-grant') {
+    const grantId = target.getAttribute('data-grant-id') || '';
+    await leaveShareGrant(grantId);
+    return;
+  }
+
+  if (action === 'clear-share-consume') {
+    getShareState().consumeResult = null;
+    render();
+    return;
+  }
+
+  if (action === 'discover-shared-cases') {
+    await discoverSharedCases();
+    return;
+  }
+
+  if (action === 'join-remote-case') {
+    const caseId = target.getAttribute('data-case-id') || '';
+    const partyId = target.getAttribute('data-party-id') || '';
+    await joinRemoteCase(caseId, partyId);
+    return;
+  }
+
+  if (action === 'open-remote-case') {
+    const caseId = target.getAttribute('data-case-id') || '';
+    if (caseId) {
+      const existing = getState().cases.find((entry) => entry.id === caseId);
+      if (!existing) {
+        const context = getRemoteContextFromShare();
+        if (context) {
+          const fetched = await getRemoteCaseSnapshot(context, caseId);
+          if (fetched.ok && fetched.result.case && typeof fetched.result.case === 'object') {
+            await syncRemoteCaseFromResult({
+              projectedCase: fetched.result.case,
+              ownerDeviceId: context.ownerDeviceId,
+              grantId: context.grantId,
+              remoteVersion: Number.isFinite(fetched.result.remote_version) ? Number(fetched.result.remote_version) : undefined,
+            });
+            await refreshCases();
+          }
+        }
+      }
+      await loadCase(caseId, { activeSubview: null });
+    }
+    return;
+  }
+
   if (action === 'run-intake-template') { await runIntakeTemplate(); return; }
 
   if (action === 'open-intake-summary') {
@@ -2068,11 +3200,32 @@ function onAuthChanged(payload) {
   updateStartVisibility();
 
   if (isRuntimeReady(payload)) {
-    void refreshCases().then(() => {
+    void refreshCases().then(async () => {
+      hydrateShareContextFromStorage();
+      await refreshGatewayDevices({ silent: true });
+
       if (state.caseId) {
         const found = state.cases.find((entry) => entry.id === state.caseId);
         if (found) state.caseData = found;
       }
+
+      if (state.pendingInvite && state.pendingInvite.type === 'share' && state.pendingInvite.input) {
+        const pendingInput = String(state.pendingInvite.input);
+        state.pendingInvite = null;
+        await consumeShareInviteLink(pendingInput, { silent: true });
+      }
+
+      const shareState = getShareState();
+      const consumeStatus = normalizeGrantStatus(shareState.consumeResult?.status || 'active');
+      if (
+        shareState.consumeResult
+        && consumeStatus === 'active'
+        && shareState.consumeResult.deviceId
+        && shareState.consumeResult.grantId
+      ) {
+        await discoverSharedCases({ silent: true });
+      }
+
       render();
     });
   } else {
@@ -2083,7 +3236,38 @@ function onAuthChanged(payload) {
 function onMediationEvent(payload) {
   if (!payload || typeof payload !== 'object') return;
 
-  if (payload.type === 'case.updated' && payload.case && typeof payload.case === 'object') {
+  if (
+    (payload.type === 'case.updated')
+    || (payload.type === 'mediation.event' && payload.event === 'case.updated')
+  ) {
+    if (!payload.case || typeof payload.case !== 'object') {
+      return;
+    }
+    if (!payload.case.id && payload.case.case_id) {
+      const currentCase = getState().caseData;
+      const context = getRemoteContextFromCase(currentCase) || getRemoteContextFromShare();
+      if (context) {
+        void syncRemoteCaseFromResult({
+          projectedCase: payload.case,
+          ownerDeviceId: context.ownerDeviceId,
+          grantId: context.grantId,
+          localPartyId: context.localPartyId || '',
+          remoteVersion: Number.isFinite(payload.remote_version) ? Number(payload.remote_version) : undefined,
+          syncStatus: 'live',
+        }).then((syncedCase) => {
+          if (!syncedCase) {
+            return;
+          }
+          ensureCaseInList(syncedCase);
+          const state = getState();
+          if (state.caseId === syncedCase.id) {
+            state.caseData = syncedCase;
+          }
+          render();
+        }).catch(() => undefined);
+      }
+      return;
+    }
     const state = getState();
     const mediationCase = payload.case;
     ensureCaseInList(mediationCase);
@@ -2096,6 +3280,27 @@ function onMediationEvent(payload) {
     return;
   }
 
+  if (payload.type === 'mediation.event' && payload.event === 'party.disconnected') {
+    showToast('A participant disconnected from this shared case.', 'info', 5000);
+    return;
+  }
+
+  if (payload.type === 'mediation.event' && payload.event === 'case.removed') {
+    const caseId = typeof payload.case_id === 'string' ? payload.case_id.trim() : '';
+    if (caseId) {
+      const state = getState();
+      state.cases = state.cases.filter((entry) => entry.id !== caseId);
+      if (state.caseId === caseId) {
+        state.caseId = null;
+        state.caseData = null;
+        state.activeSubview = null;
+      }
+    }
+    showToast('This shared case is no longer available.', 'info', 5000);
+    render();
+    return;
+  }
+
   if (payload.type === 'log' && payload.message) {
     const text = String(payload.message || '');
     if (text.includes('runtime start failed')) {
@@ -2104,18 +3309,97 @@ function onMediationEvent(payload) {
   }
 }
 
-function onGatewayChat(payload) {
-  const correlationId = extractCorrelationId(payload);
-  if (!correlationId) return;
+function onGatewayShareEvent(payload) {
+  if (!payload || typeof payload !== 'object') return;
 
-  const state = getState();
-  const pending = state.waitingGatewayReplies.get(correlationId);
-  if (!pending) return;
+  const type = typeof payload.type === 'string' ? payload.type : '';
+  const shareState = getShareState();
 
-  if (pending.deviceId && payload && payload.deviceId && payload.deviceId !== pending.deviceId) return;
+  if (type === 'share.consume.success') {
+    const grantId = typeof payload.grantId === 'string' ? payload.grantId : '';
+    const deviceId = typeof payload.deviceId === 'string' ? payload.deviceId : '';
+    shareState.consumeResult = {
+      grantId,
+      deviceId,
+      role: 'collaborator',
+      status: 'active',
+      acceptedAt: nowIso(),
+    };
+    persistShareConsumeResult(shareState.consumeResult);
+    void discoverSharedCases({ silent: true });
+    render();
+    return;
+  }
 
-  state.waitingGatewayReplies.delete(correlationId);
-  pending.resolve(payload);
+  if (type === 'share.consume.requires-auth') {
+    const pending = String(shareState.consumeInput || '').trim();
+    if (pending) {
+      getState().pendingInvite = { type: 'share', input: pending };
+    }
+    render();
+    return;
+  }
+
+  if (type === 'share.revoke.success' || type === 'share.leave.success') {
+    const grantId = typeof payload.grantId === 'string' ? payload.grantId : '';
+    if (grantId && shareState.consumeResult && shareState.consumeResult.grantId === grantId) {
+      shareState.consumeResult = null;
+      persistShareConsumeResult(null);
+      render();
+    }
+    if (grantId) {
+      const status = type === 'share.leave.success' ? 'left' : 'access_revoked';
+      void api.mediation.markRemoteGrantStatus({ grantId, status })
+        .then(() => refreshCases())
+        .catch(() => undefined);
+    }
+    return;
+  }
+
+  if (type === 'share.create.success') {
+    const deviceId = typeof payload.deviceId === 'string' ? payload.deviceId : '';
+    if (deviceId) {
+      void refreshShareGrants(deviceId, { silent: true });
+    }
+    return;
+  }
+
+  if (type === 'access.revoked') {
+    const grantId = typeof payload.grantId === 'string' ? payload.grantId : '';
+    if (shareState.consumeResult && (!grantId || shareState.consumeResult.grantId === grantId)) {
+      shareState.consumeResult = {
+        ...shareState.consumeResult,
+        status: 'revoked',
+      };
+      persistShareConsumeResult(shareState.consumeResult);
+    }
+    showToast('Access revoked by owner.', 'error', 6000);
+    if (grantId) {
+      void api.mediation.markRemoteGrantStatus({ grantId, status: 'access_revoked' })
+        .then(() => refreshCases())
+        .catch(() => undefined);
+    }
+    render();
+    return;
+  }
+
+  if (type === 'access.left') {
+    const grantId = typeof payload.grantId === 'string' ? payload.grantId : '';
+    if (shareState.consumeResult && (!grantId || shareState.consumeResult.grantId === grantId)) {
+      shareState.consumeResult = {
+        ...shareState.consumeResult,
+        status: 'left',
+      };
+      persistShareConsumeResult(shareState.consumeResult);
+    }
+    showToast('You left this shared device.', 'info', 5000);
+    if (grantId) {
+      void api.mediation.markRemoteGrantStatus({ grantId, status: 'left' })
+        .then(() => refreshCases())
+        .catch(() => undefined);
+    }
+    render();
+  }
 }
 
 /* ============================================================
@@ -2133,31 +3417,39 @@ async function bootstrap() {
 
   api.auth.onAuthChanged((payload) => { onAuthChanged(payload); });
   api.mediation.onMediationEvent((payload) => { onMediationEvent(payload); });
-  api.gateway.onChatEvent((payload) => { onGatewayChat(payload); });
+  api.gateway.onShareEvent((payload) => { onGatewayShareEvent(payload); });
 
   patchState({ startMessage: '' });
 
-  try {
-    const params = new URLSearchParams(window.location.search);
-    const caseId = params.get('caseId') || '';
-    const token = params.get('token') || '';
-    if (caseId && token) {
-      const baseHref = String(window.location.href || '').split('?')[0];
-      const inviteUrl = `${baseHref}?caseId=${encodeURIComponent(caseId)}&token=${encodeURIComponent(token)}`;
-      patchState({
-        joinFormExpanded: true,
-        joinLinkInput: inviteUrl,
-      });
-      void previewInvite(inviteUrl);
-    }
-  } catch {
-    // ignore invalid launch params
+  const launchLinkInput = extractLaunchLinkInput();
+  if (launchLinkInput) {
+    patchState({
+      joinFormExpanded: true,
+      joinLinkInput: launchLinkInput,
+    });
   }
 
   await refreshAuthStatus({ silent: true });
 
   if (isRuntimeReady(getState().auth)) {
+    hydrateShareContextFromStorage();
     await refreshCases();
+    await refreshGatewayDevices({ silent: true });
+
+    const shareState = getShareState();
+    const consumeStatus = normalizeGrantStatus(shareState.consumeResult?.status || 'active');
+    if (
+      shareState.consumeResult
+      && consumeStatus === 'active'
+      && shareState.consumeResult.deviceId
+      && shareState.consumeResult.grantId
+    ) {
+      await discoverSharedCases({ silent: true });
+    }
+  }
+
+  if (launchLinkInput) {
+    await previewOrConsumeLink(launchLinkInput);
   }
 
   updateStartVisibility();

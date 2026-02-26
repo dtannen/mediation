@@ -39,9 +39,9 @@ function createServiceAndCase(options: {
   return { service, mediationCase };
 }
 
-function joinBoth(service: MediationService, caseId: string, token: string): void {
-  service.joinWithInvite(caseId, 'party_a', token);
-  service.joinWithInvite(caseId, 'party_b', token);
+function joinBoth(service: MediationService, caseId: string): void {
+  service.joinParty(caseId, 'party_a');
+  service.joinParty(caseId, 'party_b');
 }
 
 function readyBoth(service: MediationService, caseId: string): void {
@@ -54,15 +54,15 @@ function readyBoth(service: MediationService, caseId: string): void {
 export async function runDomainTests(): Promise<{ passed: number; failed: number }> {
   return runCases('domain', [
     {
-      name: 'invite token join accepts valid token and rejects invalid token',
+      name: 'join requires a valid party id',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        service.joinWithInvite(mediationCase.id, 'party_a', mediationCase.inviteLink.token);
+        service.joinParty(mediationCase.id, 'party_a');
 
         assert.throws(
-          () => service.joinWithInvite(mediationCase.id, 'party_b', 'bad_token'),
+          () => service.joinParty(mediationCase.id, 'party_missing'),
           (err: unknown) => {
-            assertDomainErrorCode(err, 'invalid_invite_token');
+            assertDomainErrorCode(err, 'party_not_found');
             return true;
           },
         );
@@ -72,7 +72,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
       name: 'private visibility isolation keeps party transcripts separate',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
 
         service.appendPrivateMessage({
           caseId: mediationCase.id,
@@ -91,7 +91,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
       name: 'all-ready gate blocks group chat until both summaries are resolved',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
 
         service.setPrivateSummary(mediationCase.id, 'party_a', 'A summary');
         service.setPartyReady(mediationCase.id, 'party_a');
@@ -111,7 +111,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
       name: 'joined party can complete intake while case is awaiting_join',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        service.joinWithInvite(mediationCase.id, 'party_a', mediationCase.inviteLink.token);
+        service.joinParty(mediationCase.id, 'party_a');
         assert.equal(service.getCase(mediationCase.id).phase, 'awaiting_join');
 
         service.appendPrivateMessage({
@@ -128,7 +128,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
         assert.equal(afterFirstReady.phase, 'awaiting_join');
         assert.equal(afterFirstReady.partyParticipationById.party_a.state, 'ready');
 
-        service.joinWithInvite(mediationCase.id, 'party_b', mediationCase.inviteLink.token);
+        service.joinParty(mediationCase.id, 'party_b');
         assert.equal(service.getCase(mediationCase.id).phase, 'private_intake');
 
         service.setPrivateSummary(mediationCase.id, 'party_b', 'Party B summary', true);
@@ -145,7 +145,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
           },
         });
 
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
         readyBoth(service, mediationCase.id);
 
         const current = service.getCase(mediationCase.id);
@@ -161,7 +161,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
       name: 'coach draft workflow supports iteration reset then approve and reject',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
         readyBoth(service, mediationCase.id);
 
         const draft = service.createCoachDraft(mediationCase.id, 'party_a', 'Initial intent');
@@ -194,7 +194,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
       name: 'direct send posts deliveryMode direct and rejects empty text',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
         readyBoth(service, mediationCase.id);
 
         service.sendDirectGroupMessage(mediationCase.id, 'party_a', 'Hello', ['direct']);
@@ -228,7 +228,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
       name: 'resolve and close move through terminal phases',
       run: () => {
         const { service, mediationCase } = createServiceAndCase();
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
         readyBoth(service, mediationCase.id);
 
         service.resolveCase(mediationCase.id, 'Resolved text');
@@ -259,7 +259,7 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
           },
         );
 
-        joinBoth(service, mediationCase.id, mediationCase.inviteLink.token);
+        joinBoth(service, mediationCase.id);
         readyBoth(service, mediationCase.id);
 
         assert.throws(

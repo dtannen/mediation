@@ -15,12 +15,35 @@ interface StoredCasesPayload {
   updatedAt: string;
 }
 
+const REMOTE_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 function isMediationCase(value: unknown): value is MediationCase {
   if (!value || typeof value !== 'object') {
     return false;
   }
   const record = value as Record<string, unknown>;
   return typeof record.id === 'string' && record.id.trim().length > 0;
+}
+
+function shouldPersistCase(mediationCase: MediationCase, nowMs: number): boolean {
+  const metadata = mediationCase.syncMetadata;
+  if (!metadata || metadata.source !== 'shared_remote') {
+    return true;
+  }
+
+  const status = String(metadata.syncStatus || '').trim().toLowerCase();
+  if (status === 'removed') {
+    return false;
+  }
+  if (status !== 'access_revoked' && status !== 'left') {
+    return true;
+  }
+
+  const updatedAtMs = Date.parse(metadata.syncUpdatedAt || mediationCase.updatedAt || '');
+  if (!Number.isFinite(updatedAtMs)) {
+    return true;
+  }
+  return updatedAtMs >= (nowMs - REMOTE_TOMBSTONE_RETENTION_MS);
 }
 
 export class FileBackedMediationStore extends InMemoryMediationStore {
@@ -39,6 +62,11 @@ export class FileBackedMediationStore extends InMemoryMediationStore {
     this.flushToDisk();
   }
 
+  override delete(caseId: string): void {
+    super.delete(caseId);
+    this.flushToDisk();
+  }
+
   private loadFromDisk(): void {
     if (!existsSync(this.storagePath)) {
       return;
@@ -48,8 +76,9 @@ export class FileBackedMediationStore extends InMemoryMediationStore {
       const raw = readFileSync(this.storagePath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<StoredCasesPayload>;
       const cases = Array.isArray(parsed.cases) ? parsed.cases : [];
+      const nowMs = Date.now();
       for (const mediationCase of cases) {
-        if (isMediationCase(mediationCase)) {
+        if (isMediationCase(mediationCase) && shouldPersistCase(mediationCase, nowMs)) {
           super.save(mediationCase);
         }
       }
@@ -61,9 +90,11 @@ export class FileBackedMediationStore extends InMemoryMediationStore {
   private flushToDisk(): void {
     try {
       mkdirSync(path.dirname(this.storagePath), { recursive: true });
+      const nowMs = Date.now();
+      const cases = super.list().filter((entry) => shouldPersistCase(entry, nowMs));
       const payload: StoredCasesPayload = {
         version: 1,
-        cases: super.list(),
+        cases,
         updatedAt: new Date().toISOString(),
       };
       const tmpPath = `${this.storagePath}.tmp.${Date.now()}`;

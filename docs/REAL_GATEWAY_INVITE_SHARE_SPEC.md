@@ -69,6 +69,8 @@ Invite/share is necessary, but full cycle requires all five gaps to be closed.
 - Shared case projected to collaborator after invite acceptance and case join.
 - Both machines persist local copies, but owner is canonical source.
 - Collaborator copy is updated only by owner responses/events.
+- Gateway-projected visibility is symmetric across parties: each side sees shared fields plus only their own party-private fields (`consent`, `private_summary`, `drafts`).
+- `private_thread` content is never transmitted across gateway payloads (always redacted on transport).
 
 ## 5.3 Transport
 
@@ -1163,30 +1165,27 @@ The projected case object includes the following fields, with visibility rules p
 | `parties[].party_id` | full | full | |
 | `parties[].label` | full | full | |
 | `parties[].joined` | full | full | |
-| `parties[].consent` | full | own party only | Full `ConsentGrant` object; other party's consent is `null` |
-| `parties[].consent.allowSummaryShare` | full | own party only | Part of consent grant |
-| `parties[].consent.allowDirectQuote` | full | own party only | Part of consent grant |
-| `parties[].consent.allowedTags` | full | own party only | Part of consent grant |
+| `parties[].consent` | own party only | own party only | Full `ConsentGrant` object for actor's own party; other party's consent is `null` |
+| `parties[].consent.allowSummaryShare` | own party only | own party only | Part of consent grant |
+| `parties[].consent.allowDirectQuote` | own party only | own party only | Part of consent grant |
+| `parties[].consent.allowedTags` | own party only | own party only | Part of consent grant |
 | `parties[].ready` | full | full | Needed to show waiting state |
 | `parties[].has_consent` | full | full | Boolean: whether the party has set any consent (non-private indicator) |
-| `parties[].private_thread` | full | own party only | **REDACTED** for other party |
-| `parties[].private_summary` | full | own party only | **REDACTED** for other party |
-| `parties[].drafts` | full | own party only | **REDACTED** for other party |
+| `parties[].private_thread` | redacted | redacted | Always `null` in gateway transport payloads |
+| `parties[].private_summary` | own party only | own party only | **REDACTED** for other party |
+| `parties[].drafts` | own party only | own party only | **REDACTED** for other party |
 | `group_thread` | full | full | All group messages visible to both |
 | `resolution` | full | full | |
-| `mediator_notes` | full | omitted | Internal mediator data |
+| `mediator_notes` | full | full | Shared mediation context field |
 
 ### 9.4.2 Redaction behavior
 
 - **REDACTED** fields are replaced with `null` in the projected output (not omitted from the schema, to allow clients to distinguish "empty" from "hidden").
-- Owner (local machine) always sees the full unredacted case since the owner is the mediator/authority.
-- Collaborator only sees:
-  - Their own party's full consent grant (`ConsentGrant` object with `allowSummaryShare`, `allowDirectQuote`, `allowedTags`).
-  - The other party's `has_consent` boolean (whether they've set consent), but NOT the specific consent field values.
-  - Their own party's private thread, summary, and drafts.
-  - The other party's `party_id`, `label`, `joined`, and `ready` status (needed for UI indicators).
-  - The full group thread (shared by design).
-  - Resolution text (shared once resolved).
+- Owner and collaborator follow the same visibility policy:
+  - Own party: full `consent`, `private_summary`, and `drafts`.
+  - Other party: `consent = null`, `private_summary = null`, `drafts = null`.
+  - Both parties: shared fields (`group_thread`, `resolution`, participant status fields, etc.).
+- `private_thread` is always `null` in transport payloads for both parties and must never cross gateway boundaries.
 
 ### 9.4.3 Projection in events
 
@@ -1223,10 +1222,7 @@ Push events (`mediation.event` with `event: "case.updated"`) MUST also project t
       },
       "has_consent": true,
       "ready": false,
-      "private_thread": [
-        { "role": "user", "content": "My upstairs neighbor plays loud music..." },
-        { "role": "assistant", "content": "Thank you for sharing. Can you tell me more about..." }
-      ],
+      "private_thread": null,
       "private_summary": null,
       "drafts": []
     }
@@ -1245,11 +1241,11 @@ Draft coaching (AI-assisted message improvement) can execute in two modes. The s
 ### 9.5.1 Owner-side coaching (primary path)
 
 1. Collaborator sends `case.run_draft_suggestion` command to owner.
-2. Owner runs LLM inference locally using its agent runtime, with access to the full case context.
+2. Owner runs LLM inference locally using its agent runtime, using shared case context plus the requesting party's allowed private fields from the projected view.
 3. Owner stores the generated suggestion on the draft and returns it in the response.
 4. Collaborator receives the suggestion and renders it in the draft review UI.
 
-This is the default path because the owner has full case context and a running agent runtime.
+This is the default path because the owner has the canonical draft state and a running agent runtime.
 
 ### 9.5.2 Collaborator-side coaching (alternative path)
 
@@ -1426,7 +1422,7 @@ The spec defines explicit authorization rules for case resolution and closure. T
 
 ### 10.6.2 Rationale
 
-- **Owner-only resolve/close** is the v1 default because the owner acts as mediator and authority. The owner has full case context and is responsible for ensuring resolution is fair.
+- **Owner-only resolve/close** is the v1 default because the owner acts as mediator and authority over canonical state transitions.
 - Collaborators can *request* resolution by sending a group message proposing terms, but only the owner can formally transition the case state.
 
 ### 10.6.3 Future extension: collaborative resolve
@@ -1668,7 +1664,8 @@ Include fields:
 ## 17. Security And Privacy Notes
 
 - This spec is owner-authoritative for shared case state.
-- Private intake visibility is scoped to mediation app roles, not cryptographically hidden from owner device storage.
+- Transport visibility is symmetric: each party sees shared fields plus their own private fields only.
+- `private_thread` data is transport-redacted and never sent across gateway payloads.
 - If stronger privacy is required later, add per-party encrypted intake blobs where owner stores ciphertext only.
 
 ## 18. Non-Goals For This Milestone

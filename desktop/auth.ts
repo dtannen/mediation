@@ -241,11 +241,12 @@ function startCallbackServer(expectedState: string, timeoutMs: number): Promise<
 }
 
 export default function createAuthService(deps: AuthServiceDeps) {
-  // Share desktop OAuth state with commands-com-agent so both apps reuse
-  // the same sign-in session and refresh token lifecycle.
-  const DESKTOP_AUTH_DIR = path.join(deps.homedir, '.commands-agent');
+  // Persist desktop OAuth state and mediation device identity so runtime
+  // reconnects can reuse the same session and refresh token lifecycle.
+  const DESKTOP_AUTH_DIR = path.join(deps.homedir, '.mediation-desktop');
   const DESKTOP_AUTH_PATH = path.join(DESKTOP_AUTH_DIR, 'desktop-auth.enc');
   const DESKTOP_SIGNOUT_SENTINEL = path.join(DESKTOP_AUTH_DIR, 'desktop-signed-out');
+  const LEGACY_AUTH_PATH = path.join(deps.homedir, '.commands-agent', 'desktop-auth.enc');
 
   let accessToken: string | null = null;
   let refreshToken: string | null = null;
@@ -345,13 +346,16 @@ export default function createAuthService(deps: AuthServiceDeps) {
   }
 
   function loadPersistedAuthState(): void {
-    if (!existsSync(DESKTOP_AUTH_PATH)) {
+    const sourcePath = existsSync(DESKTOP_AUTH_PATH)
+      ? DESKTOP_AUTH_PATH
+      : (existsSync(LEGACY_AUTH_PATH) ? LEGACY_AUTH_PATH : '');
+    if (!sourcePath) {
       return;
     }
 
     let parsed: Record<string, unknown>;
     try {
-      const raw = readFileSync(DESKTOP_AUTH_PATH);
+      const raw = readFileSync(sourcePath);
       const text = deps.safeStorage?.isEncryptionAvailable()
         ? deps.safeStorage.decryptString(raw)
         : raw.toString('utf8');

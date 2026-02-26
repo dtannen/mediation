@@ -9,7 +9,7 @@ interface MediationService {
   createCase: (input: Record<string, unknown>) => Record<string, unknown>;
   getCase: (caseId: string) => Record<string, unknown>;
   listCases: () => Record<string, unknown>[];
-  joinWithInvite: (caseId: string, partyId: string, inviteToken: string) => Record<string, unknown>;
+  joinParty: (caseId: string, partyId: string) => Record<string, unknown>;
   appendPrivateMessage: (input: Record<string, unknown>) => Record<string, unknown>;
   setPartyConsent: (
     caseId: string,
@@ -26,6 +26,17 @@ interface MediationService {
   rejectCoachDraft: (caseId: string, draftId: string, reason?: string) => Record<string, unknown>;
   resolveCase: (caseId: string, resolution: string) => Record<string, unknown>;
   closeCase: (caseId: string) => Record<string, unknown>;
+  upsertRemoteCaseSnapshot: (input: {
+    projectedCase: Record<string, unknown>;
+    ownerDeviceId: string;
+    grantId: string;
+    accessRole: 'owner' | 'collaborator';
+    localPartyId?: string;
+    remoteVersion?: number;
+    syncStatus?: string;
+  }) => Record<string, unknown>;
+  markRemoteGrantStatus: (grantId: string, status: 'access_revoked' | 'left') => Record<string, unknown>[];
+  markRemoteCaseRemoved: (grantId: string, caseId: string) => void;
 }
 
 function toError(err: unknown): Record<string, unknown> {
@@ -81,6 +92,7 @@ export function register(
     runCoachReply?: (input: { caseId: string; partyId: string; prompt: string }) => Promise<Record<string, unknown>>;
     runDraftSuggestion?: (input: { caseId: string; draftId: string }) => Promise<Record<string, unknown>>;
     emitMediationEvent?: (payload: Record<string, unknown>) => void;
+    emitStructuredLog?: (event: string, fields?: Record<string, unknown>) => void;
   },
 ): void {
   const r = deps.registry;
@@ -112,65 +124,9 @@ export function register(
     }
   });
 
-  r.handle(ipcMain, CH.MEDIATION_PEEK_INVITE, async (_event, payload) => {
-    try {
-      const caseId = String(payload?.caseId || '').trim();
-      const inviteToken = String(payload?.inviteToken || '').trim();
-      const mediationCase = svc.getCase(caseId);
-      const inviteLink = mediationCase.inviteLink && typeof mediationCase.inviteLink === 'object'
-        ? mediationCase.inviteLink as Record<string, unknown>
-        : {};
-
-      if (inviteToken && String(inviteLink.token || '') !== inviteToken) {
-        throw new DomainError('invalid_invite_token', 'invite token is invalid');
-      }
-
-      const participationById = (
-        mediationCase.partyParticipationById
-        && typeof mediationCase.partyParticipationById === 'object'
-      ) ? mediationCase.partyParticipationById as Record<string, unknown> : {};
-
-      const parties = Array.isArray(mediationCase.parties)
-        ? mediationCase.parties.map((party) => {
-          const partyId = typeof party === 'object' && party ? String((party as Record<string, unknown>).id || '') : '';
-          const participation = participationById[partyId];
-          const state = participation && typeof participation === 'object'
-            ? String((participation as Record<string, unknown>).state || 'invited')
-            : 'invited';
-
-          return {
-            id: partyId,
-            displayName: typeof party === 'object' && party
-              ? String((party as Record<string, unknown>).displayName || partyId)
-              : partyId,
-            state,
-          };
-        })
-        : [];
-
-      return ok({
-        preview: {
-          caseId: String(mediationCase.id || caseId),
-          topic: String(mediationCase.topic || ''),
-          description: String(mediationCase.description || ''),
-          parties,
-          availablePartyIds: parties
-            .filter((party) => party.state === 'invited' || party.state === 'joined')
-            .map((party) => party.id),
-        },
-      });
-    } catch (err) {
-      return fail(err);
-    }
-  });
-
   r.handle(ipcMain, CH.MEDIATION_JOIN, async (_event, payload) => {
     try {
-      const mediationCase = svc.joinWithInvite(
-        String(payload?.caseId || ''),
-        String(payload?.partyId || ''),
-        String(payload?.inviteToken || ''),
-      );
+      const mediationCase = svc.joinParty(String(payload?.caseId || ''), String(payload?.partyId || ''));
       emitCaseUpdate(deps, 'join', mediationCase, { partyId: String(payload?.partyId || '') });
       return ok({ case: mediationCase });
     } catch (err) {
@@ -417,6 +373,89 @@ export function register(
       const mediationCase = svc.closeCase(String(payload?.caseId || ''));
       emitCaseUpdate(deps, 'close', mediationCase);
       return ok({ case: mediationCase });
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
+  r.handle(ipcMain, CH.MEDIATION_SYNC_REMOTE_CASE, async (_event, payload) => {
+    try {
+      if (!payload || typeof payload !== 'object') {
+        throw new DomainError('invalid_payload', 'payload is required');
+      }
+      const projectedCase = payload.projectedCase && typeof payload.projectedCase === 'object'
+        ? payload.projectedCase as Record<string, unknown>
+        : null;
+      if (!projectedCase) {
+        throw new DomainError('invalid_payload', 'projectedCase is required');
+      }
+
+      const mediationCase = svc.upsertRemoteCaseSnapshot({
+        projectedCase,
+        ownerDeviceId: String(payload.ownerDeviceId || ''),
+        grantId: String(payload.grantId || ''),
+        accessRole: payload.accessRole === 'owner' ? 'owner' : 'collaborator',
+        localPartyId: typeof payload.localPartyId === 'string' ? payload.localPartyId : undefined,
+        remoteVersion: Number.isFinite(payload.remoteVersion) ? Number(payload.remoteVersion) : undefined,
+        syncStatus: typeof payload.syncStatus === 'string' ? payload.syncStatus : undefined,
+      });
+      const incomingVersion = Number.isFinite(payload.remoteVersion) ? Number(payload.remoteVersion) : 0;
+      const persistedVersion = Number((mediationCase as any)?.syncMetadata?.remoteVersion || 0);
+      const projectedCaseId = pickString((projectedCase as Record<string, unknown>).case_id);
+      const syncedCaseId = pickString((mediationCase as Record<string, unknown>).id);
+      const eventCaseId = projectedCaseId || syncedCaseId;
+      if (incomingVersion > 0 && persistedVersion > 0 && incomingVersion < persistedVersion) {
+        deps.emitStructuredLog?.('mediation.sync.conflict', {
+          case_id: eventCaseId,
+          grant_id: String(payload.grantId || ''),
+          remote_version: incomingVersion,
+          local_remote_version: persistedVersion,
+        });
+      }
+      deps.emitStructuredLog?.('mediation.case.synced', {
+        case_id: eventCaseId,
+        grant_id: String(payload.grantId || ''),
+        remote_version: persistedVersion > 0 ? persistedVersion : undefined,
+      });
+      emitCaseUpdate(deps, 'sync_remote_case', mediationCase);
+      return ok({ case: mediationCase });
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
+  r.handle(ipcMain, CH.MEDIATION_MARK_REMOTE_GRANT_STATUS, async (_event, payload) => {
+    try {
+      const grantId = pickString(payload?.grantId);
+      const status = pickString(payload?.status);
+      if (!grantId || (status !== 'access_revoked' && status !== 'left')) {
+        throw new DomainError('invalid_payload', 'grantId and status are required');
+      }
+      const cases = svc.markRemoteGrantStatus(grantId, status);
+      for (const mediationCase of cases) {
+        emitCaseUpdate(deps, 'mark_remote_grant_status', mediationCase, { grantId, status });
+      }
+      return ok({ cases });
+    } catch (err) {
+      return fail(err);
+    }
+  });
+
+  r.handle(ipcMain, CH.MEDIATION_REMOVE_REMOTE_CASE, async (_event, payload) => {
+    try {
+      const grantId = pickString(payload?.grantId);
+      const caseId = pickString(payload?.caseId);
+      if (!grantId || !caseId) {
+        throw new DomainError('invalid_payload', 'grantId and caseId are required');
+      }
+      svc.markRemoteCaseRemoved(grantId, caseId);
+      deps.emitMediationEvent?.({
+        type: 'mediation.event',
+        event: 'case.removed',
+        case_id: caseId,
+        reason: 'owner_removed_visibility',
+      });
+      return ok({ removed: true, caseId });
     } catch (err) {
       return fail(err);
     }

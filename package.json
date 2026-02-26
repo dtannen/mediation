@@ -13,13 +13,16 @@
     "demo": "npm run build && npm run start",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:desktop": "tsc --noEmit --target ES2022 --module CommonJS --moduleResolution Node --strict --esModuleInterop --skipLibCheck desktop/**/*.ts",
-    "test": "npm run build && node dist/tests/run-tests.js"
+    "test": "npm run build && node dist/tests/run-tests.js",
+    "test:acceptance": "npm run build && node dist/tests/two-machine-acceptance.js"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.47"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.47",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
+    "@types/ws": "^8.5.13",
     "electron": "^35.0.0",
     "typescript": "^5.7.2"
   }

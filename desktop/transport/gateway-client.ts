@@ -284,6 +284,56 @@ export default function createGatewayClient(deps: GatewayClientDeps) {
     return { ok: true, status: response.status, data: parsed };
   }
 
+  async function createShareInvite(
+    gatewayUrl: string,
+    payload: {
+      deviceId: string;
+      email: string;
+      grantExpiresAt?: number;
+      inviteTokenTtlSeconds?: number;
+    },
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {
+      deviceId: payload.deviceId,
+      email: payload.email,
+    };
+
+    if (Number.isFinite(payload.grantExpiresAt)) {
+      body.grantExpiresAt = Math.trunc(payload.grantExpiresAt as number);
+    }
+    if (Number.isFinite(payload.inviteTokenTtlSeconds)) {
+      body.inviteTokenTtlSeconds = Math.trunc(payload.inviteTokenTtlSeconds as number);
+    }
+
+    return gatewayJson(`${gatewayUrl}/gateway/v1/shares/invites`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function consumeShareInvite(gatewayUrl: string, token: string): Promise<Record<string, unknown>> {
+    return gatewayJson(`${gatewayUrl}/gateway/v1/shares/invites/accept`, {
+      method: 'POST',
+      body: JSON.stringify({ token: token.trim() }),
+    });
+  }
+
+  async function listShareGrants(gatewayUrl: string, deviceId: string): Promise<Record<string, unknown>> {
+    return gatewayJson(`${gatewayUrl}/gateway/v1/shares/devices/${encodeURIComponent(deviceId)}/grants`);
+  }
+
+  async function revokeShareGrant(gatewayUrl: string, grantId: string): Promise<Record<string, unknown>> {
+    return gatewayJson(`${gatewayUrl}/gateway/v1/shares/grants/${encodeURIComponent(grantId)}/revoke`, {
+      method: 'POST',
+    });
+  }
+
+  async function leaveShareGrant(gatewayUrl: string, grantId: string): Promise<Record<string, unknown>> {
+    return gatewayJson(`${gatewayUrl}/gateway/v1/shares/grants/${encodeURIComponent(grantId)}/leave`, {
+      method: 'POST',
+    });
+  }
+
   async function subscribeSse(
     url: string,
     onEvent: (event: { event: string; data: string; id: string }) => void,
@@ -413,6 +463,11 @@ export default function createGatewayClient(deps: GatewayClientDeps) {
     updateIntegrationRoute,
     deleteIntegrationRoute,
     rotateIntegrationRouteToken,
+    createShareInvite,
+    consumeShareInvite,
+    listShareGrants,
+    revokeShareGrant,
+    leaveShareGrant,
     subscribeSse,
     subscribeSessionEvents,
   };

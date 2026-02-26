@@ -18,4 +18,8 @@ export class InMemoryMediationStore {
   clear(): void {
     this.cases.clear();
   }
+
+  delete(caseId: string): void {
+    this.cases.delete(caseId);
+  }
 }

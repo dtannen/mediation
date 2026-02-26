@@ -85,6 +85,92 @@ function assertGroupChatPhase(mediationCase: MediationCase): void {
   }
 }
 
+function pickString(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function pickStringArray(record: Record<string, unknown>, key: string): string[] {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => String(entry || '').trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function pickRecordArray(record: Record<string, unknown>, key: string): Record<string, unknown>[] {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((entry) => entry && typeof entry === 'object') as Record<string, unknown>[];
+}
+
+function asPhase(value: string): MediationPhase {
+  if (
+    value === 'awaiting_join'
+    || value === 'private_intake'
+    || value === 'group_chat'
+    || value === 'resolved'
+    || value === 'closed'
+  ) {
+    return value;
+  }
+  return 'awaiting_join';
+}
+
+function asAuthorType(value: string): ThreadMessage['authorType'] {
+  if (value === 'party' || value === 'party_llm' || value === 'mediator_llm' || value === 'system') {
+    return value;
+  }
+  return 'system';
+}
+
+function asVisibility(value: string): ThreadMessage['visibility'] {
+  if (value === 'private' || value === 'group' || value === 'system') {
+    return value;
+  }
+  return 'group';
+}
+
+function asDeliveryMode(value: string): GroupMessageDeliveryMode | undefined {
+  if (value === 'direct' || value === 'coach_approved' || value === 'system') {
+    return value;
+  }
+  return undefined;
+}
+
+function asDraftStatus(value: string): GroupMessageDraft['status'] {
+  if (value === 'composing' || value === 'pending_approval' || value === 'approved' || value === 'rejected') {
+    return value;
+  }
+  return 'composing';
+}
+
+function asComposeAuthor(value: string): CoachComposeAuthor {
+  return value === 'party_llm' ? 'party_llm' : 'party';
+}
+
+function toIsoOrNow(value: string): string {
+  if (!value) {
+    return nowIso();
+  }
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? new Date(ts).toISOString() : nowIso();
+}
+
+function cloneCase(mediationCase: MediationCase): MediationCase {
+  return JSON.parse(JSON.stringify(mediationCase)) as MediationCase;
+}
+
+function cloneMessages(messages: ThreadMessage[]): ThreadMessage[] {
+  return JSON.parse(JSON.stringify(messages || [])) as ThreadMessage[];
+}
+
+const REMOTE_TOMBSTONE_STATUSES = new Set(['access_revoked', 'left', 'removed']);
+
 export class MediationService {
   constructor(private readonly store: InMemoryMediationStore = new InMemoryMediationStore()) {}
 
@@ -134,6 +220,12 @@ export class MediationService {
       description: (input.description || '').trim(),
       createdAt: nowIso(),
       updatedAt: nowIso(),
+      syncMetadata: {
+        source: 'owner_local',
+        accessRole: 'owner',
+        syncStatus: 'live',
+        syncUpdatedAt: nowIso(),
+      },
       phase: 'awaiting_join',
       parties: input.parties,
       inviteLink: {
@@ -169,44 +261,9 @@ export class MediationService {
     return this.store.list();
   }
 
-  getInviteLink(caseId: string): { token: string; url: string } {
+  joinParty(caseId: string, partyId: string): MediationCase {
     const mediationCase = this.getCase(caseId);
-    return {
-      token: mediationCase.inviteLink.token,
-      url: mediationCase.inviteLink.url,
-    };
-  }
-
-  joinWithInvite(caseId: string, partyId: string, inviteToken: string): MediationCase {
-    const mediationCase = this.getCase(caseId);
-
-    if (inviteToken !== mediationCase.inviteLink.token) {
-      throw new DomainError('invalid_invite_token', 'invite token is invalid');
-    }
-
-    const participant = mediationCase.partyParticipationById[partyId];
-    if (!participant) {
-      throw new DomainError('party_not_found', `party '${partyId}' not found in case`);
-    }
-
-    if (!hasJoined(participant.state)) {
-      participant.state = 'joined';
-      participant.joinedAt = nowIso();
-      mediationCase.updatedAt = nowIso();
-      this.store.save(mediationCase);
-    }
-
-    const allJoined = mediationCase.parties.every((party) => {
-      const state = mediationCase.partyParticipationById[party.id]?.state;
-      return Boolean(state && hasJoined(state));
-    });
-
-    if (allJoined && mediationCase.phase === 'awaiting_join') {
-      this.transition(caseId, 'private_intake');
-      return this.getCase(caseId);
-    }
-
-    return mediationCase;
+    return this.joinPartyInCase(mediationCase, partyId);
   }
 
   appendPrivateMessage(input: AppendMessageInput): MediationCase {
@@ -273,7 +330,7 @@ export class MediationService {
   setPartyConsent(
     caseId: string,
     partyId: string,
-    input: { allowSummaryShare: boolean; allowDirectQuote: boolean },
+    input: { allowSummaryShare: boolean; allowDirectQuote: boolean; allowedTags?: string[] },
   ): MediationCase {
     const mediationCase = this.getCase(caseId);
     const participant = mediationCase.partyParticipationById[partyId];
@@ -288,6 +345,11 @@ export class MediationService {
 
     grant.allowSummaryShare = input.allowSummaryShare === true;
     grant.allowDirectQuote = input.allowDirectQuote === true;
+    if (Array.isArray(input.allowedTags)) {
+      grant.allowedTags = input.allowedTags
+        .map((entry) => String(entry || '').trim())
+        .filter((entry) => entry.length > 0);
+    }
 
     mediationCase.updatedAt = nowIso();
     this.store.save(mediationCase);
@@ -426,6 +488,11 @@ export class MediationService {
     const mediationCase = this.getCase(caseId);
     assertGroupChatPhase(mediationCase);
     assertPartyExists(mediationCase, partyId);
+    const hasActiveDraft = Object.values(mediationCase.groupChat.draftsById)
+      .some((draft) => draft.partyId === partyId && draft.status !== 'approved' && draft.status !== 'rejected');
+    if (hasActiveDraft) {
+      throw new DomainError('draft_already_active', `party '${partyId}' already has an active draft`);
+    }
 
     const initialText = initialPartyMessage.trim();
     if (!initialText) {
@@ -536,11 +603,14 @@ export class MediationService {
     if (!draft) {
       throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
     }
-    if (draft.status !== 'pending_approval') {
-      throw new DomainError('draft_not_pending', `draft '${draftId}' is not pending approval`);
+    if (draft.status === 'approved' || draft.status === 'rejected') {
+      throw new DomainError('draft_closed', `draft '${draftId}' is already ${draft.status}`);
     }
 
-    const sourceText = approvedText || draft.suggestedText || '';
+    const lastComposeText = draft.composeMessages.length > 0
+      ? draft.composeMessages[draft.composeMessages.length - 1].text
+      : '';
+    const sourceText = approvedText || draft.suggestedText || lastComposeText || '';
     const finalText = sourceText.trim();
     if (!finalText) {
       throw new DomainError('invalid_approved_text', 'approved text cannot be empty');
@@ -640,5 +710,301 @@ export class MediationService {
       this.transition(caseId, 'closed');
     }
     return this.getCase(caseId);
+  }
+
+  upsertRemoteCaseSnapshot(input: {
+    projectedCase: Record<string, unknown>;
+    ownerDeviceId: string;
+    grantId: string;
+    accessRole: 'owner' | 'collaborator';
+    localPartyId?: string;
+    remoteVersion?: number;
+    syncStatus?: MediationCase['syncMetadata'] extends { syncStatus?: infer T } ? T : never;
+  }): MediationCase {
+    const projected = input.projectedCase || {};
+    const caseId = pickString(projected, 'case_id');
+    if (!caseId) {
+      throw new DomainError('invalid_payload', 'remote case snapshot missing case_id');
+    }
+
+    const incomingVersion = Number.isFinite(input.remoteVersion)
+      ? Math.max(0, Math.trunc(input.remoteVersion as number))
+      : 0;
+    const existing = this.store.get(caseId);
+    const existingVersion = Number(existing?.syncMetadata?.remoteVersion || 0);
+    if (
+      existing
+      && existing.syncMetadata?.source === 'shared_remote'
+      && incomingVersion > 0
+      && existingVersion > 0
+      && incomingVersion <= existingVersion
+    ) {
+      return existing;
+    }
+
+    const projectedParties = pickRecordArray(projected, 'parties');
+    const parties: Party[] = projectedParties.map((party, idx) => {
+      const partyId = pickString(party, 'party_id') || `party_${idx + 1}`;
+      return {
+        id: partyId,
+        displayName: pickString(party, 'label') || partyId,
+        localLLM: {
+          provider: 'remote',
+          model: 'remote',
+        },
+      };
+    });
+
+    const partyParticipationById: MediationCase['partyParticipationById'] = {};
+    const privateIntakeByPartyId: MediationCase['privateIntakeByPartyId'] = {};
+    const consentByPartyId: CaseConsent['byPartyId'] = {};
+
+    for (const party of projectedParties) {
+      const partyId = pickString(party, 'party_id');
+      if (!partyId) {
+        continue;
+      }
+
+      const joined = party.joined === true;
+      const ready = party.ready === true;
+      const participationState: PartyParticipationState = ready ? 'ready' : (joined ? 'joined' : 'invited');
+      partyParticipationById[partyId] = {
+        partyId,
+        state: participationState,
+        invitedAt: existing?.partyParticipationById?.[partyId]?.invitedAt || toIsoOrNow(pickString(projected, 'created_at')),
+        ...(joined ? { joinedAt: existing?.partyParticipationById?.[partyId]?.joinedAt || nowIso() } : {}),
+        ...(ready ? { readyAt: existing?.partyParticipationById?.[partyId]?.readyAt || nowIso() } : {}),
+      };
+
+      const consentRecord = party.consent && typeof party.consent === 'object'
+        ? party.consent as Record<string, unknown>
+        : {};
+      const explicitTags = pickStringArray(consentRecord, 'allowedTags');
+      consentByPartyId[partyId] = {
+        allowSummaryShare: consentRecord.allowSummaryShare === true || party.has_consent === true,
+        allowDirectQuote: consentRecord.allowDirectQuote === true,
+        allowedTags: explicitTags,
+      };
+
+      const privateThread = Array.isArray(party.private_thread)
+        ? party.private_thread as Array<Record<string, unknown>>
+        : null;
+      const messages: ThreadMessage[] = privateThread
+        ? privateThread.map((message) => {
+          const messageId = pickString(message, 'id') || makeId('msg');
+          return {
+            id: messageId,
+            createdAt: toIsoOrNow(pickString(message, 'created_at')),
+            authorType: asAuthorType(pickString(message, 'author_type')),
+            authorPartyId: pickString(message, 'author_party_id') || undefined,
+            text: pickString(message, 'text'),
+            tags: pickStringArray(message, 'tags'),
+            visibility: asVisibility(pickString(message, 'visibility')),
+            deliveryMode: asDeliveryMode(pickString(message, 'delivery_mode')),
+            sourceDraftId: pickString(message, 'source_draft_id') || undefined,
+          };
+        })
+        : cloneMessages(existing?.privateIntakeByPartyId?.[partyId]?.messages || []);
+
+      privateIntakeByPartyId[partyId] = {
+        partyId,
+        resolved: Boolean(pickString(party, 'private_summary')),
+        summary: pickString(party, 'private_summary'),
+        messages,
+      };
+    }
+
+    const groupThread = pickRecordArray(projected, 'group_thread');
+    const groupMessages: ThreadMessage[] = groupThread.map((message) => ({
+      id: pickString(message, 'id') || makeId('msg'),
+      createdAt: toIsoOrNow(pickString(message, 'created_at')),
+      authorType: asAuthorType(pickString(message, 'author_type')),
+      authorPartyId: pickString(message, 'author_party_id') || undefined,
+      text: pickString(message, 'text'),
+      tags: pickStringArray(message, 'tags'),
+      visibility: asVisibility(pickString(message, 'visibility')),
+      deliveryMode: asDeliveryMode(pickString(message, 'delivery_mode')),
+      sourceDraftId: pickString(message, 'source_draft_id') || undefined,
+    }));
+
+    const draftsById: Record<string, GroupMessageDraft> = {};
+    for (const party of projectedParties) {
+      const partyId = pickString(party, 'party_id');
+      if (!partyId || !Array.isArray(party.drafts)) {
+        continue;
+      }
+
+      for (const draftRecord of party.drafts as Array<Record<string, unknown>>) {
+        const draftId = pickString(draftRecord, 'draft_id');
+        if (!draftId) {
+          continue;
+        }
+        const composeMessages = pickRecordArray(draftRecord, 'compose_messages').map((entry) => ({
+          id: pickString(entry, 'id') || makeId('compose'),
+          createdAt: toIsoOrNow(pickString(entry, 'created_at')),
+          author: asComposeAuthor(pickString(entry, 'author')),
+          text: pickString(entry, 'text'),
+        }));
+
+        draftsById[draftId] = {
+          id: draftId,
+          partyId,
+          createdAt: toIsoOrNow(pickString(draftRecord, 'created_at')),
+          updatedAt: toIsoOrNow(pickString(draftRecord, 'updated_at')),
+          status: asDraftStatus(pickString(draftRecord, 'status')),
+          composeMessages,
+          suggestedText: pickString(draftRecord, 'suggested_text') || undefined,
+          approvedText: pickString(draftRecord, 'approved_text') || undefined,
+          approvedAt: pickString(draftRecord, 'approved_at') || undefined,
+          rejectedAt: pickString(draftRecord, 'rejected_at') || undefined,
+          rejectionReason: pickString(draftRecord, 'rejection_reason') || undefined,
+          sentMessageId: pickString(draftRecord, 'sent_message_id') || undefined,
+        };
+      }
+    }
+
+    const createdAt = toIsoOrNow(pickString(projected, 'created_at') || existing?.createdAt || nowIso());
+    const updatedAt = toIsoOrNow(pickString(projected, 'updated_at') || nowIso());
+    const topic = pickString(projected, 'title') || existing?.topic || `Remote Case ${caseId}`;
+    const phase = asPhase(pickString(projected, 'phase') || existing?.phase || 'awaiting_join');
+
+    const nextCase: MediationCase = {
+      id: caseId,
+      topic,
+      description: existing?.description || '',
+      createdAt,
+      updatedAt,
+      syncMetadata: {
+        source: 'shared_remote',
+        ownerDeviceId: input.ownerDeviceId,
+        grantId: input.grantId,
+        accessRole: input.accessRole,
+        localPartyId: input.localPartyId || existing?.syncMetadata?.localPartyId,
+        remoteVersion: incomingVersion > 0 ? incomingVersion : existingVersion,
+        syncUpdatedAt: nowIso(),
+        syncStatus: (input.syncStatus as any) || existing?.syncMetadata?.syncStatus || 'live',
+      },
+      phase,
+      parties: parties.length > 0 ? parties : (existing?.parties || []),
+      inviteLink: existing?.inviteLink || {
+        token: '',
+        url: '',
+        createdAt,
+      },
+      partyParticipationById,
+      consent: { byPartyId: consentByPartyId },
+      privateIntakeByPartyId,
+      groupChat: {
+        opened: phase === 'group_chat' || phase === 'resolved' || phase === 'closed',
+        introductionsSent: groupMessages.length > 0,
+        mediatorSummary: pickString(projected, 'mediator_notes'),
+        messages: groupMessages,
+        draftsById,
+      },
+      resolution: pickString(projected, 'resolution') || undefined,
+    };
+
+    this.store.save(nextCase);
+    return cloneCase(nextCase);
+  }
+
+  markRemoteGrantStatus(grantId: string, status: 'access_revoked' | 'left'): MediationCase[] {
+    const normalizedGrantId = grantId.trim();
+    if (!normalizedGrantId) {
+      return [];
+    }
+
+    const now = nowIso();
+    const updated: MediationCase[] = [];
+    for (const mediationCase of this.store.list()) {
+      if (mediationCase.syncMetadata?.source !== 'shared_remote') {
+        continue;
+      }
+      if (mediationCase.syncMetadata.grantId !== normalizedGrantId) {
+        continue;
+      }
+
+      mediationCase.syncMetadata.syncStatus = status;
+      mediationCase.syncMetadata.syncUpdatedAt = now;
+      mediationCase.updatedAt = now;
+      this.store.save(mediationCase);
+      updated.push(cloneCase(mediationCase));
+    }
+    return updated;
+  }
+
+  markRemoteCaseRemoved(grantId: string, caseId: string): void {
+    const normalizedGrantId = grantId.trim();
+    const normalizedCaseId = caseId.trim();
+    if (!normalizedGrantId || !normalizedCaseId) {
+      return;
+    }
+
+    const mediationCase = this.store.get(normalizedCaseId);
+    if (!mediationCase || mediationCase.syncMetadata?.source !== 'shared_remote') {
+      return;
+    }
+    if (mediationCase.syncMetadata.grantId !== normalizedGrantId) {
+      return;
+    }
+
+    mediationCase.syncMetadata.syncStatus = 'removed';
+    mediationCase.syncMetadata.syncUpdatedAt = nowIso();
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    this.store.delete(normalizedCaseId);
+  }
+
+  purgeExpiredRemoteTombstones(): number {
+    const cutoffMs = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    let purged = 0;
+    for (const mediationCase of this.store.list()) {
+      const metadata = mediationCase.syncMetadata;
+      if (!metadata || metadata.source !== 'shared_remote') {
+        continue;
+      }
+      if (!metadata.syncStatus || !REMOTE_TOMBSTONE_STATUSES.has(metadata.syncStatus)) {
+        continue;
+      }
+
+      if (metadata.syncStatus === 'removed') {
+        this.store.delete(mediationCase.id);
+        purged += 1;
+        continue;
+      }
+
+      const updatedAtMs = Date.parse(metadata.syncUpdatedAt || mediationCase.updatedAt || '');
+      if (!Number.isFinite(updatedAtMs) || updatedAtMs < cutoffMs) {
+        this.store.delete(mediationCase.id);
+        purged += 1;
+      }
+    }
+    return purged;
+  }
+
+  private joinPartyInCase(mediationCase: MediationCase, partyId: string): MediationCase {
+    const participant = mediationCase.partyParticipationById[partyId];
+    if (!participant) {
+      throw new DomainError('party_not_found', `party '${partyId}' not found in case`);
+    }
+
+    if (!hasJoined(participant.state)) {
+      participant.state = 'joined';
+      participant.joinedAt = nowIso();
+      mediationCase.updatedAt = nowIso();
+      this.store.save(mediationCase);
+    }
+
+    const allJoined = mediationCase.parties.every((party) => {
+      const state = mediationCase.partyParticipationById[party.id]?.state;
+      return Boolean(state && hasJoined(state));
+    });
+
+    if (allJoined && mediationCase.phase === 'awaiting_join') {
+      this.transition(mediationCase.id, 'private_intake');
+      return this.getCase(mediationCase.id);
+    }
+
+    return mediationCase;
   }
 }
