@@ -139,9 +139,9 @@ async function createMainWindow(): Promise<void> {
 
   mainWindow = new BrowserWindow({
     width: 1280,
-    height: 820,
+    height: 1000,
     minWidth: 960,
-    minHeight: 640,
+    minHeight: 760,
     backgroundColor: '#0b1220',
     webPreferences: {
       preload: preloadPath,

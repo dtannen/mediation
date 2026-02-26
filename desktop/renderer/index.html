@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Mediation Desktop</title>
+    <title>Mediate</title>
     <link rel="stylesheet" href="./styles/base.css" />
     <link rel="stylesheet" href="./styles/components.css" />
     <link rel="stylesheet" href="./styles/chat.css" />
@@ -12,12 +12,28 @@
   <body>
     <section id="start-screen">
       <div id="start-card">
-        <h1>Mediation</h1>
-        <p class="muted">Start Agent runs OAuth, registers this mediation device with gateway, and launches the local commands-agent runtime.</p>
-        <div class="row" style="margin-top: 14px;">
-          <button id="start-btn" class="primary">Start</button>
+        <div class="splash-icon">
+          <svg viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="icon-grad" x1="0" y1="0" x2="72" y2="72" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#667eea"/>
+                <stop offset="100%" stop-color="#764ba2"/>
+              </linearGradient>
+            </defs>
+            <circle cx="36" cy="36" r="34" stroke="url(#icon-grad)" stroke-width="2.5" fill="rgba(102,126,234,0.06)"/>
+            <path d="M24 32C24 28.686 26.686 26 30 26h12c3.314 0 6 2.686 6 6v6c0 3.314-2.686 6-6 6h-2l-5 5v-5h-5c-3.314 0-6-2.686-6-6v-6z" fill="url(#icon-grad)" opacity="0.8"/>
+            <circle cx="32" cy="35" r="1.5" fill="#fff"/>
+            <circle cx="36" cy="35" r="1.5" fill="#fff"/>
+            <circle cx="40" cy="35" r="1.5" fill="#fff"/>
+          </svg>
         </div>
-        <p id="start-status" class="muted small" style="margin-top: 10px;"></p>
+        <h1 class="splash-wordmark">Mediate</h1>
+        <p class="splash-tagline">Guided conflict resolution, powered by AI</p>
+        <div>
+          <button id="start-btn" class="cta">Get Started</button>
+        </div>
+        <div id="start-spinner" class="splash-spinner"></div>
+        <p id="start-status"></p>
       </div>
     </section>
 

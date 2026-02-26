@@ -1,56 +1,118 @@
+/* ============================================================
+   VIEW TITLES
+   ============================================================ */
 .view-title {
-  margin: 0 0 6px;
-  font-size: 1.15rem;
+  margin: 0 0 var(--sp-1);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--ink-strong);
 }
 
 .view-subtitle {
   margin: 0;
   color: var(--muted);
-  font-size: 0.9rem;
+  font-size: var(--text-sm);
+  line-height: 1.5;
 }
 
 .section-title {
-  margin: 0 0 8px;
-  font-size: 0.98rem;
-  color: #d7e3ff;
+  margin: 0 0 var(--sp-2);
+  font-size: var(--text-base);
+  font-weight: 600;
+  color: var(--ink-strong);
 }
 
-.detail-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-}
-
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-}
-
-.join-preview {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(12, 18, 28, 0.75);
-  padding: 10px;
-  font-size: 0.9rem;
-  display: grid;
-  gap: 6px;
-}
-
-.empty-state {
-  border: 1px dashed var(--line);
-  border-radius: 10px;
-  padding: 14px;
-  color: var(--muted);
-}
-
+/* ============================================================
+   VIEW ACTIONS
+   ============================================================ */
 .view-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 
-.status-line {
+/* ============================================================
+   DASHBOARD GRID
+   ============================================================ */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-4);
+  animation: fadeIn var(--duration-normal) var(--ease-out) both;
+}
+
+.dashboard-title {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.dashboard-title h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+}
+
+/* ============================================================
+   DETAIL GRID
+   ============================================================ */
+.detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-3);
+  animation: fadeIn var(--duration-normal) var(--ease-out) both;
+}
+
+/* ============================================================
+   CTA SECTION (for case detail)
+   ============================================================ */
+.cta-section {
+  border: 1px solid rgba(102, 126, 234, 0.25);
+  border-radius: var(--radius-md);
+  padding: var(--sp-5);
+  background: var(--brand-gradient-subtle);
+  text-align: center;
+}
+.cta-section .cta-heading {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--ink-strong);
+  margin-bottom: var(--sp-1);
+}
+.cta-section .cta-desc {
+  font-size: var(--text-sm);
   color: var(--muted);
-  font-size: 0.9rem;
+  margin-bottom: var(--sp-4);
+  max-width: 400px;
+  margin-left: auto;
+  margin-right: auto;
+  line-height: 1.5;
+}
+
+/* ============================================================
+   RESOLVED/CLOSED VIEWS
+   ============================================================ */
+.resolved-card {
+  text-align: center;
+  padding: var(--sp-8) var(--sp-5);
+}
+.resolved-card .resolution-text {
+  border: 1px solid var(--line-light);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-4);
+  background: rgba(10, 15, 23, 0.5);
+  text-align: left;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--ink);
+  max-width: 560px;
+  margin: var(--sp-4) auto;
+}
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width: 700px) {
+  .cta-section {
+    padding: var(--sp-4);
+  }
 }

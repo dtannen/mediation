@@ -1,80 +1,124 @@
+/* ============================================================
+   CHAT SHELL & LAYOUT
+   ============================================================ */
 .chat-shell {
   display: grid;
-  gap: 10px;
+  gap: var(--sp-3);
+  animation: fadeIn var(--duration-normal) var(--ease-out) both;
 }
 
 .chat-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
+  gap: var(--sp-3);
 }
 
 .chat-layout.with-coach {
   grid-template-columns: minmax(0, 55%) minmax(0, 45%);
 }
 
+/* ============================================================
+   MESSAGE CONTAINER
+   ============================================================ */
 .chat-messages {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: rgba(10, 16, 25, 0.78);
-  padding: 12px;
-  min-height: 320px;
-  max-height: 52vh;
+  border: 1px solid var(--line-light);
+  border-radius: var(--radius-md);
+  background: rgba(8, 13, 22, 0.7);
+  padding: var(--sp-4);
+  min-height: 340px;
+  max-height: 64vh;
   overflow: auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--sp-3);
+  scroll-behavior: smooth;
 }
 
+/* ============================================================
+   MESSAGE BUBBLES
+   ============================================================ */
 .msg-bubble {
-  max-width: 82%;
-  padding: 10px 14px;
-  border-radius: 12px;
-  border: 1px solid var(--glass-border);
+  max-width: 80%;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-lg);
+  border: 1px solid transparent;
+  animation: fadeIn var(--duration-fast) var(--ease-out) both;
+  position: relative;
 }
 
+/* Own messages (right-aligned, brand tint) */
 .msg-own {
   align-self: flex-end;
-  background: rgba(102, 126, 234, 0.13);
-  border-color: rgba(102, 126, 234, 0.3);
+  background: rgba(102, 126, 234, 0.1);
+  border-color: rgba(102, 126, 234, 0.2);
+  border-bottom-right-radius: var(--sp-1);
 }
 
+/* Other party messages (left-aligned) */
 .msg-other {
   align-self: flex-start;
-  background: rgba(148, 163, 184, 0.1);
+  background: rgba(148, 163, 184, 0.07);
+  border-color: rgba(148, 163, 184, 0.1);
+  border-bottom-left-radius: var(--sp-1);
 }
 
+/* Mediator messages (left-aligned, green accent) */
 .msg-mediator {
   align-self: flex-start;
-  max-width: 90%;
-  background: rgba(16, 185, 129, 0.08);
+  max-width: 88%;
+  background: rgba(16, 185, 129, 0.06);
+  border-color: rgba(16, 185, 129, 0.15);
   border-left: 3px solid var(--mediator);
+  border-bottom-left-radius: var(--sp-1);
 }
 
+/* System messages (centered) */
 .msg-system {
   align-self: center;
   color: var(--muted);
-  font-size: 0.82rem;
-  padding: 5px 0;
+  font-size: var(--text-sm);
+  padding: var(--sp-1) 0;
+  text-align: center;
+  max-width: 85%;
+  line-height: 1.5;
+}
+
+/* Message header with avatar */
+.msg-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
 }
 
 .msg-author {
-  font-size: 0.76rem;
+  font-size: var(--text-xs);
   font-weight: 600;
   color: var(--muted);
-  margin-bottom: 4px;
+}
+
+.msg-ai-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: rgba(16, 185, 129, 0.12);
+  color: #6ee7b7;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
 .msg-content {
-  line-height: 1.42;
+  line-height: 1.5;
   color: var(--ink);
   word-break: break-word;
+  font-size: var(--text-sm);
 }
 
 .msg-content p {
-  margin: 0 0 8px;
+  margin: 0 0 var(--sp-2);
 }
-
 .msg-content p:last-child {
   margin-bottom: 0;
 }
@@ -84,45 +128,100 @@
   padding-left: 18px;
 }
 
-.msg-ts {
-  font-size: 10px;
-  color: #64748b;
-  margin-top: 6px;
+.msg-content code {
+  background: rgba(148, 163, 184, 0.1);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.88em;
+  font-family: var(--mono);
 }
 
+.msg-ts {
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.45);
+  margin-top: var(--sp-1);
+}
+
+/* ============================================================
+   CHAT INPUT AREA
+   ============================================================ */
 .chat-input-area {
   border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 10px;
-  background: rgba(10, 16, 24, 0.76);
+  border-radius: var(--radius-md);
+  padding: var(--sp-3);
+  background: rgba(10, 16, 24, 0.65);
   display: grid;
-  gap: 10px;
+  gap: var(--sp-2);
+  transition:
+    border-color var(--duration-fast) ease,
+    box-shadow var(--duration-fast) ease;
+}
+
+.chat-input-area:focus-within {
+  border-color: rgba(102, 126, 234, 0.35);
+  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.06);
 }
 
 .chat-input-area textarea {
-  min-height: 44px;
-  max-height: 120px;
+  min-height: 42px;
+  max-height: 130px;
+  border: none;
+  background: transparent;
+  padding: var(--sp-2);
+  font-size: var(--text-sm);
+  resize: none;
+}
+.chat-input-area textarea:focus {
+  outline: none;
+  box-shadow: none;
+  border-color: transparent;
 }
 
 .chat-input-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 
 .chat-input-area.disabled {
-  opacity: 0.7;
+  opacity: 0.6;
+  pointer-events: none;
 }
 
+/* ============================================================
+   MARKDOWN IMAGE GUARD
+   ============================================================ */
 .md-image-blocked {
   display: inline-block;
-  font-size: 0.84rem;
+  font-size: var(--text-sm);
   color: var(--muted);
   border: 1px dashed var(--line);
   border-radius: 6px;
   padding: 1px 6px;
 }
 
+/* ============================================================
+   READY PROMPT (bottom of intake chat)
+   ============================================================ */
+.ready-prompt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid rgba(102, 126, 234, 0.25);
+  border-radius: var(--radius-md);
+  background: var(--brand-gradient-subtle);
+}
+.ready-prompt-text {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
 @media (max-width: 1100px) {
   .chat-layout.with-coach {
     grid-template-columns: 1fr;

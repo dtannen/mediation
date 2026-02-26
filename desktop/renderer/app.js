@@ -5,6 +5,7 @@ const api = window.mediationDesktop;
 
 const startScreen = document.getElementById('start-screen');
 const startButton = document.getElementById('start-btn');
+const startSpinner = document.getElementById('start-spinner');
 const startStatus = document.getElementById('start-status');
 const appShell = document.getElementById('app-shell');
 const appRoot = document.getElementById('app-root');
@@ -12,6 +13,10 @@ const modalRoot = document.getElementById('modal-root');
 const toastRoot = document.getElementById('toast');
 
 let toastTimer = null;
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
 
 function nowIso() {
   return new Date().toISOString();
@@ -31,47 +36,77 @@ function formatShortDate(iso) {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-function normalizeError(resultOrError, fallback = 'Request failed') {
-  if (!resultOrError) {
-    return fallback;
-  }
+function formatRelativeTime(iso) {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const now = Date.now();
+  const diff = now - date.getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'Just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return 'Yesterday';
+  if (days < 7) return `${days}d ago`;
+  return formatShortDate(iso);
+}
 
-  if (typeof resultOrError === 'string') {
-    return resultOrError;
+function getInitial(name) {
+  if (!name) return '?';
+  return name.charAt(0).toUpperCase();
+}
+
+function getAvatarClass(partyId) {
+  if (partyId === 'party_a') return 'avatar-a';
+  if (partyId === 'party_b') return 'avatar-b';
+  return 'avatar-a';
+}
+
+function friendlyPhase(phase) {
+  switch (phase) {
+    case 'awaiting_join': return 'Waiting';
+    case 'private_intake': return 'Preparing';
+    case 'group_chat': return 'In Session';
+    case 'resolved': return 'Resolved';
+    case 'closed': return 'Closed';
+    default: return phase || '';
   }
+}
+
+function phasePillClass(phase) {
+  if (phase === 'resolved') return 'resolved';
+  if (phase === 'closed') return 'closed';
+  return 'active';
+}
+
+function normalizeError(resultOrError, fallback = 'Something went wrong') {
+  if (!resultOrError) return fallback;
+  if (typeof resultOrError === 'string') return resultOrError;
 
   const err = resultOrError.error;
-  if (typeof err === 'string') {
-    return err;
-  }
+  if (typeof err === 'string') return err;
   if (err && typeof err === 'object') {
-    if (typeof err.message === 'string' && err.message.trim()) {
-      return err.message.trim();
-    }
-    if (typeof err.code === 'string' && err.code.trim()) {
-      return err.code.trim();
-    }
+    if (typeof err.message === 'string' && err.message.trim()) return err.message.trim();
+    if (typeof err.code === 'string' && err.code.trim()) return err.code.trim();
   }
-
-  if (resultOrError instanceof Error) {
-    return resultOrError.message;
-  }
-
+  if (resultOrError instanceof Error) return resultOrError.message;
   return fallback;
 }
+
+/* ============================================================
+   TOAST
+   ============================================================ */
 
 function showToast(message, level = 'info', timeoutMs = 3800) {
   setToast(message, level);
   renderToast();
 
-  if (toastTimer) {
-    clearTimeout(toastTimer);
-  }
+  if (toastTimer) clearTimeout(toastTimer);
 
   const current = getState().toast;
-  if (!current) {
-    return;
-  }
+  if (!current) return;
 
   const toastId = current.id;
   toastTimer = setTimeout(() => {
@@ -91,15 +126,16 @@ function renderToast() {
     toastRoot.textContent = '';
     return;
   }
-
   toastRoot.className = toast.level || 'info';
   toastRoot.textContent = toast.message;
 }
 
+/* ============================================================
+   AUTH & RUNTIME
+   ============================================================ */
+
 function isRuntimeReady(auth) {
-  if (!auth || auth.signedIn !== true) {
-    return false;
-  }
+  if (!auth || auth.signedIn !== true) return false;
   const hasDevice = Boolean(auth.mediationDevice && auth.mediationDevice.id);
   const runtime = auth.runtime || {};
   return hasDevice && runtime.running === true && runtime.ready === true;
@@ -124,37 +160,39 @@ function updateStartVisibility() {
     appShell.classList.add('hidden');
   }
 
-  const runtime = state.auth && state.auth.runtime ? state.auth.runtime : null;
   if (state.startBusy) {
-    startStatus.textContent = state.startMessage || 'Starting...';
-    startStatus.className = 'small';
-  } else if (!ready && runtime && runtime.lastError) {
-    startStatus.textContent = String(runtime.lastError);
+    startButton.classList.add('hidden');
+    startSpinner.classList.add('visible');
+    startStatus.textContent = state.startMessage || 'Setting things up...';
     startStatus.className = 'small';
   } else if (!ready) {
-    startStatus.textContent = state.startMessage || 'Press Start to continue.';
+    startButton.classList.remove('hidden');
+    startSpinner.classList.remove('visible');
+    startStatus.textContent = '';
     startStatus.className = 'small muted';
   } else {
-    startStatus.textContent = 'Runtime ready.';
+    startButton.classList.add('hidden');
+    startSpinner.classList.remove('visible');
+    startStatus.textContent = '';
     startStatus.className = 'small muted';
   }
 
   startButton.disabled = Boolean(state.startBusy);
 }
 
+/* ============================================================
+   INVITE LINK PARSING
+   ============================================================ */
+
 function parseInviteLink(input) {
   const raw = String(input || '').trim();
-  if (!raw) {
-    return null;
-  }
+  if (!raw) return null;
 
   try {
     const url = new URL(raw);
     const caseId = url.searchParams.get('caseId') || '';
     const token = url.searchParams.get('token') || '';
-    if (!caseId || !token) {
-      return null;
-    }
+    if (!caseId || !token) return null;
     return {
       caseId,
       token,
@@ -165,9 +203,7 @@ function parseInviteLink(input) {
   } catch {
     const tokenMatch = raw.match(/token=([^&\s]+)/i);
     const caseMatch = raw.match(/caseId=([^&\s]+)/i);
-    if (!tokenMatch || !caseMatch) {
-      return null;
-    }
+    if (!tokenMatch || !caseMatch) return null;
 
     const ownerMatch = raw.match(/ownerDeviceId=([^&\s]+)/i);
     const gatewayMatch = raw.match(/gatewayUrl=([^&\s]+)/i);
@@ -189,17 +225,17 @@ function enrichInviteLink(baseLink) {
 
   try {
     const url = new URL(baseLink);
-    if (ownDeviceId) {
-      url.searchParams.set('ownerDeviceId', ownDeviceId);
-    }
-    if (gatewayUrl) {
-      url.searchParams.set('gatewayUrl', gatewayUrl);
-    }
+    if (ownDeviceId) url.searchParams.set('ownerDeviceId', ownDeviceId);
+    if (gatewayUrl) url.searchParams.set('gatewayUrl', gatewayUrl);
     return url.toString();
   } catch {
     return baseLink;
   }
 }
+
+/* ============================================================
+   CASE / PARTY HELPERS
+   ============================================================ */
 
 function getPartyState(caseData, partyId) {
   return caseData.partyParticipationById && caseData.partyParticipationById[partyId]
@@ -209,14 +245,10 @@ function getPartyState(caseData, partyId) {
 
 function choosePartyForCase(caseData) {
   const state = getState();
-  if (!caseData || !caseData.id || !Array.isArray(caseData.parties) || caseData.parties.length === 0) {
-    return '';
-  }
+  if (!caseData || !caseData.id || !Array.isArray(caseData.parties) || caseData.parties.length === 0) return '';
 
   const selected = state.partyByCase[caseData.id];
-  if (selected && caseData.parties.some((party) => party.id === selected)) {
-    return selected;
-  }
+  if (selected && caseData.parties.some((party) => party.id === selected)) return selected;
 
   const readyParty = caseData.parties.find((party) => getPartyState(caseData, party.id) === 'ready');
   if (readyParty) {
@@ -224,10 +256,7 @@ function choosePartyForCase(caseData) {
     return readyParty.id;
   }
 
-  const joinedParty = caseData.parties.find((party) => {
-    const s = getPartyState(caseData, party.id);
-    return s === 'joined';
-  });
+  const joinedParty = caseData.parties.find((party) => getPartyState(caseData, party.id) === 'joined');
   if (joinedParty) {
     state.partyByCase[caseData.id] = joinedParty.id;
     return joinedParty.id;
@@ -239,24 +268,19 @@ function choosePartyForCase(caseData) {
 
 function getCurrentParty(caseData) {
   const partyId = choosePartyForCase(caseData);
-  if (!partyId) {
-    return null;
-  }
+  if (!partyId) return null;
   const party = caseData.parties.find((entry) => entry.id === partyId);
   return party ? { partyId, party } : null;
 }
 
 function getPrivateThread(caseData, partyId) {
-  if (!caseData || !caseData.privateIntakeByPartyId) {
-    return { messages: [], summary: '', resolved: false };
-  }
+  if (!caseData || !caseData.privateIntakeByPartyId) return { messages: [], summary: '', resolved: false };
   return caseData.privateIntakeByPartyId[partyId] || { messages: [], summary: '', resolved: false };
 }
 
 function ensureCaseInList(caseData) {
-  const state = getState();
   upsertCase(caseData);
-
+  const state = getState();
   state.cases.sort((a, b) => {
     const at = new Date(a.updatedAt || a.createdAt || 0).getTime();
     const bt = new Date(b.updatedAt || b.createdAt || 0).getTime();
@@ -266,15 +290,16 @@ function ensureCaseInList(caseData) {
 
 function setCaseData(caseData) {
   const state = getState();
-  if (!caseData || !caseData.id) {
-    return;
-  }
-
+  if (!caseData || !caseData.id) return;
   state.caseId = caseData.id;
   state.caseData = caseData;
   choosePartyForCase(caseData);
   ensureCaseInList(caseData);
 }
+
+/* ============================================================
+   AUTH FLOWS
+   ============================================================ */
 
 async function refreshAuthStatus(options = {}) {
   const result = await api.auth.getStatus();
@@ -284,7 +309,7 @@ async function refreshAuthStatus(options = {}) {
   if (!options.silent && !isRuntimeReady(result)) {
     const runtime = result && result.runtime ? result.runtime : null;
     if (runtime && runtime.lastError) {
-      showToast(runtime.lastError, 'error', 5000);
+      showToast('Connection issue. Please try again.', 'error', 5000);
     }
   }
 
@@ -296,9 +321,7 @@ async function waitForRuntimeReady(timeoutMs = 75_000) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {
     const auth = await refreshAuthStatus({ silent: true });
-    if (isRuntimeReady(auth)) {
-      return auth;
-    }
+    if (isRuntimeReady(auth)) return auth;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return getState().auth;
@@ -307,26 +330,29 @@ async function waitForRuntimeReady(timeoutMs = 75_000) {
 async function startFlow() {
   const state = getState();
   state.startBusy = true;
-  state.startMessage = 'Starting OAuth and mediation runtime...';
+  state.startMessage = 'Setting things up...';
   updateStartVisibility();
 
   try {
     const signInResult = await api.auth.signIn();
     if (!signInResult || signInResult.ok !== true) {
-      throw new Error(normalizeError(signInResult, 'Sign in failed'));
+      throw new Error(normalizeError(signInResult, 'Unable to sign in'));
     }
+
+    state.startMessage = 'Almost ready...';
+    updateStartVisibility();
 
     const auth = await waitForRuntimeReady();
     if (!isRuntimeReady(auth)) {
-      throw new Error('Signed in, but runtime did not become ready.');
+      throw new Error('Having trouble connecting. Please try again.');
     }
 
-    state.startMessage = 'Runtime ready.';
-    showToast('Signed in and mediation runtime is ready.', 'success');
+    state.startMessage = '';
+    showToast('Welcome back!', 'success');
     await refreshCases();
     render();
   } catch (err) {
-    state.startMessage = normalizeError(err, 'Unable to start app');
+    state.startMessage = normalizeError(err, 'Unable to connect. Please try again.');
     showToast(state.startMessage, 'error', 5000);
   } finally {
     state.startBusy = false;
@@ -342,18 +368,19 @@ async function signOutFlow() {
   }
 
   resetState();
-  patchState({
-    startBusy: false,
-    startMessage: 'Press Start to continue.',
-  });
+  patchState({ startBusy: false, startMessage: '' });
   await refreshAuthStatus({ silent: true });
   render();
 }
 
+/* ============================================================
+   DATA FETCHING
+   ============================================================ */
+
 async function refreshCases() {
   const result = await api.mediation.list();
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, 'Failed to load cases'), 'error');
+    showToast(normalizeError(result, 'Unable to load your mediations'), 'error');
     return;
   }
 
@@ -381,7 +408,7 @@ async function refreshCases() {
 async function loadCase(caseId, options = {}) {
   const result = await api.mediation.get(caseId);
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, `Failed to load case ${caseId}`), 'error');
+    showToast(normalizeError(result, 'Unable to load this mediation'), 'error');
     return null;
   }
 
@@ -396,92 +423,78 @@ async function loadCase(caseId, options = {}) {
   return result.case;
 }
 
-function caseStatusLine(caseData, partyId) {
-  if (!caseData) {
-    return 'No status';
-  }
+/* ============================================================
+   STATUS HELPERS
+   ============================================================ */
 
-  if (caseData.phase === 'group_chat') {
-    return 'Mediation in progress';
-  }
-  if (caseData.phase === 'resolved') {
-    return 'Resolved';
-  }
-  if (caseData.phase === 'closed') {
-    return 'Closed';
-  }
+function caseStatusLine(caseData, partyId) {
+  if (!caseData) return '';
+
+  if (caseData.phase === 'group_chat') return 'Mediation in progress';
+  if (caseData.phase === 'resolved') return 'Successfully resolved';
+  if (caseData.phase === 'closed') return 'Closed';
 
   const ownState = getPartyState(caseData, partyId);
   const otherParties = caseData.parties.filter((party) => party.id !== partyId);
   const invitedOther = otherParties.find((party) => getPartyState(caseData, party.id) === 'invited');
   const joinedOther = otherParties.find((party) => getPartyState(caseData, party.id) === 'joined');
 
-  if (ownState === 'invited') {
-    return 'You have not joined yet';
-  }
-  if (ownState === 'joined' && invitedOther) {
-    return `Waiting for ${invitedOther.displayName} to join`;
-  }
-  if (ownState === 'joined') {
-    return 'Your intake in progress';
-  }
-  if (ownState === 'ready' && invitedOther) {
-    return `Waiting for ${invitedOther.displayName} to join`;
-  }
-  if (ownState === 'ready' && joinedOther) {
-    return `Waiting for ${joinedOther.displayName} to finish intake`;
-  }
+  if (ownState === 'invited') return 'Waiting for you to join';
+  if (ownState === 'joined' && invitedOther) return `Waiting for ${invitedOther.displayName}`;
+  if (ownState === 'joined') return 'Preparation in progress';
+  if (ownState === 'ready' && invitedOther) return `Waiting for ${invitedOther.displayName} to join`;
+  if (ownState === 'ready' && joinedOther) return `Waiting for ${joinedOther.displayName} to finish`;
 
-  return 'Mediation active';
+  return 'Active';
 }
+
+/* ============================================================
+   VIEW ROUTER
+   ============================================================ */
 
 function resolveView() {
   const state = getState();
   const caseData = state.caseData;
 
-  if (!caseData) {
-    return 'dashboard';
-  }
-
-  if (state.activeSubview === 'private-intake') {
-    return 'private-intake';
-  }
-  if (state.activeSubview === 'group-chat') {
-    return 'group-chat';
-  }
-
-  if (caseData.phase === 'resolved') {
-    return 'resolved';
-  }
-  if (caseData.phase === 'closed') {
-    return 'closed';
-  }
-
+  if (!caseData) return 'dashboard';
+  if (state.activeSubview === 'private-intake') return 'private-intake';
+  if (state.activeSubview === 'intake-summary') return 'intake-summary';
+  if (state.activeSubview === 'group-chat') return 'group-chat';
+  if (caseData.phase === 'resolved') return 'resolved';
+  if (caseData.phase === 'closed') return 'closed';
   return 'case-detail';
 }
+
+/* ============================================================
+   RENDER: PARTICIPANT ROW
+   ============================================================ */
 
 function renderParticipantRow(caseData, party, currentPartyId) {
   const state = getPartyState(caseData, party.id);
   const thread = getPrivateThread(caseData, party.id);
-  let label = 'Has not joined yet';
+  let label = 'Waiting to join';
   if (state === 'joined') {
-    label = thread.messages.length > 0 ? 'Intake in progress' : 'Joined - intake not started';
+    label = thread.messages.length > 0 ? 'Preparing' : 'Joined';
   }
-  if (state === 'ready') {
-    label = 'Ready';
-  }
+  if (state === 'ready') label = 'Ready';
 
   const isYou = party.id === currentPartyId;
+  const avatarCls = getAvatarClass(party.id);
+
   return `
     <div class="participant-row">
       <div class="participant">
-        <span class="participant-dot ${escapeHtml(state)}"></span>
-        <strong>${escapeHtml(isYou ? `You (${party.displayName})` : party.displayName)}</strong>
+        <span class="avatar avatar-sm ${avatarCls}">${escapeHtml(getInitial(party.displayName))}</span>
+        <strong>${escapeHtml(isYou ? `${party.displayName} (You)` : party.displayName)}</strong>
       </div>
       <span class="status-line">${escapeHtml(label)}</span>
     </div>
   `;
 }
+
+/* ============================================================
+   RENDER: CASE CARD
+   ============================================================ */
 
 function renderCaseCard(caseData) {
   const state = getState();
@@ -489,58 +502,68 @@ function renderCaseCard(caseData) {
     || (caseData.parties[0] ? caseData.parties[0].id : '');
   const status = caseStatusLine(caseData, currentPartyId);
 
-  const otherLines = caseData.parties.map((party) => {
-    const s = getPartyState(caseData, party.id);
-    return `${party.displayName}: ${s}`;
-  }).join(' • ');
+  const avatars = caseData.parties.map((party) => {
+    const cls = getAvatarClass(party.id);
+    return `<span class="avatar avatar-sm ${cls}">${escapeHtml(getInitial(party.displayName))}</span>`;
+  }).join('');
 
-  const phaseClass = caseData.phase === 'resolved' || caseData.phase === 'closed'
-    ? caseData.phase
-    : '';
+  const phaseClass = (caseData.phase === 'resolved' || caseData.phase === 'closed')
+    ? `phase-${caseData.phase}` : '';
 
   return `
     <button class="case-card ${phaseClass}" data-action="open-case" data-case-id="${escapeHtml(caseData.id)}">
       <div class="case-head">
         <p class="case-topic">${escapeHtml(caseData.topic)}</p>
-        <span class="case-meta">${escapeHtml(formatShortDate(caseData.updatedAt || caseData.createdAt))}</span>
+        <span class="phase-pill ${phasePillClass(caseData.phase)}">${escapeHtml(friendlyPhase(caseData.phase))}</span>
       </div>
       <div class="status-line">${escapeHtml(status)}</div>
-      <div class="case-meta">${escapeHtml(otherLines)}</div>
+      <div class="case-card-footer">
+        <div class="case-avatars">${avatars}</div>
+        <span class="case-meta">${escapeHtml(formatRelativeTime(caseData.updatedAt || caseData.createdAt))}</span>
+      </div>
     </button>
   `;
 }
 
+/* ============================================================
+   RENDER: DASHBOARD VIEW
+   ============================================================ */
+
 function renderDashboardView() {
   const state = getState();
   const auth = state.auth || {};
+  const email = auth.email || '';
+  const userInitial = email ? email.charAt(0).toUpperCase() : 'U';
+  const isOnline = isRuntimeReady(auth);
 
   const createForm = state.createFormExpanded
     ? `
       <form class="panel stack" data-submit-action="create-case">
-        <h3 class="section-title">Start New Mediation</h3>
+        <h3 class="section-title">Start a New Mediation</h3>
+        <p class="muted small">Set up a mediation session between two parties.</p>
         <div class="grid-2">
           <label class="stack">
             <span class="small muted">Topic</span>
-            <input name="topic" required placeholder="Co-founder governance dispute" />
+            <input name="topic" required placeholder="e.g. Partnership agreement dispute" />
           </label>
           <label class="stack">
-            <span class="small muted">Description</span>
-            <input name="description" placeholder="Optional" />
+            <span class="small muted">Description (optional)</span>
+            <input name="description" placeholder="Brief context about the situation" />
           </label>
         </div>
         <div class="grid-2">
           <label class="stack">
             <span class="small muted">Your name</span>
-            <input name="partyAName" required value="Alex" />
+            <input name="partyAName" required placeholder="Your name" />
           </label>
           <label class="stack">
-            <span class="small muted">Other party</span>
-            <input name="partyBName" required value="Blair" />
+            <span class="small muted">Other party's name</span>
+            <input name="partyBName" required placeholder="Their name" />
           </label>
         </div>
         <div class="view-actions">
-          <button type="submit" class="primary">Create & Open</button>
-          <button type="button" data-action="toggle-create-form">Cancel</button>
+          <button type="submit" class="primary">Create Mediation</button>
+          <button type="button" class="ghost" data-action="toggle-create-form">Cancel</button>
         </div>
       </form>
     `
@@ -549,14 +572,15 @@ function renderDashboardView() {
   const joinForm = state.joinFormExpanded
     ? `
       <form class="panel stack" data-submit-action="preview-invite">
-        <h3 class="section-title">Join From Invite Link</h3>
+        <h3 class="section-title">Join a Mediation</h3>
+        <p class="muted small">Paste the invite link you received.</p>
         <label class="stack">
-          <span class="small muted">Invite URL</span>
-          <input name="inviteLink" value="${escapeHtml(state.joinLinkInput || '')}" placeholder="https://mediate.app/join?caseId=...&token=..." required />
+          <span class="small muted">Invite link</span>
+          <input name="inviteLink" value="${escapeHtml(state.joinLinkInput || '')}" placeholder="Paste your invite link here..." required />
         </label>
         <div class="view-actions">
-          <button type="submit" class="primary">Preview</button>
-          <button type="button" data-action="toggle-join-form">Cancel</button>
+          <button type="submit" class="primary">Continue</button>
+          <button type="button" class="ghost" data-action="toggle-join-form">Cancel</button>
         </div>
       </form>
     `
@@ -564,21 +588,20 @@ function renderDashboardView() {
 
   const preview = state.joinPreview
     ? `
-      <div class="join-preview">
-        <strong>Preview</strong>
-        <div>Topic: ${escapeHtml(state.joinPreview.topic || '(unknown)')}</div>
-        <div>Case: ${escapeHtml(state.joinPreview.caseId || '')}</div>
-        <label class="stack">
+      <div class="join-preview panel">
+        <h4 style="margin: 0 0 8px; font-size: var(--text-base);">You've been invited</h4>
+        <div class="muted small">Topic: <strong style="color: var(--ink);">${escapeHtml(state.joinPreview.topic || '(unknown)')}</strong></div>
+        <label class="stack" style="margin-top: 8px;">
           <span class="small muted">Join as</span>
           <select name="joinParty" id="join-party-select">
             ${(state.joinPreview.parties || []).map((party) => {
               const disabled = party.state === 'ready' ? 'disabled' : '';
               const selected = state.joinPartyId === party.id ? 'selected' : '';
-              return `<option value="${escapeHtml(party.id)}" ${disabled} ${selected}>${escapeHtml(`${party.displayName} (${party.state})`)}</option>`;
+              return `<option value="${escapeHtml(party.id)}" ${disabled} ${selected}>${escapeHtml(party.displayName)}${party.state === 'ready' ? ' (already joined)' : ''}</option>`;
             }).join('')}
           </select>
         </label>
-        <div class="view-actions">
+        <div class="view-actions" style="margin-top: 8px;">
           <button type="button" class="primary" data-action="join-preview">Join Mediation</button>
         </div>
       </div>
@@ -586,27 +609,39 @@ function renderDashboardView() {
     : '';
 
   const casesHtml = state.cases.length > 0
-    ? `<div class="case-list">${state.cases.map((caseData) => renderCaseCard(caseData)).join('')}</div>`
-    : '<div class="empty-state">No mediations yet. Start one or join from an invite link above.</div>';
+    ? `<div class="case-list">${state.cases.map((c) => renderCaseCard(c)).join('')}</div>`
+    : `
+      <div class="empty-state">
+        <div class="empty-title">No mediations yet</div>
+        <div class="empty-desc">Start a new mediation or join one from an invite link to get going.</div>
+      </div>
+    `;
 
   return `
     <div class="dashboard-grid">
       <section class="panel">
         <div class="dashboard-header">
-          <div class="dashboard-title">
-            <h2>Mediation</h2>
-            <p class="muted small">${escapeHtml(auth.email || 'Signed in')} • ${escapeHtml(auth.mediationDevice?.id || 'no-device')}</p>
+          <div class="dashboard-brand">
+            <span class="brand-name">Mediate</span>
           </div>
-          <div class="row wrap">
-            <span class="badge ${isRuntimeReady(auth) ? 'ok' : 'err'}">${isRuntimeReady(auth) ? 'Runtime online' : 'Runtime offline'}</span>
-            <button data-action="sign-out">Sign Out</button>
+          <div class="dashboard-user">
+            <div class="user-avatar">
+              <span class="avatar avatar-a">${escapeHtml(userInitial)}</span>
+              <span class="status-dot ${isOnline ? '' : 'offline'}"></span>
+            </div>
+            <button class="ghost" data-action="sign-out" style="font-size: var(--text-xs);">Sign Out</button>
           </div>
         </div>
 
         <div class="actions-row">
-          <button class="primary" data-action="toggle-create-form">+ New Mediation</button>
-          <button data-action="toggle-join-form">Join From Invite Link</button>
-          <button data-action="refresh-cases">Refresh</button>
+          <div class="action-card" data-action="toggle-create-form">
+            <div class="action-title">+ New Mediation</div>
+            <div class="action-desc">Start a guided mediation session</div>
+          </div>
+          <div class="action-card secondary" data-action="toggle-join-form">
+            <div class="action-title">Join from Invite</div>
+            <div class="action-desc">Have an invite link? Join here</div>
+          </div>
         </div>
       </section>
 
@@ -615,19 +650,21 @@ function renderDashboardView() {
       ${preview}
 
       <section class="panel">
-        <h3 class="section-title">Your Cases</h3>
+        <h3 class="section-title">Your Mediations</h3>
         ${casesHtml}
       </section>
     </div>
   `;
 }
 
+/* ============================================================
+   RENDER: CASE DETAIL VIEW
+   ============================================================ */
+
 function renderCaseDetailView() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return '<section class="panel">Case not found.</section>';
-  }
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
 
   const current = getCurrentParty(caseData);
   const currentPartyId = current ? current.partyId : '';
@@ -637,38 +674,66 @@ function renderCaseDetailView() {
   const anyoneInvited = caseData.parties.some((party) => getPartyState(caseData, party.id) === 'invited');
   const inviteLink = enrichInviteLink(caseData.inviteLink?.url || '');
 
-  let intakeActionText = 'Start Your Intake';
+  // Progress stepper
+  const steps = [
+    { label: 'Joined', done: ownState !== 'invited' },
+    { label: 'Prepared', done: ownState === 'ready' },
+    { label: 'Mediation', done: caseData.phase === 'group_chat' || caseData.phase === 'resolved' || caseData.phase === 'closed' },
+    { label: 'Resolved', done: caseData.phase === 'resolved' || caseData.phase === 'closed' },
+  ];
+  let activeIndex = steps.findIndex((s) => !s.done);
+  if (activeIndex === -1) activeIndex = steps.length;
+
+  const stepperHtml = steps.map((step, i) => {
+    const cls = step.done ? 'completed' : (i === activeIndex ? 'active' : '');
+    const line = i < steps.length - 1
+      ? `<div class="step-line ${i < activeIndex ? 'completed' : ''}"></div>`
+      : '';
+    return `<div class="step ${cls}"><span class="step-dot"></span><span class="step-label">${step.label}</span></div>${line}`;
+  }).join('');
+
+  let intakeHeading = 'Start Your Preparation';
+  let intakeDesc = 'Share your perspective privately with your AI coach before the mediation begins.';
   if (ownState === 'joined' && thread.messages.length > 0 && !thread.resolved) {
-    intakeActionText = 'Continue Your Intake';
+    intakeHeading = 'Continue Your Preparation';
+    intakeDesc = 'Pick up where you left off with your AI coach.';
   }
   if (ownState === 'ready') {
-    intakeActionText = 'Review Your Intake';
+    intakeHeading = 'Review Your Preparation';
+    intakeDesc = 'You\'re ready. Review your notes while waiting for the other party.';
   }
 
-  const intakeDescription = ownState === 'ready'
-    ? 'Your summary is complete. You can review your intake while waiting.'
-    : 'Private coaching helps prepare your perspective before mediation.';
-
   const waitingText = ownState === 'ready' && !everyoneReady
-    ? '<div class="waiting-panel">You are ready. Waiting for the other party to complete intake.</div>'
+    ? '<div class="waiting-panel">You\'re all set. Waiting for the other party to finish preparing.</div>'
     : '';
 
-  const groupAction = everyoneReady
-    ? '<button class="primary" data-action="open-group">Enter Mediation</button>'
+  const groupCta = everyoneReady
+    ? `
+      <section class="cta-section">
+        <div class="cta-heading">Ready to Begin</div>
+        <div class="cta-desc">Both parties are prepared. Start the mediation session now.</div>
+        <button class="cta" data-action="open-group">Enter Mediation</button>
+      </section>
+    `
     : '';
 
   return `
     <div class="detail-grid">
       <section class="topbar">
         <div class="row">
-          <button data-action="back-dashboard">← Back</button>
+          <button class="back-btn" data-action="back-dashboard">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
           <div>
             <h2>${escapeHtml(caseData.topic)}</h2>
-            <div class="meta">${escapeHtml(caseData.description || 'No description')}</div>
+            <div class="meta">${escapeHtml(caseData.description || '')}</div>
           </div>
         </div>
-        <div class="badge">${escapeHtml(current?.party?.displayName || '')}</div>
+        <span class="phase-pill ${phasePillClass(caseData.phase)}">${escapeHtml(friendlyPhase(caseData.phase))}</span>
       </section>
+
+      <div class="progress-stepper">${stepperHtml}</div>
 
       <section class="panel stack">
         <h3 class="section-title">Participants</h3>
@@ -677,29 +742,35 @@ function renderCaseDetailView() {
         </div>
       </section>
 
-      <section class="panel stack">
-        <h3 class="section-title">Your Intake</h3>
-        <p class="muted small">${escapeHtml(intakeDescription)}</p>
-        <div class="view-actions">
-          <button class="primary" data-action="open-intake">${escapeHtml(intakeActionText)} →</button>
-          ${groupAction}
-        </div>
+      <section class="cta-section">
+        <div class="cta-heading">${escapeHtml(intakeHeading)}</div>
+        <div class="cta-desc">${escapeHtml(intakeDesc)}</div>
+        <button class="cta" data-action="open-intake">${escapeHtml(intakeHeading)}</button>
         ${waitingText}
       </section>
 
+      ${groupCta}
+
       ${anyoneInvited ? `
         <section class="panel stack">
-          <h3 class="section-title">Invite</h3>
-          <div class="invite-box">${escapeHtml(inviteLink)}</div>
-          <div class="view-actions">
-            <button data-action="copy-invite">Copy Link</button>
-            <button data-action="open-share-modal">Share</button>
+          <h3 class="section-title">Invite the Other Party</h3>
+          <p class="muted small">Share this link so the other party can join.</p>
+          <div class="invite-card">
+            <div class="invite-link-display">${escapeHtml(inviteLink)}</div>
+            <div class="view-actions">
+              <button class="primary" data-action="copy-invite">Copy Link</button>
+              <button class="ghost" data-action="open-share-modal">Share</button>
+            </div>
           </div>
         </section>
       ` : ''}
     </div>
   `;
 }
+
+/* ============================================================
+   RENDER: MESSAGE BUBBLE
+   ============================================================ */
 
 function renderMessageBubble(message, caseData, currentPartyId) {
   const authorType = message.authorType || 'system';
@@ -711,7 +782,25 @@ function renderMessageBubble(message, caseData, currentPartyId) {
   if (authorType === 'mediator_llm') {
     return `
       <div class="msg-bubble msg-mediator">
-        <div class="msg-author">Mediator</div>
+        <div class="msg-header">
+          <span class="avatar avatar-sm avatar-ai">M</span>
+          <span class="msg-author">Mediator</span>
+          <span class="msg-ai-badge">AI</span>
+        </div>
+        <div class="msg-content">${renderMarkdownUntrusted(message.text || '')}</div>
+        <div class="msg-ts">${escapeHtml(formatTime(message.createdAt))}</div>
+      </div>
+    `;
+  }
+
+  if (authorType === 'party_llm') {
+    return `
+      <div class="msg-bubble msg-other">
+        <div class="msg-header">
+          <span class="avatar avatar-sm avatar-ai">C</span>
+          <span class="msg-author">Your Coach</span>
+          <span class="msg-ai-badge">AI</span>
+        </div>
         <div class="msg-content">${renderMarkdownUntrusted(message.text || '')}</div>
         <div class="msg-ts">${escapeHtml(formatTime(message.createdAt))}</div>
       </div>
@@ -720,28 +809,35 @@ function renderMessageBubble(message, caseData, currentPartyId) {
 
   const isOwn = message.authorPartyId === currentPartyId;
   const cls = isOwn ? 'msg-own' : 'msg-other';
-  const partyName = caseData.parties.find((party) => party.id === message.authorPartyId)?.displayName || message.authorPartyId || 'Party';
+  const party = caseData.parties.find((p) => p.id === message.authorPartyId);
+  const partyName = party?.displayName || 'Party';
+  const avatarCls = getAvatarClass(message.authorPartyId);
 
   return `
     <div class="msg-bubble ${cls}">
-      ${isOwn ? '' : `<div class="msg-author">${escapeHtml(partyName)}</div>`}
+      ${isOwn ? '' : `
+        <div class="msg-header">
+          <span class="avatar avatar-sm ${avatarCls}">${escapeHtml(getInitial(partyName))}</span>
+          <span class="msg-author">${escapeHtml(partyName)}</span>
+        </div>
+      `}
       <div class="msg-content">${renderMarkdownUntrusted(message.text || '')}</div>
       <div class="msg-ts">${escapeHtml(formatTime(message.createdAt))}</div>
     </div>
   `;
 }
 
+/* ============================================================
+   RENDER: PRIVATE INTAKE VIEW
+   ============================================================ */
+
 function renderPrivateIntakeView() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return '<section class="panel">Case not found.</section>';
-  }
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
 
   const current = getCurrentParty(caseData);
-  if (!current) {
-    return '<section class="panel">Party context missing.</section>';
-  }
+  if (!current) return '<section class="panel">Unable to load your session.</section>';
 
   const partyId = current.partyId;
   const partyState = getPartyState(caseData, partyId);
@@ -756,11 +852,11 @@ function renderPrivateIntakeView() {
   const messages = thread.messages || [];
   const messageList = messages.length > 0
     ? messages.map((message) => renderMessageBubble(message, caseData, partyId)).join('')
-    : '<div class="msg-system">Your private intake starts here. Share your perspective, goals, and constraints.</div>';
+    : '<div class="msg-system">Welcome! Share your perspective on the situation. Everything here is private and confidential.</div>';
 
   const ready = partyState === 'ready';
   const waitingText = ready
-    ? `<div class="waiting-panel">You're all set. ${otherNotJoined ? 'Waiting for the other party to join and complete intake.' : 'Waiting for the other party to finish intake.'}</div>`
+    ? `<div class="waiting-panel">You're all set. ${otherNotJoined ? 'Waiting for the other party to join.' : 'Waiting for the other party to finish preparing.'}</div>`
     : '';
 
   const draftValue = state.chatDrafts.get(draftKey) || '';
@@ -769,16 +865,19 @@ function renderPrivateIntakeView() {
     <div class="chat-shell">
       <section class="topbar">
         <div class="row">
-          <button data-action="back-case">← Back</button>
+          <button class="back-btn" data-action="back-case">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
           <div>
             <h2>${escapeHtml(caseData.topic)}</h2>
-            <div class="meta">Private intake with your coach</div>
+            <div class="meta">Private session with your AI coach</div>
           </div>
         </div>
-        <div class="badge">${escapeHtml(current.party.displayName)}</div>
+        <span class="badge brand">${escapeHtml(current.party.displayName)}</span>
       </section>
 
-      ${otherNotJoined ? '<div class="system-banner">The other party has not joined yet. You can continue your intake now.</div>' : ''}
+      ${otherNotJoined ? '<div class="system-banner">The other party hasn\'t joined yet. You can continue preparing in the meantime.</div>' : ''}
 
       <section class="chat-messages" role="log" aria-live="polite">
         ${messageList}
@@ -786,40 +885,105 @@ function renderPrivateIntakeView() {
 
       ${ready ? waitingText : `
         <form class="chat-input-area" data-submit-action="send-private-message">
-          <textarea data-draft-key="${escapeHtml(draftKey)}" name="privateMessage" placeholder="Type your message..." rows="1">${escapeHtml(draftValue)}</textarea>
+          <textarea data-draft-key="${escapeHtml(draftKey)}" name="privateMessage" placeholder="Share your thoughts..." rows="1">${escapeHtml(draftValue)}</textarea>
           <div class="chat-input-actions">
-            <button type="button" data-action="run-intake-template">Generate Summary Draft</button>
             <button type="submit" class="primary">Send</button>
           </div>
         </form>
-      `}
 
-      <section class="summary-panel stack">
-        <div class="row">
-          <h3 class="section-title" style="margin:0;">Summary & Ready</h3>
-          <button data-action="toggle-summary-panel">${state.summaryPanelExpanded ? 'Collapse' : 'Expand'}</button>
-        </div>
-
-        ${state.summaryPanelExpanded ? `
-          <textarea data-draft-key="${escapeHtml(summaryKey)}" name="summaryText" placeholder="Write a concise private summary...">${escapeHtml(summaryDraft)}</textarea>
-          <div class="consent-settings">
-            <label>
-              <input type="checkbox" id="consent-share-summary" ${consent.allowSummaryShare ? 'checked' : ''} />
-              <span>Allow sharing a summary with the other party</span>
-            </label>
-            <label>
-              <input type="checkbox" id="consent-direct-quote" ${consent.allowDirectQuote ? 'checked' : ''} />
-              <span>Allow direct quotes (otherwise paraphrase only)</span>
-            </label>
-          </div>
-          <div class="view-actions">
-            <button class="primary" data-action="save-summary-ready">Save Summary & Mark Ready</button>
-          </div>
+        ${messages.length >= 2 ? `
+          <section class="ready-prompt">
+            <span class="ready-prompt-text">Ready to move forward?</span>
+            <button class="primary" data-action="open-intake-summary">Summarize My Perspective</button>
+          </section>
         ` : ''}
-      </section>
+      `}
     </div>
   `;
 }
+
+/* ============================================================
+   RENDER: INTAKE SUMMARY (new screen)
+   ============================================================ */
+
+function renderIntakeSummaryView() {
+  const state = getState();
+  const caseData = state.caseData;
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
+
+  const current = getCurrentParty(caseData);
+  if (!current) return '<section class="panel">Unable to load your session.</section>';
+
+  const partyId = current.partyId;
+  const partyState = getPartyState(caseData, partyId);
+  const thread = getPrivateThread(caseData, partyId);
+  const summaryKey = `summary:${caseData.id}:${partyId}`;
+  const summaryDraft = state.chatDrafts.get(summaryKey) || thread.summary || '';
+  const consent = caseData.consent?.byPartyId?.[partyId] || { allowSummaryShare: true, allowDirectQuote: false };
+  const ready = partyState === 'ready';
+
+  const otherNotJoined = caseData.parties.some((party) => party.id !== partyId && getPartyState(caseData, party.id) === 'invited');
+
+  return `
+    <div class="stack fade-in">
+      <section class="topbar">
+        <div class="row">
+          <button class="back-btn" data-action="back-to-intake">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back to Chat
+          </button>
+          <div>
+            <h2>${escapeHtml(caseData.topic)}</h2>
+            <div class="meta">Review your summary</div>
+          </div>
+        </div>
+        <span class="badge brand">${escapeHtml(current.party.displayName)}</span>
+      </section>
+
+      ${ready ? `
+        <div class="waiting-panel">You're all set. ${otherNotJoined ? 'Waiting for the other party to join.' : 'Waiting for the other party to finish preparing.'}</div>
+      ` : `
+        <section class="panel stack">
+          <h3 class="section-title">Your Summary</h3>
+          <p class="muted small">Review and edit this summary of your perspective. The mediator will use it to understand your position.</p>
+          <textarea data-draft-key="${escapeHtml(summaryKey)}" name="summaryText" placeholder="Summarize your key points and what you'd like to achieve..." style="min-height: 140px;">${escapeHtml(summaryDraft)}</textarea>
+          ${!summaryDraft ? `
+            <button class="ghost" data-action="run-intake-template" style="align-self: flex-start;">Generate from conversation</button>
+          ` : ''}
+        </section>
+
+        <section class="panel stack">
+          <h3 class="section-title">Sharing Preferences</h3>
+          <p class="muted small">Control what the mediator can share with the other party.</p>
+          <div class="consent-settings">
+            <label>
+              <div class="toggle-switch">
+                <input type="checkbox" id="consent-share-summary" ${consent.allowSummaryShare ? 'checked' : ''} />
+                <span class="toggle-track"></span>
+              </div>
+              <span>Allow sharing a summary with the other party</span>
+            </label>
+            <label>
+              <div class="toggle-switch">
+                <input type="checkbox" id="consent-direct-quote" ${consent.allowDirectQuote ? 'checked' : ''} />
+                <span class="toggle-track"></span>
+              </div>
+              <span>Allow direct quotes (otherwise paraphrase only)</span>
+            </label>
+          </div>
+        </section>
+
+        <section style="text-align: center; padding: var(--sp-4) 0;">
+          <button class="cta" data-action="save-summary-ready">I'm Ready for Mediation</button>
+        </section>
+      `}
+    </div>
+  `;
+}
+
+/* ============================================================
+   RENDER: COACH PANEL
+   ============================================================ */
 
 function findActiveDraft(caseData, partyId) {
   const state = getState();
@@ -838,7 +1002,6 @@ function findActiveDraft(caseData, partyId) {
     state.activeDraftByCase[caseData.id] = draft.id;
     return draft;
   }
-
   return null;
 }
 
@@ -851,20 +1014,26 @@ function renderCoachPanel(caseData, partyId, overlayMode = false) {
   const composeMessages = draft
     ? draft.composeMessages.map((entry) => `
       <div class="msg-bubble ${entry.author === 'party' ? 'msg-own' : 'msg-other'}">
-        ${entry.author === 'party' ? '' : '<div class="msg-author">Coach</div>'}
+        ${entry.author === 'party' ? '' : `
+          <div class="msg-header">
+            <span class="avatar avatar-sm avatar-ai">C</span>
+            <span class="msg-author">Coach</span>
+            <span class="msg-ai-badge">AI</span>
+          </div>
+        `}
         <div class="msg-content">${renderMarkdownUntrusted(entry.text || '')}</div>
         <div class="msg-ts">${escapeHtml(formatTime(entry.createdAt))}</div>
       </div>
     `).join('')
-    : '<div class="msg-system">Start by drafting what you want to say. The coach will suggest a cleaner version.</div>';
+    : '<div class="msg-system">Describe what you want to say. Your coach will help you refine it.</div>';
 
   const suggestedText = draft && draft.suggestedText ? draft.suggestedText : '';
 
   return `
     <aside class="coach-panel ${overlayMode ? 'overlay' : ''}" role="dialog" aria-modal="${overlayMode ? 'true' : 'false'}">
       <div class="row" style="justify-content:space-between;">
-        <h3 class="section-title" style="margin:0;">Draft with Coach</h3>
-        <button data-action="close-coach-panel">Close</button>
+        <h3 class="section-title" style="margin:0;">Drafting Assistant</h3>
+        <button class="ghost" data-action="close-coach-panel">Close</button>
       </div>
 
       <section class="chat-messages" role="log" aria-live="polite" style="min-height:200px; max-height:36vh;">
@@ -874,18 +1043,18 @@ function renderCoachPanel(caseData, partyId, overlayMode = false) {
       <form class="chat-input-area" data-submit-action="send-draft-message">
         <textarea data-draft-key="${escapeHtml(draftInputKey)}" name="draftMessage" placeholder="Describe what you want to say..." rows="2">${escapeHtml(draftInput)}</textarea>
         <div class="chat-input-actions">
-          ${draft ? '<button type="button" data-action="run-draft-suggestion">Generate Suggestion</button>' : ''}
+          ${draft ? '<button type="button" class="ghost" data-action="run-draft-suggestion">Get Suggestion</button>' : ''}
           <button type="submit" class="primary">Send to Coach</button>
         </div>
       </form>
 
       ${suggestedText ? `
         <div class="suggestion">
-          <div class="small muted">Suggested message</div>
+          <div class="small muted" style="margin-bottom: 6px;">Suggested message</div>
           <textarea name="approvedText" id="draft-approved-text">${escapeHtml(suggestedText)}</textarea>
-          <div class="view-actions" style="margin-top:8px;">
-            <button class="success" data-action="approve-draft">Approve & Send</button>
-            <button class="warning" data-action="reject-draft">Reject & Keep Drafting</button>
+          <div class="view-actions" style="margin-top: 8px;">
+            <button class="success" data-action="approve-draft">Send This Message</button>
+            <button class="ghost" data-action="reject-draft">Keep Drafting</button>
           </div>
         </div>
       ` : ''}
@@ -893,17 +1062,17 @@ function renderCoachPanel(caseData, partyId, overlayMode = false) {
   `;
 }
 
+/* ============================================================
+   RENDER: GROUP CHAT VIEW
+   ============================================================ */
+
 function renderGroupChatView() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return '<section class="panel">Case not found.</section>';
-  }
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
 
   const current = getCurrentParty(caseData);
-  if (!current) {
-    return '<section class="panel">Party context missing.</section>';
-  }
+  if (!current) return '<section class="panel">Unable to load your session.</section>';
 
   const partyId = current.partyId;
   const messages = caseData.groupChat?.messages || [];
@@ -912,22 +1081,30 @@ function renderGroupChatView() {
   const panelOpen = state.coachPanelOpen === true;
   const overlayMode = panelOpen && window.innerWidth < 1100;
 
+  const participantBadges = caseData.parties.map((party) => {
+    const avatarCls = getAvatarClass(party.id);
+    return `
+      <span class="badge">
+        <span class="avatar avatar-sm ${avatarCls}" style="width:20px;height:20px;font-size:10px;">${escapeHtml(getInitial(party.displayName))}</span>
+        ${escapeHtml(party.displayName)}
+      </span>
+    `;
+  }).join('');
+
   return `
     <div class="chat-shell">
       <section class="topbar">
         <div class="row">
-          <button data-action="back-case">← Back</button>
+          <button class="back-btn" data-action="back-case">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
           <div>
             <h2>${escapeHtml(caseData.topic)}</h2>
-            <div class="meta">Group mediation in progress</div>
+            <div class="meta">Mediation session</div>
           </div>
         </div>
-        <div class="row wrap">
-          ${caseData.parties.map((party) => {
-            const st = getPartyState(caseData, party.id);
-            return `<span class="badge"><span class="participant-dot ${escapeHtml(st)}"></span>${escapeHtml(party.displayName)}</span>`;
-          }).join('')}
-        </div>
+        <div class="row wrap">${participantBadges}</div>
       </section>
 
       <div class="chat-layout ${panelOpen && !overlayMode ? 'with-coach' : ''}">
@@ -935,19 +1112,19 @@ function renderGroupChatView() {
           <section class="chat-messages" role="log" aria-live="polite">
             ${messages.length > 0
               ? messages.map((message) => renderMessageBubble(message, caseData, partyId)).join('')
-              : '<div class="msg-system">Group chat will appear here when messages are sent.</div>'}
+              : '<div class="msg-system">The mediation session has started. Share your thoughts openly and respectfully.</div>'}
           </section>
 
           <form class="chat-input-area ${panelOpen ? 'disabled' : ''}" data-submit-action="send-group-message">
             <textarea data-draft-key="${escapeHtml(groupDraftKey)}" name="groupMessage" placeholder="Type your message..." rows="2" ${panelOpen ? 'disabled' : ''}>${escapeHtml(groupDraftText)}</textarea>
             <div class="chat-input-actions">
-              <button type="button" data-action="open-coach-panel" ${panelOpen ? 'disabled' : ''}>Draft with Coach ▸</button>
-              <button type="submit" class="primary" ${panelOpen ? 'disabled' : ''}>Send Direct</button>
+              <button type="button" class="ghost" data-action="open-coach-panel" ${panelOpen ? 'disabled' : ''}>Draft with Coach</button>
+              <button type="submit" class="primary" ${panelOpen ? 'disabled' : ''}>Send</button>
             </div>
           </form>
 
-          <div class="view-actions">
-            <button data-action="open-resolve-prompt">Resolve Case</button>
+          <div style="display: flex; justify-content: flex-end;">
+            <button class="ghost" data-action="open-resolve-prompt" style="font-size: var(--text-xs); color: var(--muted);">Resolve this mediation</button>
           </div>
         </div>
 
@@ -959,12 +1136,14 @@ function renderGroupChatView() {
   `;
 }
 
+/* ============================================================
+   RENDER: RESOLVED VIEW
+   ============================================================ */
+
 function renderResolvedView() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return '<section class="panel">Case not found.</section>';
-  }
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
 
   const transcript = (caseData.groupChat?.messages || [])
     .map((message) => {
@@ -979,21 +1158,29 @@ function renderResolvedView() {
     <div class="stack">
       <section class="topbar">
         <div class="row">
-          <button data-action="back-dashboard">← Back</button>
+          <button class="back-btn" data-action="back-dashboard">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
           <div>
             <h2>${escapeHtml(caseData.topic)}</h2>
-            <div class="meta">Resolved</div>
+            <div class="meta">Resolved on ${escapeHtml(formatShortDate(caseData.updatedAt || caseData.createdAt))}</div>
           </div>
         </div>
       </section>
 
-      <section class="panel stack">
-        <h3 class="view-title">✓ Mediation Resolved</h3>
-        <p class="view-subtitle">Resolution summary</p>
-        <div class="invite-box">${escapeHtml(caseData.resolution || 'No resolution text recorded.')}</div>
-        <div class="view-actions">
-          <button data-action="close-case" class="primary">Close Case</button>
-          <button data-action="export-transcript">Export Transcript</button>
+      <section class="panel resolved-card">
+        <div class="completion-icon">
+          <svg viewBox="0 0 32 32" fill="none">
+            <path d="M9 17l5 5 9-11" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h3 class="view-title" style="text-align: center;">Mediation Resolved</h3>
+        <p class="view-subtitle" style="text-align: center;">Here's the resolution summary</p>
+        <div class="resolution-text">${escapeHtml(caseData.resolution || 'No resolution text recorded.')}</div>
+        <div class="view-actions" style="justify-content: center;">
+          <button class="primary" data-action="close-case">Close Case</button>
+          <button class="ghost" data-action="export-transcript">Export Transcript</button>
         </div>
       </section>
 
@@ -1005,18 +1192,23 @@ function renderResolvedView() {
   `;
 }
 
+/* ============================================================
+   RENDER: CLOSED VIEW
+   ============================================================ */
+
 function renderClosedView() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return '<section class="panel">Case not found.</section>';
-  }
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
 
   return `
     <div class="stack">
       <section class="topbar">
         <div class="row">
-          <button data-action="back-dashboard">← Back</button>
+          <button class="back-btn" data-action="back-dashboard">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
           <div>
             <h2>${escapeHtml(caseData.topic)}</h2>
             <div class="meta">Closed</div>
@@ -1024,17 +1216,26 @@ function renderClosedView() {
         </div>
       </section>
 
-      <section class="panel stack">
-        <h3 class="view-title">Case Closed</h3>
-        <p class="view-subtitle">Resolved on ${escapeHtml(formatShortDate(caseData.updatedAt || caseData.createdAt))}</p>
-        <div class="view-actions">
-          <button data-action="export-transcript">View Transcript</button>
+      <section class="panel resolved-card">
+        <div class="completion-icon">
+          <svg viewBox="0 0 32 32" fill="none">
+            <path d="M9 17l5 5 9-11" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h3 class="view-title" style="text-align: center;">Case Closed</h3>
+        <p class="view-subtitle" style="text-align: center;">This mediation was resolved on ${escapeHtml(formatShortDate(caseData.updatedAt || caseData.createdAt))}</p>
+        <div class="view-actions" style="justify-content: center; margin-top: var(--sp-4);">
+          <button class="ghost" data-action="export-transcript">View Transcript</button>
           <button class="primary" data-action="back-dashboard">Start New Mediation</button>
         </div>
       </section>
     </div>
   `;
 }
+
+/* ============================================================
+   RENDER: MODAL
+   ============================================================ */
 
 function renderModal() {
   const state = getState();
@@ -1047,11 +1248,12 @@ function renderModal() {
     modalRoot.innerHTML = `
       <div class="modal-backdrop">
         <div class="modal stack">
-          <h3 class="section-title">Invite Link Created</h3>
+          <h3 class="section-title">Share Invite Link</h3>
+          <p class="muted small">Send this link to the other party so they can join the mediation.</p>
           <div class="invite-box">${escapeHtml(state.modal.link || '')}</div>
           <div class="view-actions">
-            <button data-action="copy-modal-invite">Copy Link</button>
-            <button data-action="close-modal" class="primary">Done</button>
+            <button class="primary" data-action="copy-modal-invite">Copy Link</button>
+            <button class="ghost" data-action="close-modal">Done</button>
           </div>
         </div>
       </div>
@@ -1063,11 +1265,12 @@ function renderModal() {
     modalRoot.innerHTML = `
       <div class="modal-backdrop">
         <form class="modal stack" data-submit-action="resolve-case">
-          <h3 class="section-title">Resolve Case</h3>
-          <textarea name="resolutionText" required placeholder="Write the resolution summary..."></textarea>
+          <h3 class="section-title">Resolve This Mediation</h3>
+          <p class="muted small">Summarize the resolution that was agreed upon.</p>
+          <textarea name="resolutionText" required placeholder="Describe the resolution..."></textarea>
           <div class="view-actions">
             <button type="submit" class="primary">Resolve</button>
-            <button type="button" data-action="close-modal">Cancel</button>
+            <button type="button" class="ghost" data-action="close-modal">Cancel</button>
           </div>
         </form>
       </div>
@@ -1078,6 +1281,10 @@ function renderModal() {
   modalRoot.innerHTML = '';
 }
 
+/* ============================================================
+   RENDER: MAIN
+   ============================================================ */
+
 function render() {
   const view = resolveView();
 
@@ -1087,6 +1294,8 @@ function render() {
     appRoot.innerHTML = renderCaseDetailView();
   } else if (view === 'private-intake') {
     appRoot.innerHTML = renderPrivateIntakeView();
+  } else if (view === 'intake-summary') {
+    appRoot.innerHTML = renderIntakeSummaryView();
   } else if (view === 'group-chat') {
     appRoot.innerHTML = renderGroupChatView();
   } else if (view === 'resolved') {
@@ -1103,45 +1312,38 @@ function render() {
   }
 }
 
+/* ============================================================
+   CLIPBOARD
+   ============================================================ */
+
 async function copyToClipboard(text) {
   try {
     await navigator.clipboard.writeText(String(text || ''));
-    showToast('Copied to clipboard.', 'success');
+    showToast('Copied to clipboard', 'success');
   } catch {
-    showToast('Copy failed. Clipboard may be unavailable.', 'error');
+    showToast('Unable to copy. Please copy manually.', 'error');
   }
 }
 
-function extractCorrelationId(payload) {
-  if (!payload || typeof payload !== 'object') {
-    return '';
-  }
+/* ============================================================
+   GATEWAY CORRELATION
+   ============================================================ */
 
-  if (typeof payload.correlationId === 'string' && payload.correlationId.trim()) {
-    return payload.correlationId.trim();
-  }
-  if (typeof payload.correlation_id === 'string' && payload.correlation_id.trim()) {
-    return payload.correlation_id.trim();
-  }
+function extractCorrelationId(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+
+  if (typeof payload.correlationId === 'string' && payload.correlationId.trim()) return payload.correlationId.trim();
+  if (typeof payload.correlation_id === 'string' && payload.correlation_id.trim()) return payload.correlation_id.trim();
 
   const nested = payload.payload;
   if (nested && typeof nested === 'object') {
-    if (typeof nested.correlationId === 'string' && nested.correlationId.trim()) {
-      return nested.correlationId.trim();
-    }
-    if (typeof nested.correlation_id === 'string' && nested.correlation_id.trim()) {
-      return nested.correlation_id.trim();
-    }
+    if (typeof nested.correlationId === 'string' && nested.correlationId.trim()) return nested.correlationId.trim();
+    if (typeof nested.correlation_id === 'string' && nested.correlation_id.trim()) return nested.correlation_id.trim();
     if (nested.message && typeof nested.message === 'object') {
-      if (typeof nested.message.correlationId === 'string' && nested.message.correlationId.trim()) {
-        return nested.message.correlationId.trim();
-      }
-      if (typeof nested.message.correlation_id === 'string' && nested.message.correlation_id.trim()) {
-        return nested.message.correlation_id.trim();
-      }
+      if (typeof nested.message.correlationId === 'string' && nested.message.correlationId.trim()) return nested.message.correlationId.trim();
+      if (typeof nested.message.correlation_id === 'string' && nested.message.correlation_id.trim()) return nested.message.correlation_id.trim();
     }
   }
-
   return '';
 }
 
@@ -1150,7 +1352,7 @@ function waitForGatewayReply(deviceId, correlationId, timeoutMs = 30_000) {
   return new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
       state.waitingGatewayReplies.delete(correlationId);
-      reject(new Error('No owner-device response received yet.'));
+      reject(new Error('The other device did not respond.'));
     }, timeoutMs);
 
     state.waitingGatewayReplies.set(correlationId, {
@@ -1164,18 +1366,11 @@ function waitForGatewayReply(deviceId, correlationId, timeoutMs = 30_000) {
 }
 
 async function notifyOwnerDeviceJoin(parsedInvite, partyId) {
-  if (!parsedInvite || !parsedInvite.ownerDeviceId) {
-    return;
-  }
+  if (!parsedInvite || !parsedInvite.ownerDeviceId) return;
 
   const ownerDeviceId = String(parsedInvite.ownerDeviceId || '').trim();
-  if (!ownerDeviceId) {
-    return;
-  }
-
-  if (ownerDeviceId === getOwnDeviceId()) {
-    return;
-  }
+  if (!ownerDeviceId) return;
+  if (ownerDeviceId === getOwnDeviceId()) return;
 
   const message = [
     'MEDIATION_JOIN_REQUEST',
@@ -1189,23 +1384,27 @@ async function notifyOwnerDeviceJoin(parsedInvite, partyId) {
   const correlationId = `join_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const sendResult = await api.gateway.sendMessage(ownerDeviceId, message, correlationId);
   if (!sendResult || sendResult.ok !== true) {
-    showToast(normalizeError(sendResult, 'Unable to notify owner device'), 'error');
+    showToast(normalizeError(sendResult, 'Unable to notify the other device'), 'error');
     return;
   }
 
   try {
     await waitForGatewayReply(ownerDeviceId, correlationId, 30_000);
-    showToast('Owner device acknowledged join request.', 'success');
+    showToast('Connected successfully.', 'success');
   } catch (err) {
-    showToast(normalizeError(err, 'Owner device did not reply yet'), 'info');
+    showToast('Joined, but the other device hasn\'t responded yet.', 'info');
   }
 }
+
+/* ============================================================
+   ACTION HANDLERS
+   ============================================================ */
 
 async function handleCreateCase(form) {
   const topic = String(form.topic.value || '').trim();
   const description = String(form.description.value || '').trim();
-  const partyAName = String(form.partyAName.value || '').trim() || 'Alex';
-  const partyBName = String(form.partyBName.value || '').trim() || 'Blair';
+  const partyAName = String(form.partyAName.value || '').trim() || 'You';
+  const partyBName = String(form.partyBName.value || '').trim() || 'Other Party';
 
   const payload = {
     topic,
@@ -1224,7 +1423,7 @@ async function handleCreateCase(form) {
 
   const createResult = await api.mediation.create(payload);
   if (!createResult || createResult.ok !== true) {
-    showToast(normalizeError(createResult, 'Case creation failed'), 'error');
+    showToast(normalizeError(createResult, 'Unable to create mediation'), 'error');
     return;
   }
 
@@ -1236,7 +1435,7 @@ async function handleCreateCase(form) {
   });
 
   if (!joinResult || joinResult.ok !== true) {
-    showToast(normalizeError(joinResult, 'Case created but auto-join failed'), 'error');
+    showToast(normalizeError(joinResult, 'Created but unable to join automatically'), 'error');
     return;
   }
 
@@ -1261,7 +1460,7 @@ async function previewInvite(linkValue) {
   if (!parsed) {
     state.joinPreview = null;
     state.joinPartyId = '';
-    showToast('Invite link is invalid.', 'error');
+    showToast('That doesn\'t look like a valid invite link.', 'error');
     render();
     return;
   }
@@ -1274,16 +1473,13 @@ async function previewInvite(linkValue) {
   if (!result || result.ok !== true) {
     state.joinPreview = null;
     state.joinPartyId = '';
-    showToast(normalizeError(result, 'Unable to preview invite'), 'error');
+    showToast(normalizeError(result, 'Unable to find this mediation'), 'error');
     render();
     return;
   }
 
   const preview = result.preview || {};
-  state.joinPreview = {
-    ...preview,
-    parsedInvite: parsed,
-  };
+  state.joinPreview = { ...preview, parsedInvite: parsed };
 
   const available = Array.isArray(preview.availablePartyIds) ? preview.availablePartyIds : [];
   state.joinPartyId = available[0]
@@ -1296,13 +1492,13 @@ async function joinFromPreview() {
   const state = getState();
   const preview = state.joinPreview;
   if (!preview) {
-    showToast('Preview an invite first.', 'error');
+    showToast('Please preview the invite first.', 'error');
     return;
   }
 
   const partyId = state.joinPartyId || '';
   if (!partyId) {
-    showToast('Select a party to join.', 'error');
+    showToast('Please select which party to join as.', 'error');
     return;
   }
 
@@ -1314,7 +1510,7 @@ async function joinFromPreview() {
   });
 
   if (!joinResult || joinResult.ok !== true) {
-    showToast(normalizeError(joinResult, 'Join failed'), 'error');
+    showToast(normalizeError(joinResult, 'Unable to join'), 'error');
     return;
   }
 
@@ -1336,14 +1532,10 @@ async function sendPrivateMessage(form) {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const message = String(form.privateMessage.value || '').trim();
-  if (!message) {
-    return;
-  }
+  if (!message) return;
 
   const partyId = current.partyId;
   const draftKey = `private:${caseData.id}:${partyId}`;
@@ -1375,7 +1567,7 @@ async function sendPrivateMessage(form) {
     patchState({ caseData: coachResult.case });
     ensureCaseInList(coachResult.case);
   } else {
-    showToast(normalizeError(coachResult, 'Coach reply failed'), 'info');
+    showToast('Coach is taking a moment to respond.', 'info');
   }
 
   render();
@@ -1385,9 +1577,7 @@ async function runIntakeTemplate() {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const result = await api.mediation.runIntakeTemplate({
     caseId: caseData.id,
@@ -1395,7 +1585,7 @@ async function runIntakeTemplate() {
   });
 
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, 'Unable to run intake template'), 'error');
+    showToast(normalizeError(result, 'Unable to generate summary'), 'error');
     return;
   }
 
@@ -1407,7 +1597,7 @@ async function runIntakeTemplate() {
     state.chatDrafts.set(summaryKey, result.summary);
   }
 
-  showToast('Generated summary draft from coach.', 'success');
+  showToast('Summary draft generated.', 'success');
   render();
 }
 
@@ -1415,14 +1605,12 @@ async function saveSummaryAndReady() {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const summaryKey = `summary:${caseData.id}:${current.partyId}`;
   const summary = String(state.chatDrafts.get(summaryKey) || '').trim();
   if (!summary) {
-    showToast('Summary is required.', 'error');
+    showToast('Please write a summary before continuing.', 'error');
     return;
   }
 
@@ -1436,7 +1624,7 @@ async function saveSummaryAndReady() {
     allowDirectQuote: Boolean(consentQuoteEl && consentQuoteEl.checked),
   });
   if (!setConsentResult || setConsentResult.ok !== true) {
-    showToast(normalizeError(setConsentResult, 'Unable to save consent'), 'error');
+    showToast(normalizeError(setConsentResult, 'Unable to save preferences'), 'error');
     return;
   }
 
@@ -1456,7 +1644,7 @@ async function saveSummaryAndReady() {
     partyId: current.partyId,
   });
   if (!readyResult || readyResult.ok !== true) {
-    showToast(normalizeError(readyResult, 'Unable to mark ready'), 'error');
+    showToast(normalizeError(readyResult, 'Unable to mark as ready'), 'error');
     return;
   }
 
@@ -1465,9 +1653,9 @@ async function saveSummaryAndReady() {
 
   if (readyResult.case.phase === 'group_chat') {
     state.activeSubview = 'group-chat';
-    showToast('Both parties are ready. Entering group mediation.', 'success');
+    showToast('Both parties are ready. Starting mediation.', 'success');
   } else {
-    showToast('You are marked ready.', 'success');
+    showToast('You\'re marked as ready!', 'success');
   }
 
   render();
@@ -1477,14 +1665,10 @@ async function sendGroupMessage(form) {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const text = String(form.groupMessage.value || '').trim();
-  if (!text) {
-    return;
-  }
+  if (!text) return;
 
   const result = await api.mediation.sendDirect({
     caseId: caseData.id,
@@ -1507,14 +1691,10 @@ async function sendDraftMessage(form) {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const text = String(form.draftMessage.value || '').trim();
-  if (!text) {
-    return;
-  }
+  if (!text) return;
 
   const draftKey = `draft:${caseData.id}:${current.partyId}`;
   let draft = findActiveDraft(caseData, current.partyId);
@@ -1544,7 +1724,7 @@ async function sendDraftMessage(form) {
     });
 
     if (!appendResult || appendResult.ok !== true) {
-      showToast(normalizeError(appendResult, 'Unable to append draft message'), 'error');
+      showToast(normalizeError(appendResult, 'Unable to send draft message'), 'error');
       return;
     }
 
@@ -1565,8 +1745,6 @@ async function sendDraftMessage(form) {
     if (suggestionResult && suggestionResult.ok === true && suggestionResult.case) {
       patchState({ caseData: suggestionResult.case });
       ensureCaseInList(suggestionResult.case);
-    } else {
-      showToast(normalizeError(suggestionResult, 'Suggestion generation failed'), 'info');
     }
   }
 
@@ -1577,13 +1755,11 @@ async function runDraftSuggestion() {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const draft = findActiveDraft(caseData, current.partyId);
   if (!draft) {
-    showToast('Create a draft first.', 'error');
+    showToast('Start a draft first.', 'error');
     return;
   }
 
@@ -1605,13 +1781,11 @@ async function approveDraft() {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const draft = findActiveDraft(caseData, current.partyId);
   if (!draft) {
-    showToast('No active draft to approve.', 'error');
+    showToast('No draft to send.', 'error');
     return;
   }
 
@@ -1625,7 +1799,7 @@ async function approveDraft() {
   });
 
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, 'Unable to approve draft'), 'error');
+    showToast(normalizeError(result, 'Unable to send draft'), 'error');
     return;
   }
 
@@ -1633,7 +1807,7 @@ async function approveDraft() {
   ensureCaseInList(result.case);
   state.coachPanelOpen = false;
   delete state.activeDraftByCase[caseData.id];
-  showToast('Draft sent to group chat.', 'success');
+  showToast('Message sent to the group.', 'success');
   render();
 }
 
@@ -1641,13 +1815,11 @@ async function rejectDraft() {
   const state = getState();
   const caseData = state.caseData;
   const current = caseData ? getCurrentParty(caseData) : null;
-  if (!caseData || !current) {
-    return;
-  }
+  if (!caseData || !current) return;
 
   const draft = findActiveDraft(caseData, current.partyId);
   if (!draft) {
-    showToast('No active draft to reject.', 'error');
+    showToast('No draft to discard.', 'error');
     return;
   }
 
@@ -1658,33 +1830,31 @@ async function rejectDraft() {
   });
 
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, 'Unable to reject draft'), 'error');
+    showToast(normalizeError(result, 'Unable to discard draft'), 'error');
     return;
   }
 
   patchState({ caseData: result.case });
   ensureCaseInList(result.case);
   delete state.activeDraftByCase[caseData.id];
-  showToast('Draft rejected. Start a new draft message.', 'info');
+  showToast('Draft discarded. You can start a new one.', 'info');
   render();
 }
 
 async function resolveCaseFromModal(form) {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return;
-  }
+  if (!caseData) return;
 
   const resolution = String(form.resolutionText.value || '').trim();
   if (!resolution) {
-    showToast('Resolution text is required.', 'error');
+    showToast('Please describe the resolution.', 'error');
     return;
   }
 
   const result = await api.mediation.resolve({ caseId: caseData.id, resolution });
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, 'Unable to resolve case'), 'error');
+    showToast(normalizeError(result, 'Unable to resolve'), 'error');
     return;
   }
 
@@ -1700,13 +1870,11 @@ async function resolveCaseFromModal(form) {
 async function closeCurrentCase() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return;
-  }
+  if (!caseData) return;
 
   const result = await api.mediation.close({ caseId: caseData.id });
   if (!result || result.ok !== true) {
-    showToast(normalizeError(result, 'Unable to close case'), 'error');
+    showToast(normalizeError(result, 'Unable to close'), 'error');
     return;
   }
 
@@ -1719,9 +1887,7 @@ async function closeCurrentCase() {
 function exportTranscript() {
   const state = getState();
   const caseData = state.caseData;
-  if (!caseData) {
-    return;
-  }
+  if (!caseData) return;
 
   const lines = [];
   lines.push(`# ${caseData.topic}`);
@@ -1747,17 +1913,17 @@ function exportTranscript() {
   URL.revokeObjectURL(url);
 }
 
+/* ============================================================
+   EVENT HANDLERS
+   ============================================================ */
+
 function handleInput(event) {
   const target = event.target;
-  if (!target) {
-    return;
-  }
+  if (!target) return;
 
   if (target.matches('[data-draft-key]')) {
     const key = target.getAttribute('data-draft-key');
-    if (key) {
-      getState().chatDrafts.set(key, target.value);
-    }
+    if (key) getState().chatDrafts.set(key, target.value);
   }
 
   if (target.id === 'join-party-select') {
@@ -1767,48 +1933,22 @@ function handleInput(event) {
 
 async function handleSubmit(event) {
   const form = event.target;
-  if (!form || !form.dataset || !form.dataset.submitAction) {
-    return;
-  }
+  if (!form || !form.dataset || !form.dataset.submitAction) return;
 
   event.preventDefault();
 
   const action = form.dataset.submitAction;
-  if (action === 'create-case') {
-    await handleCreateCase(form);
-    return;
-  }
-
-  if (action === 'preview-invite') {
-    await previewInvite(String(form.inviteLink.value || ''));
-    return;
-  }
-
-  if (action === 'send-private-message') {
-    await sendPrivateMessage(form);
-    return;
-  }
-
-  if (action === 'send-group-message') {
-    await sendGroupMessage(form);
-    return;
-  }
-
-  if (action === 'send-draft-message') {
-    await sendDraftMessage(form);
-    return;
-  }
-
-  if (action === 'resolve-case') {
-    await resolveCaseFromModal(form);
-  }
+  if (action === 'create-case') { await handleCreateCase(form); return; }
+  if (action === 'preview-invite') { await previewInvite(String(form.inviteLink.value || '')); return; }
+  if (action === 'send-private-message') { await sendPrivateMessage(form); return; }
+  if (action === 'send-group-message') { await sendGroupMessage(form); return; }
+  if (action === 'send-draft-message') { await sendDraftMessage(form); return; }
+  if (action === 'resolve-case') { await resolveCaseFromModal(form); }
 }
 
 async function handleClick(event) {
   const target = event.target.closest('[data-action]');
-  if (!target) {
-    return;
-  }
+  if (!target) return;
 
   const action = target.getAttribute('data-action');
   const state = getState();
@@ -1838,9 +1978,7 @@ async function handleClick(event) {
 
   if (action === 'open-case') {
     const caseId = target.getAttribute('data-case-id');
-    if (caseId) {
-      await loadCase(caseId, { activeSubview: null });
-    }
+    if (caseId) await loadCase(caseId, { activeSubview: null });
     return;
   }
 
@@ -1874,106 +2012,56 @@ async function handleClick(event) {
 
   if (action === 'copy-invite') {
     const caseData = state.caseData;
-    if (caseData?.inviteLink?.url) {
-      await copyToClipboard(enrichInviteLink(caseData.inviteLink.url));
-    }
+    if (caseData?.inviteLink?.url) await copyToClipboard(enrichInviteLink(caseData.inviteLink.url));
     return;
   }
 
   if (action === 'open-share-modal') {
     const caseData = state.caseData;
     if (caseData?.inviteLink?.url) {
-      state.modal = {
-        type: 'share-invite',
-        link: enrichInviteLink(caseData.inviteLink.url),
-      };
+      state.modal = { type: 'share-invite', link: enrichInviteLink(caseData.inviteLink.url) };
       render();
     }
     return;
   }
 
-  if (action === 'close-modal') {
-    state.modal = null;
-    render();
-    return;
-  }
-
+  if (action === 'close-modal') { state.modal = null; render(); return; }
   if (action === 'copy-modal-invite') {
-    if (state.modal && state.modal.link) {
-      await copyToClipboard(state.modal.link);
-    }
+    if (state.modal && state.modal.link) await copyToClipboard(state.modal.link);
     return;
   }
 
-  if (action === 'join-preview') {
-    await joinFromPreview();
-    return;
-  }
+  if (action === 'join-preview') { await joinFromPreview(); return; }
+  if (action === 'run-intake-template') { await runIntakeTemplate(); return; }
 
-  if (action === 'run-intake-template') {
+  if (action === 'open-intake-summary') {
     await runIntakeTemplate();
-    return;
-  }
-
-  if (action === 'toggle-summary-panel') {
-    state.summaryPanelExpanded = !state.summaryPanelExpanded;
+    state.activeSubview = 'intake-summary';
     render();
     return;
   }
 
-  if (action === 'save-summary-ready') {
-    await saveSummaryAndReady();
-    return;
-  }
-
-  if (action === 'open-coach-panel') {
-    state.coachPanelOpen = true;
+  if (action === 'back-to-intake') {
+    state.activeSubview = 'private-intake';
     render();
     return;
   }
 
-  if (action === 'close-coach-panel') {
-    state.coachPanelOpen = false;
-    render();
-    return;
-  }
-
-  if (action === 'run-draft-suggestion') {
-    await runDraftSuggestion();
-    return;
-  }
-
-  if (action === 'approve-draft') {
-    await approveDraft();
-    return;
-  }
-
-  if (action === 'reject-draft') {
-    await rejectDraft();
-    return;
-  }
-
-  if (action === 'open-resolve-prompt') {
-    state.modal = { type: 'resolve-case' };
-    render();
-    return;
-  }
-
-  if (action === 'close-case') {
-    await closeCurrentCase();
-    return;
-  }
-
-  if (action === 'export-transcript') {
-    exportTranscript();
-    return;
-  }
-
-  if (action === 'sign-out') {
-    await signOutFlow();
-    return;
-  }
+  if (action === 'save-summary-ready') { await saveSummaryAndReady(); return; }
+  if (action === 'open-coach-panel') { state.coachPanelOpen = true; render(); return; }
+  if (action === 'close-coach-panel') { state.coachPanelOpen = false; render(); return; }
+  if (action === 'run-draft-suggestion') { await runDraftSuggestion(); return; }
+  if (action === 'approve-draft') { await approveDraft(); return; }
+  if (action === 'reject-draft') { await rejectDraft(); return; }
+  if (action === 'open-resolve-prompt') { state.modal = { type: 'resolve-case' }; render(); return; }
+  if (action === 'close-case') { await closeCurrentCase(); return; }
+  if (action === 'export-transcript') { exportTranscript(); return; }
+  if (action === 'sign-out') { await signOutFlow(); return; }
 }
+
+/* ============================================================
+   REAL-TIME EVENTS
+   ============================================================ */
 
 function onAuthChanged(payload) {
   const state = getState();
@@ -1984,9 +2072,7 @@ function onAuthChanged(payload) {
     void refreshCases().then(() => {
       if (state.caseId) {
         const found = state.cases.find((entry) => entry.id === state.caseId);
-        if (found) {
-          state.caseData = found;
-        }
+        if (found) state.caseData = found;
       }
       render();
     });
@@ -1996,9 +2082,7 @@ function onAuthChanged(payload) {
 }
 
 function onMediationEvent(payload) {
-  if (!payload || typeof payload !== 'object') {
-    return;
-  }
+  if (!payload || typeof payload !== 'object') return;
 
   if (payload.type === 'case.updated' && payload.case && typeof payload.case === 'object') {
     const state = getState();
@@ -2016,65 +2100,43 @@ function onMediationEvent(payload) {
   if (payload.type === 'log' && payload.message) {
     const text = String(payload.message || '');
     if (text.includes('runtime start failed')) {
-      showToast(text, 'error', 5000);
+      showToast('Connection issue. Please restart the app.', 'error', 5000);
     }
   }
 }
 
 function onGatewayChat(payload) {
   const correlationId = extractCorrelationId(payload);
-  if (!correlationId) {
-    return;
-  }
+  if (!correlationId) return;
 
   const state = getState();
   const pending = state.waitingGatewayReplies.get(correlationId);
-  if (!pending) {
-    return;
-  }
+  if (!pending) return;
 
-  if (pending.deviceId && payload && payload.deviceId && payload.deviceId !== pending.deviceId) {
-    return;
-  }
+  if (pending.deviceId && payload && payload.deviceId && payload.deviceId !== pending.deviceId) return;
 
   state.waitingGatewayReplies.delete(correlationId);
   pending.resolve(payload);
 }
 
+/* ============================================================
+   BOOTSTRAP
+   ============================================================ */
+
 async function bootstrap() {
-  appRoot.addEventListener('click', (event) => {
-    void handleClick(event);
-  });
-  modalRoot.addEventListener('click', (event) => {
-    void handleClick(event);
-  });
-
-  appRoot.addEventListener('submit', (event) => {
-    void handleSubmit(event);
-  });
-  modalRoot.addEventListener('submit', (event) => {
-    void handleSubmit(event);
-  });
-
+  appRoot.addEventListener('click', (event) => { void handleClick(event); });
+  modalRoot.addEventListener('click', (event) => { void handleClick(event); });
+  appRoot.addEventListener('submit', (event) => { void handleSubmit(event); });
+  modalRoot.addEventListener('submit', (event) => { void handleSubmit(event); });
   appRoot.addEventListener('input', handleInput);
 
-  startButton.addEventListener('click', () => {
-    void startFlow();
-  });
+  startButton.addEventListener('click', () => { void startFlow(); });
 
-  api.auth.onAuthChanged((payload) => {
-    onAuthChanged(payload);
-  });
+  api.auth.onAuthChanged((payload) => { onAuthChanged(payload); });
+  api.mediation.onMediationEvent((payload) => { onMediationEvent(payload); });
+  api.gateway.onChatEvent((payload) => { onGatewayChat(payload); });
 
-  api.mediation.onMediationEvent((payload) => {
-    onMediationEvent(payload);
-  });
-
-  api.gateway.onChatEvent((payload) => {
-    onGatewayChat(payload);
-  });
-
-  patchState({ startMessage: 'Press Start to continue.' });
+  patchState({ startMessage: '' });
 
   try {
     const params = new URLSearchParams(window.location.search);
@@ -2104,5 +2166,5 @@ async function bootstrap() {
 }
 
 void bootstrap().catch((err) => {
-  showToast(normalizeError(err, 'Failed to initialize renderer'), 'error', 6000);
+  showToast(normalizeError(err, 'Unable to start. Please restart the app.'), 'error', 6000);
 });
