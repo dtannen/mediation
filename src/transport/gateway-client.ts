@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 export const TRUSTED_ORIGINS = new Set([
@@ -270,7 +271,7 @@ export async function sendMessage(
     `${gatewayUrl}/gateway/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: 'POST',
-      headers: authHeaders(deviceToken),
+      headers: { ...authHeaders(deviceToken), 'X-Idempotency-Key': randomUUID() },
       body: JSON.stringify(frame),
     },
   );

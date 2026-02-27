@@ -1049,7 +1049,33 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
     }
   }
 
+  async function registerIdentityKey(launch: RuntimeLaunchConfig): Promise<void> {
+    const response = await fetch(
+      `${launch.gatewayUrl}/gateway/v1/devices/${encodeURIComponent(launch.deviceId)}/identity-key`,
+      {
+        method: 'PUT',
+        redirect: 'manual',
+        headers: {
+          Authorization: `Bearer ${launch.accessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          algorithm: 'ed25519',
+          public_key: launch.identity.publicKeyRawBase64,
+          ...(launch.deviceName ? { display_name: launch.deviceName } : {}),
+        }),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      emitLog(`[agent] identity key registration failed: HTTP ${response.status} ${text}`);
+    }
+  }
+
   async function connectOnce(launch: RuntimeLaunchConfig, signal: AbortSignal): Promise<void> {
+    await registerIdentityKey(launch);
+
     const wsUrl = toWsUrl(launch.gatewayUrl, launch.deviceId);
 
     await new Promise<void>((resolve, reject) => {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { validateTrustedOrigin } from '../lib/trusted-origins';
 import { parseSseStream, createDedupSet } from '../lib/sse-parser';
 import { sleepWithAbort } from '../lib/sleep-with-abort';
@@ -153,6 +154,7 @@ export default function createGatewayClient(deps: GatewayClientDeps) {
   async function sendMessage(gatewayUrl: string, sessionId: string, encryptedFrame: Record<string, unknown>): Promise<Record<string, unknown>> {
     return gatewayJson(`${gatewayUrl}/gateway/v1/sessions/${encodeURIComponent(sessionId)}/messages`, {
       method: 'POST',
+      headers: { 'X-Idempotency-Key': randomUUID() },
       body: JSON.stringify(encryptedFrame),
     });
   }
