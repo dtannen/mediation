@@ -1063,6 +1063,8 @@ export default function createAgentRuntimeManager(deps: RuntimeManagerDeps) {
         body: JSON.stringify({
           algorithm: 'ed25519',
           public_key: launch.identity.publicKeyRawBase64,
+          device_class: 'app',
+          device_profile: 'mediation',
           ...(launch.deviceName ? { display_name: launch.deviceName } : {}),
         }),
       },

@@ -599,6 +599,8 @@ export default function createAuthService(deps: AuthServiceDeps) {
         body: JSON.stringify({
           algorithm: 'ed25519',
           public_key: identity.publicKeyRawBase64,
+          device_class: 'app',
+          device_profile: 'mediation',
           ...(displayName ? { display_name: displayName } : {}),
         }),
       },
