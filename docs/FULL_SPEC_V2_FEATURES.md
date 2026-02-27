@@ -159,10 +159,13 @@ interface CoachingTemplateVersion {
   version: number;
   createdAt: string;      // ISO8601
   changeNote: string;
+  intakeCoachPreamble?: string;
+  draftCoachPreamble?: string;
+  mediatorPreamble?: string;
   globalGuidance: string;
-  intakeCoachInstructions: string;
-  draftCoachInstructions: string;
-  mediatorInstructions: string;
+  intakeCoachInstructions?: string;
+  draftCoachInstructions?: string;
+  mediatorInstructions?: string;
 }
 ```
 
@@ -174,18 +177,26 @@ interface CoachingTemplateVersion {
 
 For each AI role, the runtime prompt must be composed from:
 
-- Role fixed preamble (safety and format requirements).
+- Role preamble (safety and format requirements), resolved as:
+- template role preamble override when provided (`{role}Preamble`)
+- otherwise runtime default role preamble
 - Template `globalGuidance`.
-- Template role-specific instructions.
+- Template role-specific instructions (optional).
 - Case topic and description from `mainTopicConfig`.
 - Relevant transcript context.
 
+Role preamble overrides must be editable in template version management UI.
+
 ## 5.2 Context Rules
 
-- Draft coach generation must include full group chat context for the case.
+- Draft coach generation must include full context for the acting party and case, including:
+- private intake conversation(s) for the acting party
+- full group chat / joint coaching conversation for the case
+- draft coach conversation history for the current draft thread
+- If user launches Draft Coach from a group chat compose action, that compose text is injected as the initial user message in the draft coach thread automatically.
 - If raw transcript exceeds provider input limits, runtime must run a deterministic compression pass over the entire transcript first, then include:
 - Compression output representing the full transcript.
-- The most recent raw turns (minimum 30 turns) unchanged.
+- The most recent raw turns (minimum 30 turns) unchanged, including the launch compose message when present.
 - The draft compose history unchanged.
 
 This preserves full-context grounding while remaining provider-compatible.
@@ -194,7 +205,15 @@ This preserves full-context grounding while remaining provider-compatible.
 
 - Intake coach output remains private to the party.
 - Draft coach output never auto-sends to group chat.
+- Draft coach response must include:
+- suggested edits / improved draft text
+- analysis explaining why the message can be improved and how the suggested changes improve clarity, tone, and mediation outcome
 - Mediator output remains neutral, facilitative, and template-informed.
+
+## 5.4 Model Requirement
+
+- Intake Coach, Draft Coach, and Mediator must use ChatGPT as the model family for v2 runtime generation.
+- Runtime configuration must default all three roles to ChatGPT unless explicitly overridden by a future feature flag.
 
 ---
 
@@ -207,14 +226,17 @@ Goal: convert "Draft with Coach" from immediate drafting to guided articulation.
 Requirements:
 
 1. Opening Draft Coach initializes or resumes a draft in `coachMeta.phase = 'exploring'`.
-2. First coach turn asks what the user wants to communicate and desired outcome.
-3. Coach asks clarifying questions until it can summarize intent, constraints, and ask for readiness confirmation.
+2. If Draft Coach is launched from a typed group-chat compose message, that message must be auto-inserted as the initial user input to coach (no re-entry required).
+3. Conversational coaching behavior (question ordering, clarifications, and intent discovery flow) is prompt-driven via template and role instructions, not hardcoded in product logic.
 4. Coach must not generate final formal draft text until user explicitly confirms readiness.
 5. After readiness confirmation, coach generates one formal draft and sets `coachMeta.phase = 'formal_draft_ready'`.
-6. User can edit draft text and approve or return to exploration.
-7. If user edits or adds new exploratory input after formal draft generation, phase resets to `exploring`.
-8. Full group chat context and draft compose history must be included per Section 5.2.
-9. Existing approve/reject semantics remain; approved send path still emits group message with `deliveryMode = 'coach_approved'`.
+6. Each draft coach response must include both:
+- improved draft suggestion(s)
+- analysis of the original message quality and rationale for the improvements
+7. User can edit draft text and approve or return to exploration.
+8. If user edits or adds new exploratory input after formal draft generation, phase resets to `exploring`.
+9. Intake, group/joint, and draft-coach context must be included per Section 5.2.
+10. Existing approve/reject semantics remain; approved send path still emits group message with `deliveryMode = 'coach_approved'`.
 
 UX behavior:
 
@@ -271,11 +293,12 @@ Requirements:
 
 Template application rules:
 
-- `globalGuidance` is always prepended before role-specific instructions.
-- Role-specific instructions are appended in this order:
+- Role preambles are resolved first (template override, otherwise runtime default), then `globalGuidance`, then optional role-specific instructions.
+- Role-specific instructions are appended in this order when present:
 - intake coach: `intakeCoachInstructions`
 - draft coach: `draftCoachInstructions`
 - mediator: `mediatorInstructions`
+- Empty role-specific instructions are valid; `globalGuidance` alone is sufficient when role-specific fields are omitted.
 
 Acceptance criteria:
 
@@ -308,7 +331,7 @@ Requirements:
 
 1. Admin UI supports create, read, update, archive, and soft delete template records.
 2. Metadata fields editable: name, category, description, status.
-3. Role instructions editable: intake, draft, mediator, and global guidance.
+3. Prompt elements editable: intake/draft/mediator preambles, global guidance, and optional role instructions (intake/draft/mediator).
 4. Publishing edits creates a new immutable version record.
 5. Previous versions remain viewable and can be restored as current version.
 6. Deleting a template in active use is blocked; only archive is allowed.
