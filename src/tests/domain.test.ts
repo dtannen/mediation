@@ -276,5 +276,137 @@ export async function runDomainTests(): Promise<{ passed: number; failed: number
         );
       },
     },
+
+    /* V2: New service methods */
+
+    {
+      name: 'createCase sets schemaVersion to 2',
+      run: () => {
+        const { mediationCase } = createServiceAndCase();
+        assert.equal(mediationCase.schemaVersion, 2);
+      },
+    },
+    {
+      name: 'setMainTopicConfig updates topic and mainTopicConfig',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        const updated = service.setMainTopicConfig(mediationCase.id, {
+          topic: 'Updated Topic',
+          description: 'New description',
+          categoryId: 'cat_1',
+        });
+
+        assert.equal(updated.topic, 'Updated Topic');
+        assert.equal(updated.description, 'New description');
+        assert.ok(updated.mainTopicConfig);
+        assert.equal(updated.mainTopicConfig!.topic, 'Updated Topic');
+        assert.equal(updated.mainTopicConfig!.categoryId, 'cat_1');
+        assert.ok(updated.mainTopicConfig!.confirmedAt);
+      },
+    },
+    {
+      name: 'setTemplateSelection stores template selection',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        const updated = service.setTemplateSelection(mediationCase.id, {
+          templateId: 'tpl_test',
+          versionId: 'tplv_test',
+          selectedBy: 'admin',
+        });
+
+        assert.ok(updated.templateSelection);
+        assert.equal(updated.templateSelection!.templateId, 'tpl_test');
+        assert.equal(updated.templateSelection!.versionId, 'tplv_test');
+        assert.equal(updated.templateSelection!.selectedBy, 'admin');
+      },
+    },
+    {
+      name: 'initializeDraftCoachMeta adds coach metadata to draft',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        joinBoth(service, mediationCase.id);
+        readyBoth(service, mediationCase.id);
+
+        const draft = service.createCoachDraft(mediationCase.id, 'party_a', 'Help me write a message');
+        const updated = service.initializeDraftCoachMeta(mediationCase.id, draft.id);
+        const updatedDraft = updated.groupChat.draftsById[draft.id];
+
+        assert.ok(updatedDraft.coachMeta);
+        assert.equal(updatedDraft.coachMeta!.phase, 'exploring');
+        assert.deepEqual(updatedDraft.coachMeta!.coachHistory, []);
+      },
+    },
+    {
+      name: 'setDraftReadiness transitions draft to confirm_ready',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        joinBoth(service, mediationCase.id);
+        readyBoth(service, mediationCase.id);
+
+        const draft = service.createCoachDraft(mediationCase.id, 'party_a', 'Test message');
+        service.initializeDraftCoachMeta(mediationCase.id, draft.id);
+
+        const updated = service.setDraftReadiness(mediationCase.id, draft.id, true);
+        const d = updated.groupChat.draftsById[draft.id];
+        assert.equal(d.coachMeta!.phase, 'confirm_ready');
+      },
+    },
+    {
+      name: 'setFormalDraftReady transitions to formal_draft_ready with suggested text',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        joinBoth(service, mediationCase.id);
+        readyBoth(service, mediationCase.id);
+
+        const draft = service.createCoachDraft(mediationCase.id, 'party_a', 'Write something');
+        service.initializeDraftCoachMeta(mediationCase.id, draft.id);
+        service.setDraftReadiness(mediationCase.id, draft.id, true);
+
+        const updated = service.setFormalDraftReady(mediationCase.id, draft.id, 'Formal draft text');
+        const d = updated.groupChat.draftsById[draft.id];
+        assert.equal(d.coachMeta!.phase, 'formal_draft_ready');
+        assert.equal(d.coachMeta!.formalDraftText, 'Formal draft text');
+        assert.equal(d.suggestedText, 'Formal draft text');
+        assert.equal(d.status, 'pending_approval');
+      },
+    },
+    {
+      name: 'rejectCoachDraft resets v2 draft to exploring instead of terminal reject',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        joinBoth(service, mediationCase.id);
+        readyBoth(service, mediationCase.id);
+
+        const draft = service.createCoachDraft(mediationCase.id, 'party_a', 'Test');
+        service.initializeDraftCoachMeta(mediationCase.id, draft.id);
+        service.setDraftReadiness(mediationCase.id, draft.id, true);
+        service.setFormalDraftReady(mediationCase.id, draft.id, 'Draft text');
+
+        const updated = service.rejectCoachDraft(mediationCase.id, draft.id, 'Not quite right');
+        const d = updated.groupChat.draftsById[draft.id];
+
+        // V2: should reset to exploring, not terminal reject
+        assert.equal(d.coachMeta!.phase, 'exploring');
+        assert.equal(d.status, 'composing');
+        assert.equal(d.coachMeta!.formalDraftText, undefined);
+        assert.equal(d.suggestedText, undefined);
+      },
+    },
+    {
+      name: 'rejectCoachDraft v1 draft (no coachMeta) is terminal',
+      run: () => {
+        const { service, mediationCase } = createServiceAndCase();
+        joinBoth(service, mediationCase.id);
+        readyBoth(service, mediationCase.id);
+
+        const draft = service.createCoachDraft(mediationCase.id, 'party_a', 'V1 style');
+        service.setCoachDraftSuggestion(mediationCase.id, draft.id, 'Suggested');
+
+        const updated = service.rejectCoachDraft(mediationCase.id, draft.id, 'Nope');
+        const d = updated.groupChat.draftsById[draft.id];
+        assert.equal(d.status, 'rejected');
+        assert.ok(d.rejectedAt);
+      },
+    },
   ]);
 }

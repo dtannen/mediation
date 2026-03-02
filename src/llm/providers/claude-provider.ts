@@ -13,6 +13,7 @@ const claudeProvider: ProviderPlugin = {
     supportsTools: true,
     supportsSessionResume: true,
     supportsPolicy: true,
+    contextWindowTokens: 200_000, // Claude Sonnet context window
   },
   runPrompt: runClaudePrompt,
 };

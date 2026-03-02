@@ -58,6 +58,24 @@ export function renderMarkdownUntrusted(value) {
       continue;
     }
 
+    // Horizontal rule
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushParagraph();
+      blocks.push('<hr>');
+      continue;
+    }
+
+    // Headings
+    const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      const level = headingMatch[1].length;
+      const text = renderInline(headingMatch[2]);
+      blocks.push(`<h${level}>${text}</h${level}>`);
+      continue;
+    }
+
+    // Unordered list
     if (trimmed.startsWith('- ')) {
       flushParagraph();
       const item = renderInline(trimmed.slice(2));
@@ -66,6 +84,20 @@ export function renderMarkdownUntrusted(value) {
         blocks[blocks.length - 1] = prev.replace('</ul>', `<li>${item}</li></ul>`);
       } else {
         blocks.push(`<ul><li>${item}</li></ul>`);
+      }
+      continue;
+    }
+
+    // Numbered list
+    const olMatch = trimmed.match(/^(\d+)\.\s+(.+)$/);
+    if (olMatch) {
+      flushParagraph();
+      const item = renderInline(olMatch[2]);
+      const prev = blocks[blocks.length - 1] || '';
+      if (prev.startsWith('<ol') && prev.endsWith('</ol>')) {
+        blocks[blocks.length - 1] = prev.replace('</ol>', `<li>${item}</li></ol>`);
+      } else {
+        blocks.push(`<ol><li>${item}</li></ol>`);
       }
       continue;
     }

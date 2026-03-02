@@ -13,6 +13,12 @@ const initialState = {
   activeDraftByCase: {},
   summaryPanelExpanded: false,
   chatDrafts: new Map(),
+  mainTopicCategories: [],
+  mainTopicTemplates: [],
+  mainTopicForm: { topic: '', description: '', categoryId: '', templateId: '' },
+  typingIndicators: {},
+  templateAdminView: null,
+  templateAdminData: { categories: [], templates: [], selectedTemplate: null, versions: [] },
   share: {
     consumeInput: '',
     consumeResult: null,

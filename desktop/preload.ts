@@ -104,6 +104,23 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
       },
     },
 
+    templates: {
+      listCategories: () => ipcRenderer.invoke(CH.TPL_LIST_CATEGORIES),
+      createCategory: (payload: { name: string; description?: string; actorId?: string }) => ipcRenderer.invoke(CH.TPL_CREATE_CATEGORY, payload),
+      updateCategory: (payload: { categoryId: string; name?: string; description?: string; actorId?: string }) => ipcRenderer.invoke(CH.TPL_UPDATE_CATEGORY, payload),
+      deleteCategory: (payload: { categoryId: string; actorId?: string }) => ipcRenderer.invoke(CH.TPL_DELETE_CATEGORY, payload),
+      list: (categoryId?: string) => ipcRenderer.invoke(CH.TPL_LIST, categoryId ? { categoryId } : {}),
+      get: (templateId: string) => ipcRenderer.invoke(CH.TPL_GET, { templateId }),
+      create: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.TPL_CREATE, payload),
+      updateMeta: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.TPL_UPDATE_META, payload),
+      createVersion: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.TPL_CREATE_VERSION, payload),
+      setStatus: (payload: { templateId: string; status: 'active' | 'archived'; actorId?: string }) => ipcRenderer.invoke(CH.TPL_SET_STATUS, payload),
+      delete: (payload: string | { templateId: string; actorId?: string }) => {
+        const p = typeof payload === 'string' ? { templateId: payload } : payload;
+        return ipcRenderer.invoke(CH.TPL_DELETE, p);
+      },
+    },
+
     mediation: {
       create: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_CREATE, payload),
       get: (caseId: string) => ipcRenderer.invoke(CH.MEDIATION_GET, { caseId }),
@@ -127,6 +144,35 @@ export function createPreloadApi(ipcRenderer: IpcRendererLike): Record<string, u
       runDraftSuggestion: (payload: { caseId: string; draftId: string }) => ipcRenderer.invoke(CH.MEDIATION_RUN_DRAFT_SUGGESTION, payload),
       approveDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_APPROVE_DRAFT, payload),
       rejectDraft: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_REJECT_DRAFT, payload),
+      setMainTopic: (payload: {
+        caseId: string;
+        topic: string;
+        description?: string;
+        categoryId: string;
+        templateId: string;
+        templateVersion: number;
+        partyId: string;
+      }) => ipcRenderer.invoke(CH.MEDIATION_SET_MAIN_TOPIC, payload),
+      setTemplateSelection: (payload: {
+        caseId: string;
+        categoryId: string;
+        templateId: string;
+        templateVersion: number;
+        actorId: string;
+        adminOverride?: boolean;
+      }) => ipcRenderer.invoke(CH.MEDIATION_SET_TEMPLATE_SELECTION, payload),
+      draftCoachTurn: (payload: {
+        caseId: string;
+        draftId: string;
+        partyId: string;
+        userMessage: string;
+        composeText?: string;
+      }) => ipcRenderer.invoke(CH.MEDIATION_DRAFT_COACH_TURN, payload),
+      setDraftReadiness: (payload: {
+        caseId: string;
+        draftId: string;
+        readinessConfirmed: boolean;
+      }) => ipcRenderer.invoke(CH.MEDIATION_SET_DRAFT_READINESS, payload),
       resolve: (payload: { caseId: string; resolution: string }) => ipcRenderer.invoke(CH.MEDIATION_RESOLVE, payload),
       close: (payload: { caseId: string }) => ipcRenderer.invoke(CH.MEDIATION_CLOSE, payload),
       remoteCommand: (payload: Record<string, unknown>) => ipcRenderer.invoke(CH.MEDIATION_REMOTE_COMMAND, payload),

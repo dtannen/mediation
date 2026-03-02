@@ -32,6 +32,8 @@ export interface ProviderCapabilities {
   supportsTools: boolean;
   supportsSessionResume: boolean;
   supportsPolicy: boolean;
+  /** Default context window size in tokens for the provider's default model (Section 5.2.1) */
+  contextWindowTokens?: number;
 }
 
 export interface ProviderRunResult {

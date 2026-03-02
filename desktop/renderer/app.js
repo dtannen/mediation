@@ -115,6 +115,28 @@ function friendlySyncStatus(caseData) {
   return 'Live';
 }
 
+/**
+ * Check if an IPC result indicates success.
+ * Supports both v2 envelope ({ success: true, data }) and legacy ({ ok: true }).
+ */
+function isIpcSuccess(result) {
+  if (!result) return false;
+  if (result.success === true) return true;
+  if (result.ok === true) return true;
+  return false;
+}
+
+/**
+ * Extract the data payload from a successful IPC result.
+ * v2 envelope: result.data; legacy: the result object itself minus ok/success keys.
+ */
+function getIpcData(result) {
+  if (!result) return {};
+  if (result.success === true && result.data !== undefined) return result.data;
+  // Legacy compat: return the result itself
+  return result;
+}
+
 function normalizeError(resultOrError, fallback = 'Something went wrong') {
   if (!resultOrError) return fallback;
   if (typeof resultOrError === 'string') return resultOrError;
@@ -291,10 +313,12 @@ async function syncRemoteCaseFromResult(input) {
     remoteVersion: input.remoteVersion,
     syncStatus: input.syncStatus || 'live',
   });
-  if (!result || result.ok !== true || !result.case) {
+  if (!result || !isIpcSuccess(result)) {
     return null;
   }
-  return result.case;
+  const d = getIpcData(result);
+  if (!d.case) return null;
+  return d.case;
 }
 
 async function sendGatewayMediationCommand(ownerDeviceId, envelope, options = {}) {
@@ -311,17 +335,18 @@ async function sendGatewayMediationCommand(ownerDeviceId, envelope, options = {}
     maxRetries: options.maxRetries || 3,
     ...(authContext ? { authContext } : {}),
   });
-  if (!gatewayResult || gatewayResult.ok !== true) {
+  if (!gatewayResult || !isIpcSuccess(gatewayResult)) {
     return { ok: false, error: normalizeError(gatewayResult, 'Unable to reach remote mediation host') };
   }
 
-  const result = gatewayResult.result && typeof gatewayResult.result === 'object'
-    ? gatewayResult.result
+  const gwData = getIpcData(gatewayResult);
+  const result = gwData.result && typeof gwData.result === 'object'
+    ? gwData.result
     : null;
   if (!result) {
     return { ok: false, error: 'Remote mediation host returned an invalid response' };
   }
-  if (result.ok !== true) {
+  if (!isIpcSuccess(result)) {
     return { ok: false, error: normalizeError(result, 'Remote mediation command failed'), result };
   }
   return { ok: true, result };
@@ -533,6 +558,7 @@ function setCaseData(caseData) {
   if (!caseData || !caseData.id) return;
   state.caseId = caseData.id;
   state.caseData = caseData;
+  state.templateAdminView = null;
   choosePartyForCase(caseData);
   ensureCaseInList(caseData);
 }
@@ -575,7 +601,7 @@ async function startFlow() {
 
   try {
     const signInResult = await api.auth.signIn();
-    if (!signInResult || signInResult.ok !== true) {
+    if (!signInResult || !isIpcSuccess(signInResult)) {
       throw new Error(normalizeError(signInResult, 'Unable to sign in'));
     }
 
@@ -607,7 +633,7 @@ async function startFlow() {
 
 async function signOutFlow() {
   const result = await api.auth.signOut();
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Sign out failed'), 'error');
     return;
   }
@@ -625,13 +651,14 @@ async function signOutFlow() {
 
 async function refreshCases() {
   const result = await api.mediation.list();
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to load your mediations'), 'error');
     return;
   }
 
   const state = getState();
-  const incoming = Array.isArray(result.cases) ? result.cases.slice() : [];
+  const resultData = getIpcData(result);
+  const incoming = Array.isArray(resultData.cases) ? resultData.cases.slice() : [];
   state.cases = incoming.filter((entry) => {
     const status = String(entry?.syncMetadata?.syncStatus || '').trim().toLowerCase();
     return status !== 'left' && status !== 'removed';
@@ -707,7 +734,7 @@ function hydrateShareContextFromStorage() {
 
 async function refreshGatewayDevices(options = {}) {
   const result = await api.gateway.fetchDevices();
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     if (!options.silent) {
       showToast(normalizeError(result, 'Unable to refresh shared devices'), 'error');
     }
@@ -715,22 +742,24 @@ async function refreshGatewayDevices(options = {}) {
   }
 
   const shareState = getShareState();
-  shareState.devices = Array.isArray(result.devices) ? result.devices : [];
+  const devData = getIpcData(result);
+  shareState.devices = Array.isArray(devData.devices) ? devData.devices : [];
   shareState.devicesLoadedAt = nowIso();
 }
 
 async function loadCase(caseId, options = {}) {
   const result = await api.mediation.get(caseId);
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to load this mediation'), 'error');
     return null;
   }
 
-  setCaseData(result.case);
-  if (isSharedCase(result.case) && !isReadOnlySharedCase(result.case)) {
-    const context = getRemoteContextFromCase(result.case);
+  const casePayload = getIpcData(result);
+  setCaseData(casePayload.case);
+  if (isSharedCase(casePayload.case) && !isReadOnlySharedCase(casePayload.case)) {
+    const context = getRemoteContextFromCase(casePayload.case);
     if (context) {
-      const fetched = await getRemoteCaseSnapshot(context, result.case.id);
+      const fetched = await getRemoteCaseSnapshot(context, casePayload.case.id);
       if (fetched.ok && fetched.result.case && typeof fetched.result.case === 'object') {
         const syncedCase = await syncRemoteCaseFromResult({
           projectedCase: fetched.result.case,
@@ -767,7 +796,7 @@ async function loadCase(caseId, options = {}) {
   ) {
     void refreshShareGrants(ownDeviceId, { silent: true });
   }
-  return result.case;
+  return casePayload.case;
 }
 
 function getShareState() {
@@ -1037,12 +1066,31 @@ function resolveView() {
   const state = getState();
   const caseData = state.caseData;
 
+  // Template admin view is independent of caseData — check before dashboard fallback
+  if (state.templateAdminView === 'list' || state.templateAdminView === 'edit') return 'template-admin';
+
   if (!caseData) return 'dashboard';
+  if (caseData.phase === 'resolved') return 'resolved';
+  if (caseData.phase === 'closed') return 'closed';
+  // F-06: Block ALL views until main topic and template are fully configured
+  // Validate: mainTopicConfig must exist with non-empty topic,
+  // templateSelection must have valid templateId + templateVersion,
+  // AND the backend-computed templateValid flag must be true (c3_1: resolvability check)
+  const mtc = caseData.mainTopicConfig;
+  const tsel = caseData.templateSelection;
+  const hasValidTopic = mtc && typeof mtc.topic === 'string' && mtc.topic.trim().length > 0;
+  const hasValidTemplate = tsel
+    && typeof tsel.templateId === 'string' && tsel.templateId.trim().length > 0
+    && typeof tsel.templateVersion === 'number' && tsel.templateVersion > 0;
+  // c3_1: also check backend-computed templateValid flag (false when pin is stale/unresolvable)
+  const isTemplateResolvable = caseData.templateValid !== false;
+  if (!hasValidTopic || !hasValidTemplate || !isTemplateResolvable) {
+    return 'main-topic';
+  }
+  if (state.activeSubview === 'main-topic') return 'main-topic';
   if (state.activeSubview === 'private-intake') return 'private-intake';
   if (state.activeSubview === 'intake-summary') return 'intake-summary';
   if (state.activeSubview === 'group-chat') return 'group-chat';
-  if (caseData.phase === 'resolved') return 'resolved';
-  if (caseData.phase === 'closed') return 'closed';
   return 'case-detail';
 }
 
@@ -1318,6 +1366,10 @@ function renderDashboardView() {
             <div class="action-title">Join from Invite Link</div>
             <div class="action-desc">Open a shared mediation</div>
           </div>
+          <div class="action-card secondary" data-action="open-template-admin" style="opacity:0.8;">
+            <div class="action-title">Manage Templates</div>
+            <div class="action-desc">Coaching template admin</div>
+          </div>
         </div>
       </section>
 
@@ -1541,6 +1593,7 @@ function renderCaseDetailView() {
 
 function renderMessageBubble(message, caseData, currentPartyId) {
   const authorType = message.authorType || 'system';
+  const copyBtn = `<button class="msg-copy-btn" data-action="copy-message" data-copy-text="${escapeHtml(message.text || '')}">Copy</button>`;
 
   if (authorType === 'system') {
     return `<div class="msg-system">${escapeHtml(message.text || '')}</div>`;
@@ -1549,6 +1602,7 @@ function renderMessageBubble(message, caseData, currentPartyId) {
   if (authorType === 'mediator_llm') {
     return `
       <div class="msg-bubble msg-mediator">
+        ${copyBtn}
         <div class="msg-header">
           <span class="avatar avatar-sm avatar-ai">M</span>
           <span class="msg-author">Mediator</span>
@@ -1563,6 +1617,7 @@ function renderMessageBubble(message, caseData, currentPartyId) {
   if (authorType === 'party_llm') {
     return `
       <div class="msg-bubble msg-other">
+        ${copyBtn}
         <div class="msg-header">
           <span class="avatar avatar-sm avatar-ai">C</span>
           <span class="msg-author">Your Coach</span>
@@ -1582,6 +1637,7 @@ function renderMessageBubble(message, caseData, currentPartyId) {
 
   return `
     <div class="msg-bubble ${cls}">
+      ${copyBtn}
       ${isOwn ? '' : `
         <div class="msg-header">
           <span class="avatar avatar-sm ${avatarCls}">${escapeHtml(getInitial(partyName))}</span>
@@ -1590,6 +1646,78 @@ function renderMessageBubble(message, caseData, currentPartyId) {
       `}
       <div class="msg-content">${renderMarkdownUntrusted(message.text || '')}</div>
       <div class="msg-ts">${escapeHtml(formatTime(message.createdAt))}</div>
+    </div>
+  `;
+}
+
+/* ============================================================
+   RENDER: MAIN TOPIC VIEW (F-06)
+   ============================================================ */
+
+function renderMainTopicView() {
+  const state = getState();
+  const caseData = state.caseData;
+  if (!caseData) return '<section class="panel">Mediation not found.</section>';
+
+  const form = state.mainTopicForm || { topic: '', description: '', categoryId: '', templateId: '' };
+  const categories = state.mainTopicCategories || [];
+  const templates = state.mainTopicTemplates || [];
+
+  const categoryOptions = categories.map((cat) =>
+    `<option value="${escapeHtml(cat.id)}" ${cat.id === form.categoryId ? 'selected' : ''}>${escapeHtml(cat.name)}</option>`
+  ).join('');
+
+  const templateOptions = templates
+    .filter((t) => !form.categoryId || t.categoryId === form.categoryId)
+    .filter((t) => t.status === 'active')
+    .map((t) =>
+      `<option value="${escapeHtml(t.id)}" ${t.id === form.templateId ? 'selected' : ''}>${escapeHtml(t.name)}</option>`
+    ).join('');
+
+  return `
+    <div class="stack">
+      <section class="topbar">
+        <div class="row">
+          <button class="back-btn" data-action="back-dashboard">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
+          <div>
+            <h2>Main Topic</h2>
+            <div class="meta">Configure the topic and template for this mediation</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <form class="main-topic-form" data-submit-action="submit-main-topic">
+          <label>
+            Topic
+            <input type="text" name="mainTopicTitle" value="${escapeHtml(form.topic || caseData.topic || '')}" placeholder="What is this mediation about?" required />
+          </label>
+          <label>
+            Description
+            <textarea name="mainTopicDescription" rows="3" placeholder="Provide more context about the issue...">${escapeHtml(form.description || caseData.description || '')}</textarea>
+          </label>
+          <label>
+            Category
+            <select name="mainTopicCategory">
+              <option value="">Select a category</option>
+              ${categoryOptions}
+            </select>
+          </label>
+          <label>
+            Template
+            <select name="mainTopicTemplate">
+              <option value="">Select a template</option>
+              ${templateOptions}
+            </select>
+          </label>
+          <div class="view-actions">
+            <button type="submit" class="primary">Continue</button>
+          </div>
+        </form>
+      </section>
     </div>
   `;
 }
@@ -1772,6 +1900,16 @@ function renderCoachPanel(caseData, partyId, overlayMode = false) {
   const draftInputKey = `draft:${caseData.id}:${partyId}`;
   const draftInput = state.chatDrafts.get(draftInputKey) || '';
 
+  // Determine coach phase (v2 or legacy)
+  const coachMeta = draft?.coachMeta;
+  const phase = coachMeta?.phase || 'exploring';
+  const isV2 = Boolean(coachMeta);
+
+  // Phase chip
+  const phaseChipClass = phase === 'exploring' ? 'exploring' : phase === 'confirm_ready' ? 'confirm-ready' : 'draft-ready';
+  const phaseLabel = phase === 'exploring' ? 'Exploring' : phase === 'confirm_ready' ? 'Ready to Draft' : 'Draft Ready';
+  const phaseChip = isV2 ? `<span class="coach-phase-chip ${phaseChipClass}">${phaseLabel}</span>` : '';
+
   const composeMessages = draft
     ? draft.composeMessages.map((entry) => `
       <div class="msg-bubble ${entry.author === 'party' ? 'msg-own' : 'msg-other'}">
@@ -1790,26 +1928,43 @@ function renderCoachPanel(caseData, partyId, overlayMode = false) {
 
   const suggestedText = draft && draft.suggestedText ? draft.suggestedText : '';
 
-  return `
-    <aside class="coach-panel ${overlayMode ? 'overlay' : ''}" role="dialog" aria-modal="${overlayMode ? 'true' : 'false'}">
-      <div class="row" style="justify-content:space-between;">
-        <h3 class="section-title" style="margin:0;">Drafting Assistant</h3>
-        <button class="ghost" data-action="close-coach-panel">Close</button>
+  // Phase-aware controls
+  let controls = '';
+  if (isV2 && phase === 'formal_draft_ready' && suggestedText) {
+    // Show editable draft with approve/reject
+    controls = `
+      <div class="suggestion">
+        <div class="small muted" style="margin-bottom: 6px;">Formal Draft</div>
+        <textarea name="approvedText" id="draft-approved-text">${escapeHtml(suggestedText)}</textarea>
+        <div class="view-actions" style="margin-top: 8px;">
+          <button class="success" data-action="approve-draft">Send This Message</button>
+          <button class="ghost" data-action="reject-draft">Back to Exploring</button>
+        </div>
       </div>
-
-      <section class="chat-messages" role="log" aria-live="polite" style="min-height:200px; max-height:36vh;">
-        ${composeMessages}
-      </section>
-
+    `;
+  } else if (isV2 && phase === 'confirm_ready') {
+    // Ready to generate formal draft
+    controls = `
+      <form class="chat-input-area" data-submit-action="send-draft-message">
+        <textarea data-draft-key="${escapeHtml(draftInputKey)}" name="draftMessage" placeholder="Any final thoughts before generating the draft..." rows="2">${escapeHtml(draftInput)}</textarea>
+        <div class="chat-input-actions">
+          <button type="button" class="ghost" data-action="reset-to-exploring">Back to Exploring</button>
+          <button type="button" class="primary" data-action="generate-formal-draft">Generate Formal Draft</button>
+        </div>
+      </form>
+    `;
+  } else {
+    // Exploring phase (v2) or legacy mode
+    controls = `
       <form class="chat-input-area" data-submit-action="send-draft-message">
         <textarea data-draft-key="${escapeHtml(draftInputKey)}" name="draftMessage" placeholder="Describe what you want to say..." rows="2">${escapeHtml(draftInput)}</textarea>
         <div class="chat-input-actions">
-          ${draft ? '<button type="button" class="ghost" data-action="run-draft-suggestion">Get Suggestion</button>' : ''}
+          ${isV2 && draft ? '<button type="button" class="ghost" data-action="set-draft-ready">Ready to Draft</button>' : ''}
+          ${!isV2 && draft ? '<button type="button" class="ghost" data-action="run-draft-suggestion">Get Suggestion</button>' : ''}
           <button type="submit" class="primary">Send to Coach</button>
         </div>
       </form>
-
-      ${suggestedText ? `
+      ${!isV2 && suggestedText ? `
         <div class="suggestion">
           <div class="small muted" style="margin-bottom: 6px;">Suggested message</div>
           <textarea name="approvedText" id="draft-approved-text">${escapeHtml(suggestedText)}</textarea>
@@ -1819,6 +1974,24 @@ function renderCoachPanel(caseData, partyId, overlayMode = false) {
           </div>
         </div>
       ` : ''}
+    `;
+  }
+
+  return `
+    <aside class="coach-panel ${overlayMode ? 'overlay' : ''}" role="dialog" aria-modal="${overlayMode ? 'true' : 'false'}">
+      <div class="row" style="justify-content:space-between; align-items:center;">
+        <div class="row" style="gap: var(--sp-2); align-items: center;">
+          <h3 class="section-title" style="margin:0;">Conversation Draft Coach</h3>
+          ${phaseChip}
+        </div>
+        <button class="ghost" data-action="close-coach-panel">Close</button>
+      </div>
+
+      <section class="chat-messages" role="log" aria-live="polite" style="min-height:200px; max-height:36vh;">
+        ${composeMessages}
+      </section>
+
+      ${controls}
     </aside>
   `;
 }
@@ -2022,6 +2195,146 @@ function renderModal() {
     return;
   }
 
+  if (state.modal.type === 'create-template') {
+    const categories = state.templateAdminData?.categories || [];
+    const categoryOptions = categories.map((c) =>
+      `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`
+    ).join('');
+
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop">
+        <form class="modal stack" data-submit-action="create-template">
+          <h3 class="section-title">New Template</h3>
+          <label class="muted small">Name</label>
+          <input type="text" name="templateName" required placeholder="Template name" />
+          <label class="muted small">Description</label>
+          <textarea name="templateDescription" placeholder="Optional description..."></textarea>
+          ${categories.length > 0 ? `
+            <label class="muted small">Category</label>
+            <select name="categoryId">
+              ${categoryOptions}
+            </select>
+          ` : ''}
+          <label class="muted small">Global Guidance</label>
+          <textarea name="globalGuidance" rows="3" placeholder="Global guidance applied to all roles..."></textarea>
+          <label class="muted small">Intake Coach Preamble</label>
+          <textarea name="intakeCoachPreamble" rows="2" placeholder="Intake coach role preamble..."></textarea>
+          <label class="muted small">Draft Coach Preamble</label>
+          <textarea name="draftCoachPreamble" rows="2" placeholder="Draft coach role preamble..."></textarea>
+          <label class="muted small">Mediator Preamble</label>
+          <textarea name="mediatorPreamble" rows="2" placeholder="Mediator role preamble..."></textarea>
+          <label class="muted small">Intake Coach Instructions</label>
+          <textarea name="intakeCoachInstructions" rows="2" placeholder="Intake coach instructions..."></textarea>
+          <label class="muted small">Draft Coach Instructions</label>
+          <textarea name="draftCoachInstructions" rows="2" placeholder="Draft coach instructions..."></textarea>
+          <label class="muted small">Mediator Instructions</label>
+          <textarea name="mediatorInstructions" rows="2" placeholder="Mediator instructions..."></textarea>
+          <label class="muted small">Change Note</label>
+          <input type="text" name="changeNote" placeholder="Reason for this version..." />
+          <div class="view-actions">
+            <button type="submit" class="primary">Create Template</button>
+            <button type="button" class="ghost" data-action="close-modal">Cancel</button>
+          </div>
+        </form>
+      </div>
+    `;
+    return;
+  }
+
+  if (state.modal.type === 'create-version') {
+    const templateId = state.modal.fields?.templateId || '';
+    const restoreFromVersion = state.modal.fields?.restoreFromVersion || '';
+    const editFromVersion = state.modal.fields?.editFromVersion || '';
+    const sourceVersionNum = restoreFromVersion || editFromVersion;
+
+    let titleLabel = 'New Version';
+    let defaultChangeNote = '';
+    if (restoreFromVersion) {
+      titleLabel = `New Version (restoring from v${restoreFromVersion})`;
+      defaultChangeNote = `Restored from v${restoreFromVersion}`;
+    } else if (editFromVersion) {
+      titleLabel = `Edit Version v${editFromVersion}`;
+    }
+
+    // Pre-populate fields from the source version, if applicable
+    const sourceVersion = sourceVersionNum
+      ? (state.templateAdminData?.versions || []).find((v) => String(v.versionNumber) === String(sourceVersionNum))
+      : null;
+
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop">
+        <form class="modal stack" data-submit-action="create-version">
+          <h3 class="section-title">${titleLabel}</h3>
+          <input type="hidden" name="templateId" value="${escapeHtml(templateId)}" />
+          ${restoreFromVersion ? `<input type="hidden" name="restoreFromVersion" value="${escapeHtml(String(restoreFromVersion))}" />` : ''}
+          <label class="muted small">Global Guidance</label>
+          <textarea name="globalGuidance" rows="3" placeholder="Global guidance applied to all roles...">${escapeHtml(sourceVersion?.globalGuidance || '')}</textarea>
+          <label class="muted small">Intake Coach Preamble</label>
+          <textarea name="intakeCoachPreamble" rows="2" placeholder="Intake coach role preamble...">${escapeHtml(sourceVersion?.intakeCoachPreamble || sourceVersion?.preambles?.intake || '')}</textarea>
+          <label class="muted small">Draft Coach Preamble</label>
+          <textarea name="draftCoachPreamble" rows="2" placeholder="Draft coach role preamble...">${escapeHtml(sourceVersion?.draftCoachPreamble || sourceVersion?.preambles?.draft_coach || '')}</textarea>
+          <label class="muted small">Mediator Preamble</label>
+          <textarea name="mediatorPreamble" rows="2" placeholder="Mediator role preamble...">${escapeHtml(sourceVersion?.mediatorPreamble || sourceVersion?.preambles?.mediator || '')}</textarea>
+          <label class="muted small">Intake Coach Instructions</label>
+          <textarea name="intakeCoachInstructions" rows="2" placeholder="Intake coach instructions...">${escapeHtml(sourceVersion?.intakeCoachInstructions || sourceVersion?.instructions?.intake || '')}</textarea>
+          <label class="muted small">Draft Coach Instructions</label>
+          <textarea name="draftCoachInstructions" rows="2" placeholder="Draft coach instructions...">${escapeHtml(sourceVersion?.draftCoachInstructions || sourceVersion?.instructions?.draft_coach || '')}</textarea>
+          <label class="muted small">Mediator Instructions</label>
+          <textarea name="mediatorInstructions" rows="2" placeholder="Mediator instructions...">${escapeHtml(sourceVersion?.mediatorInstructions || sourceVersion?.instructions?.mediator || '')}</textarea>
+          <label class="muted small">Change Note (required)</label>
+          <input type="text" name="changeNote" required placeholder="What changed in this version..." value="${escapeHtml(defaultChangeNote)}" />
+          <div class="view-actions">
+            <button type="submit" class="primary">${editFromVersion ? 'Save as New Version' : 'Publish Version'}</button>
+            <button type="button" class="ghost" data-action="close-modal">Cancel</button>
+          </div>
+        </form>
+      </div>
+    `;
+    return;
+  }
+
+  if (state.modal.type === 'create-category') {
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop">
+        <form class="modal stack" data-submit-action="create-category">
+          <h3 class="section-title">New Category</h3>
+          <label class="muted small">Name</label>
+          <input type="text" name="categoryName" required placeholder="Category name" />
+          <label class="muted small">Description</label>
+          <textarea name="categoryDescription" placeholder="Optional description..."></textarea>
+          <div class="view-actions">
+            <button type="submit" class="primary">Create Category</button>
+            <button type="button" class="ghost" data-action="close-modal">Cancel</button>
+          </div>
+        </form>
+      </div>
+    `;
+    return;
+  }
+
+  if (state.modal.type === 'edit-category') {
+    const catId = state.modal.fields?.categoryId || '';
+    const catName = state.modal.fields?.name || '';
+    const catDesc = state.modal.fields?.description || '';
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop">
+        <form class="modal stack" data-submit-action="edit-category">
+          <h3 class="section-title">Edit Category</h3>
+          <input type="hidden" name="categoryId" value="${escapeHtml(catId)}" />
+          <label class="muted small">Name</label>
+          <input type="text" name="categoryName" required placeholder="Category name" value="${escapeHtml(catName)}" />
+          <label class="muted small">Description</label>
+          <textarea name="categoryDescription" placeholder="Optional description...">${escapeHtml(catDesc)}</textarea>
+          <div class="view-actions">
+            <button type="submit" class="primary">Save</button>
+            <button type="button" class="ghost" data-action="close-modal">Cancel</button>
+          </div>
+        </form>
+      </div>
+    `;
+    return;
+  }
+
   modalRoot.innerHTML = '';
 }
 
@@ -2036,6 +2349,8 @@ function render() {
     appRoot.innerHTML = renderDashboardView();
   } else if (view === 'case-detail') {
     appRoot.innerHTML = renderCaseDetailView();
+  } else if (view === 'main-topic') {
+    appRoot.innerHTML = renderMainTopicView();
   } else if (view === 'private-intake') {
     appRoot.innerHTML = renderPrivateIntakeView();
   } else if (view === 'intake-summary') {
@@ -2044,6 +2359,8 @@ function render() {
     appRoot.innerHTML = renderGroupChatView();
   } else if (view === 'resolved') {
     appRoot.innerHTML = renderResolvedView();
+  } else if (view === 'template-admin') {
+    appRoot.innerHTML = renderTemplateAdminView();
   } else {
     appRoot.innerHTML = renderClosedView();
   }
@@ -2051,8 +2368,504 @@ function render() {
   renderModal();
   renderToast();
 
+  // Auto-scroll chat messages and render jump-to-latest affordance (Section 6.2.1)
   for (const node of appRoot.querySelectorAll('.chat-messages')) {
-    node.scrollTop = node.scrollHeight;
+    const isNearBottom = (node.scrollHeight - node.scrollTop - node.clientHeight) < 80;
+    if (isNearBottom) {
+      node.scrollTop = node.scrollHeight;
+    }
+
+    // Show or hide jump-to-latest button
+    const existingJump = node.querySelector('.jump-to-latest');
+    if (existingJump) existingJump.remove();
+
+    if (!isNearBottom && node.scrollHeight > node.clientHeight + 200) {
+      const jumpBtn = document.createElement('div');
+      jumpBtn.className = 'jump-to-latest';
+      jumpBtn.textContent = '↓ Jump to latest';
+      jumpBtn.addEventListener('click', () => {
+        node.scrollTop = node.scrollHeight;
+        jumpBtn.remove();
+      });
+      node.appendChild(jumpBtn);
+    }
+  }
+
+  // Render typing indicators
+  renderTypingIndicators();
+}
+
+/* ============================================================
+   RENDER: TEMPLATE ADMIN VIEW (F-05)
+   ============================================================ */
+
+function renderTemplateAdminView() {
+  const state = getState();
+  const data = state.templateAdminData || { categories: [], templates: [], selectedTemplate: null, versions: [] };
+
+  const templateRows = data.templates.map((tpl) => `
+    <div class="participant-row" style="cursor:pointer;" data-action="select-admin-template" data-template-id="${escapeHtml(tpl.id)}">
+      <div class="participant">
+        <strong>${escapeHtml(tpl.name)}</strong>
+        <span class="badge ${tpl.status === 'active' ? '' : 'closed'}" style="font-size:10px;">${escapeHtml(tpl.status)}</span>
+      </div>
+      <span class="status-line">${escapeHtml(tpl.description || '')}</span>
+    </div>
+  `).join('');
+
+  const selectedTemplate = data.selectedTemplate;
+  const currentVersion = selectedTemplate?.currentVersion || 0;
+  const versionRows = data.versions.map((v) => {
+    const isCurrent = v.versionNumber === currentVersion;
+    const changeText = v.changeNote || v.changeNotes || '';
+    const actorText = v.createdByActorId || v.actorId || '';
+    return `
+    <div class="participant-row">
+      <div class="participant">
+        <strong>v${v.versionNumber}${isCurrent ? ' (current)' : ''}</strong>
+        <span class="status-line">${escapeHtml(changeText)}</span>
+      </div>
+      <div class="row" style="gap: var(--sp-1); align-items: center;">
+        <span class="meta">${escapeHtml(formatShortDate(v.createdAt))} by ${escapeHtml(actorText)}</span>
+        ${isCurrent ? `<button class="ghost" style="font-size:var(--text-xs);padding:2px 6px;" data-action="edit-admin-version" data-template-id="${escapeHtml(selectedTemplate.id)}" data-version-number="${v.versionNumber}">Edit</button>` : `<button class="ghost" style="font-size:var(--text-xs);padding:2px 6px;" data-action="restore-admin-version" data-template-id="${escapeHtml(selectedTemplate.id)}" data-version-number="${v.versionNumber}">Restore</button>`}
+      </div>
+    </div>
+  `;
+  }).join('');
+
+  const categories = data.categories || [];
+  const categoryRows = categories.map((cat) => `
+    <div class="participant-row">
+      <div class="participant">
+        <strong>${escapeHtml(cat.name)}</strong>
+        <span class="status-line">${escapeHtml(cat.description || '')}</span>
+      </div>
+      <div class="row" style="gap: var(--sp-1); align-items: center;">
+        <button class="ghost" style="font-size:var(--text-xs);padding:2px 6px;" data-action="edit-admin-category" data-category-id="${escapeHtml(cat.id)}" data-category-name="${escapeHtml(cat.name)}" data-category-description="${escapeHtml(cat.description || '')}">Edit</button>
+        <button class="ghost" style="font-size:var(--text-xs);padding:2px 6px;color:var(--error);" data-action="delete-admin-category" data-category-id="${escapeHtml(cat.id)}">Delete</button>
+      </div>
+    </div>
+  `).join('');
+
+  return `
+    <div class="stack">
+      <section class="topbar">
+        <div class="row">
+          <button class="back-btn" data-action="back-dashboard">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </button>
+          <div>
+            <h2>Manage Templates</h2>
+            <div class="meta">Create and manage coaching templates</div>
+          </div>
+        </div>
+      </section>
+
+      <div class="chat-layout with-coach">
+        <section class="panel">
+          <h3 class="section-title">Templates</h3>
+          ${templateRows || '<div class="muted small">No templates found.</div>'}
+          <div class="view-actions" style="margin-top: var(--sp-3);">
+            <button class="primary" data-action="create-admin-template">New Template</button>
+          </div>
+
+          <h3 class="section-title" style="margin-top: var(--sp-4);">Categories</h3>
+          ${categoryRows || '<div class="muted small">No categories found.</div>'}
+          <div class="view-actions" style="margin-top: var(--sp-3);">
+            <button class="ghost" data-action="create-admin-category">New Category</button>
+          </div>
+        </section>
+
+        ${selectedTemplate ? `
+          <section class="panel">
+            <h3 class="section-title">${escapeHtml(selectedTemplate.name)}</h3>
+            <p class="muted small">${escapeHtml(selectedTemplate.description || 'No description')}</p>
+            <div class="view-actions" style="margin-bottom: var(--sp-3);">
+              <button class="primary" data-action="create-admin-version" data-template-id="${escapeHtml(selectedTemplate.id)}">New Version</button>
+              <button class="ghost" data-action="archive-admin-template" data-template-id="${escapeHtml(selectedTemplate.id)}">
+                ${selectedTemplate.status === 'active' ? 'Archive' : 'Activate'}
+              </button>
+              <button class="ghost" style="color:var(--error);" data-action="delete-admin-template" data-template-id="${escapeHtml(selectedTemplate.id)}">Delete</button>
+            </div>
+            <h4 class="section-title" style="font-size: var(--text-sm);">Version History</h4>
+            ${versionRows || '<div class="muted small">No versions.</div>'}
+          </section>
+        ` : '<section class="panel"><div class="muted small">Select a template to view details.</div></section>'}
+      </div>
+    </div>
+  `;
+}
+
+/* ============================================================
+   TYPING INDICATORS (F-02)
+   ============================================================ */
+
+function renderTypingIndicators() {
+  const state = getState();
+  const indicators = state.typingIndicators || {};
+  const now = Date.now();
+
+  // Clear expired indicators (15s TTL per Section 6.2.1)
+  for (const [key, entry] of Object.entries(indicators)) {
+    if (now - entry.startedAt > 15000) {
+      delete indicators[key];
+    }
+  }
+
+  // Inject indicators into chat containers
+  for (const node of appRoot.querySelectorAll('.chat-messages')) {
+    const existing = node.querySelector('.typing-indicator');
+    if (existing) existing.remove();
+
+    const activeIndicators = Object.values(indicators).filter((i) => i.active);
+    if (activeIndicators.length > 0) {
+      // Section 6.2.1: source-specific labels
+      // "AI is thinking..." for ai_generation; "{Party name} is typing..." for remote_party
+      const labelParts = activeIndicators.map((i) => {
+        const sourceType = i.sourceType || 'ai_generation';
+        const displayName = i.label || 'AI';
+        if (sourceType === 'remote_party') {
+          return `${escapeHtml(displayName)} is typing\u2026`;
+        }
+        return `${escapeHtml(displayName)} is thinking\u2026`;
+      });
+      const indicator = document.createElement('div');
+      indicator.className = 'typing-indicator';
+      indicator.innerHTML = `
+        <span class="typing-dots">
+          <span class="typing-dot"></span>
+          <span class="typing-dot"></span>
+          <span class="typing-dot"></span>
+        </span>
+        <span>${labelParts.join(', ')}</span>
+      `;
+      node.appendChild(indicator);
+      node.scrollTop = node.scrollHeight;
+    }
+  }
+}
+
+const TYPING_DEBOUNCE_MAP = new Map();
+const TYPING_DEBOUNCE_MS = 2000; // Section 6.2.1: 2-second debounce for remote party signals
+
+function setTypingIndicator(key, active, label = 'AI', sourceType = 'ai_generation') {
+  const state = getState();
+  if (!state.typingIndicators) state.typingIndicators = {};
+
+  if (active) {
+    // Remote party debounce (Section 6.2.1): repeated start signals within 2s are ignored
+    const lastStart = TYPING_DEBOUNCE_MAP.get(key);
+    const now = Date.now();
+    if (lastStart && (now - lastStart) < TYPING_DEBOUNCE_MS && state.typingIndicators[key]?.active) {
+      return;
+    }
+    TYPING_DEBOUNCE_MAP.set(key, now);
+    state.typingIndicators[key] = { active: true, label, sourceType, startedAt: now };
+  } else {
+    TYPING_DEBOUNCE_MAP.delete(key);
+    delete state.typingIndicators[key];
+  }
+  renderTypingIndicators();
+}
+
+/* ============================================================
+   MAIN TOPIC DATA LOADING (F-06)
+   ============================================================ */
+
+async function loadMainTopicData() {
+  try {
+    const [catResult, tplResult] = await Promise.all([
+      api.templates.listCategories(),
+      api.templates.list(),
+    ]);
+
+    const state = getState();
+    if (catResult && isIpcSuccess(catResult)) {
+      const catData = getIpcData(catResult);
+      state.mainTopicCategories = catData.categories || (Array.isArray(catData) ? catData : []);
+    }
+    if (tplResult && isIpcSuccess(tplResult)) {
+      const tplData = getIpcData(tplResult);
+      state.mainTopicTemplates = tplData.templates || (Array.isArray(tplData) ? tplData : []);
+
+      // Auto-select first active template if none selected
+      if (!state.mainTopicForm.templateId && state.mainTopicTemplates.length > 0) {
+        const first = state.mainTopicTemplates.find((t) => t.status === 'active');
+        if (first) {
+          state.mainTopicForm.templateId = first.id;
+          if (first.categoryId) {
+            state.mainTopicForm.categoryId = first.categoryId;
+          }
+        }
+      }
+    }
+  } catch {
+    // best effort
+  }
+}
+
+async function handleSubmitMainTopic(form) {
+  const state = getState();
+  const caseData = state.caseData;
+  if (!caseData) return;
+
+  const topic = String(form.mainTopicTitle?.value || '').trim();
+  const description = String(form.mainTopicDescription?.value || '').trim();
+  const categoryId = String(form.mainTopicCategory?.value || '').trim();
+  const templateId = String(form.mainTopicTemplate?.value || '').trim();
+
+  if (!topic) {
+    showToast('Please enter a topic for this mediation.', 'error');
+    return;
+  }
+
+  if (!templateId) {
+    showToast('Please select a template for this mediation.', 'error');
+    return;
+  }
+
+  // Resolve the current party (acting user)
+  const current = getCurrentParty(caseData);
+  const partyId = current ? current.partyId : '';
+  if (!partyId) {
+    showToast('Unable to determine acting party.', 'error');
+    return;
+  }
+
+  // Resolve template version number for the selected template
+  let templateVersion = 1;
+  try {
+    const tplResult = await api.templates.get(templateId);
+    if (tplResult && isIpcSuccess(tplResult)) {
+      const tplData = getIpcData(tplResult);
+      const version = tplData.version;
+      if (version) {
+        templateVersion = version.versionNumber || version.version || 1;
+      }
+    }
+  } catch {
+    // best-effort: fall back to version 1
+  }
+
+  // Send the full SetMainTopicRequest (Section 7.1) in a single call
+  // The IPC handler persists both mainTopicConfig and templateSelection atomically
+  const topicResult = await api.mediation.setMainTopic({
+    caseId: caseData.id,
+    topic,
+    description,
+    categoryId,
+    templateId,
+    templateVersion,
+    partyId,
+  });
+
+  if (!topicResult || !isIpcSuccess(topicResult)) {
+    showToast(normalizeError(topicResult, 'Unable to save topic'), 'error');
+    return;
+  }
+
+  // Refresh case data to get fully updated mainTopicConfig + templateSelection
+  const refreshResult = await api.mediation.get(caseData.id);
+  if (refreshResult && isIpcSuccess(refreshResult)) {
+    const refreshData = getIpcData(refreshResult);
+    setCaseData(refreshData.case || refreshData);
+  }
+
+  state.activeSubview = 'private-intake';
+  state.mainTopicForm = { topic: '', description: '', categoryId: '', templateId: '' };
+  render();
+}
+
+/* ============================================================
+   TEMPLATE ADMIN DATA LOADING (F-05)
+   ============================================================ */
+
+async function loadTemplateAdminData() {
+  try {
+    const [catResult, tplResult] = await Promise.all([
+      api.templates.listCategories(),
+      api.templates.list(),
+    ]);
+
+    const state = getState();
+    if (catResult && isIpcSuccess(catResult)) {
+      const catData = getIpcData(catResult);
+      state.templateAdminData.categories = catData.categories || (Array.isArray(catData) ? catData : []);
+    }
+    if (tplResult && isIpcSuccess(tplResult)) {
+      const tplData = getIpcData(tplResult);
+      state.templateAdminData.templates = tplData.templates || (Array.isArray(tplData) ? tplData : []);
+    }
+  } catch {
+    // best effort
+  }
+}
+
+/* ============================================================
+   TEMPLATE ADMIN: CREATE (F-05)
+   ============================================================ */
+
+async function handleCreateTemplate(form) {
+  const name = String(form.templateName?.value || '').trim();
+  if (!name) {
+    showToast('Template name is required.', 'error');
+    return;
+  }
+
+  const description = String(form.templateDescription?.value || '').trim();
+  const categoryId = String(form.categoryId?.value || '').trim();
+  const globalGuidance = String(form.globalGuidance?.value || '').trim();
+  const changeNote = String(form.changeNote?.value || 'Initial version').trim();
+
+  try {
+    const result = await api.templates.create({
+      name,
+      description,
+      categoryId,
+      globalGuidance,
+      intakeCoachPreamble: String(form.intakeCoachPreamble?.value || '').trim(),
+      draftCoachPreamble: String(form.draftCoachPreamble?.value || '').trim(),
+      mediatorPreamble: String(form.mediatorPreamble?.value || '').trim(),
+      intakeCoachInstructions: String(form.intakeCoachInstructions?.value || '').trim(),
+      draftCoachInstructions: String(form.draftCoachInstructions?.value || '').trim(),
+      mediatorInstructions: String(form.mediatorInstructions?.value || '').trim(),
+      changeNote,
+      actorId: 'local_owner',
+    });
+    if (result && isIpcSuccess(result)) {
+      showToast('Template created.', 'success');
+      const state = getState();
+      state.modal = null;
+      await loadTemplateAdminData();
+      render();
+    } else {
+      showToast(normalizeError(result, 'Failed to create template.'), 'error');
+    }
+  } catch (err) {
+    showToast('Failed to create template.', 'error');
+  }
+}
+
+/* ============================================================
+   TEMPLATE ADMIN: CREATE VERSION (F-05)
+   ============================================================ */
+
+async function handleCreateVersion(form) {
+  const templateId = String(form.templateId?.value || '').trim();
+  const changeNote = String(form.changeNote?.value || '').trim();
+
+  if (!templateId) {
+    showToast('Template ID is missing.', 'error');
+    return;
+  }
+  if (!changeNote) {
+    showToast('Change note is required for new versions.', 'error');
+    return;
+  }
+
+  const restoreFromVersion = form.restoreFromVersion?.value ? Number(form.restoreFromVersion.value) : undefined;
+
+  try {
+    const result = await api.templates.createVersion({
+      templateId,
+      globalGuidance: String(form.globalGuidance?.value || '').trim(),
+      intakeCoachPreamble: String(form.intakeCoachPreamble?.value || '').trim(),
+      draftCoachPreamble: String(form.draftCoachPreamble?.value || '').trim(),
+      mediatorPreamble: String(form.mediatorPreamble?.value || '').trim(),
+      intakeCoachInstructions: String(form.intakeCoachInstructions?.value || '').trim(),
+      draftCoachInstructions: String(form.draftCoachInstructions?.value || '').trim(),
+      mediatorInstructions: String(form.mediatorInstructions?.value || '').trim(),
+      changeNote,
+      actorId: 'local_owner',
+      restoreFromVersion,
+    });
+    if (result && isIpcSuccess(result)) {
+      showToast('Version published.', 'success');
+      const state = getState();
+      state.modal = null;
+      // Refresh the selected template and versions
+      try {
+        const refreshResult = await api.templates.get(templateId);
+        if (refreshResult && isIpcSuccess(refreshResult)) {
+          const data = getIpcData(refreshResult);
+          state.templateAdminData.selectedTemplate = data.template || null;
+          state.templateAdminData.versions = data.versions || [];
+        }
+      } catch { /* best-effort */ }
+      await loadTemplateAdminData();
+      render();
+    } else {
+      showToast(normalizeError(result, 'Failed to publish version.'), 'error');
+    }
+  } catch (err) {
+    showToast('Failed to publish version.', 'error');
+  }
+}
+
+/* ============================================================
+   TEMPLATE ADMIN: CATEGORY CRUD (F-05)
+   ============================================================ */
+
+async function handleCreateCategory(form) {
+  const name = String(form.categoryName?.value || '').trim();
+  if (!name) {
+    showToast('Category name is required.', 'error');
+    return;
+  }
+  const description = String(form.categoryDescription?.value || '').trim();
+
+  try {
+    const result = await api.templates.createCategory({
+      name,
+      description,
+      actorId: 'local_owner',
+    });
+    if (result && isIpcSuccess(result)) {
+      showToast('Category created.', 'success');
+      const state = getState();
+      state.modal = null;
+      await loadTemplateAdminData();
+      render();
+    } else {
+      showToast(normalizeError(result, 'Failed to create category.'), 'error');
+    }
+  } catch (err) {
+    showToast('Failed to create category.', 'error');
+  }
+}
+
+async function handleEditCategory(form) {
+  const categoryId = String(form.categoryId?.value || '').trim();
+  if (!categoryId) {
+    showToast('Category ID is missing.', 'error');
+    return;
+  }
+  const name = String(form.categoryName?.value || '').trim();
+  if (!name) {
+    showToast('Category name is required.', 'error');
+    return;
+  }
+  const description = String(form.categoryDescription?.value || '').trim();
+
+  try {
+    const result = await api.templates.updateCategory({
+      categoryId,
+      name,
+      description,
+      actorId: 'local_owner',
+    });
+    if (result && isIpcSuccess(result)) {
+      showToast('Category updated.', 'success');
+      const state = getState();
+      state.modal = null;
+      await loadTemplateAdminData();
+      render();
+    } else {
+      showToast(normalizeError(result, 'Failed to update category.'), 'error');
+    }
+  } catch (err) {
+    showToast('Failed to update category.', 'error');
   }
 }
 
@@ -2083,8 +2896,8 @@ async function handleCreateCase(form) {
     topic,
     description,
     parties: [
-      { id: 'party_a', displayName: partyAName, localLLM: { provider: 'claude', model: 'sonnet' } },
-      { id: 'party_b', displayName: partyBName, localLLM: { provider: 'claude', model: 'sonnet' } },
+      { id: 'party_a', displayName: partyAName, localLLM: { provider: 'chatgpt', model: 'gpt-4o' } },
+      { id: 'party_b', displayName: partyBName, localLLM: { provider: 'chatgpt', model: 'gpt-4o' } },
     ],
     consent: {
       byPartyId: {
@@ -2095,27 +2908,32 @@ async function handleCreateCase(form) {
   };
 
   const createResult = await api.mediation.create(payload);
-  if (!createResult || createResult.ok !== true) {
+  if (!createResult || !isIpcSuccess(createResult)) {
     showToast(normalizeError(createResult, 'Unable to create mediation'), 'error');
     return;
   }
 
-  const createdCase = createResult.case;
+  const createdCase = getIpcData(createResult).case;
   const joinResult = await api.mediation.join({
     caseId: createdCase.id,
     partyId: 'party_a',
   });
 
-  if (!joinResult || joinResult.ok !== true) {
+  if (!joinResult || !isIpcSuccess(joinResult)) {
     showToast(normalizeError(joinResult, 'Created but unable to join automatically'), 'error');
     return;
   }
 
   const state = getState();
   state.partyByCase[createdCase.id] = 'party_a';
-  setCaseData(joinResult.case);
+  setCaseData(getIpcData(joinResult).case);
   state.createFormExpanded = false;
-  state.activeSubview = 'private-intake';
+  // F-06: Route to main-topic view instead of directly to private-intake
+  // The view router will handle gating based on mainTopicConfig/templateSelection
+  state.activeSubview = 'main-topic';
+
+  // Load categories and templates for the main topic form
+  await loadMainTopicData();
 
   await refreshCases();
   render();
@@ -2131,15 +2949,16 @@ async function refreshShareGrants(deviceId, options = {}) {
 
   try {
     const result = await api.gateway.listShareGrants(id);
-    if (!result || result.ok !== true) {
+    if (!result || !isIpcSuccess(result)) {
       if (!options.silent) {
         showToast(normalizeError(result, 'Unable to load grants'), 'error');
       }
       return;
     }
 
-    const grants = Array.isArray(result.grants)
-      ? result.grants.map((row) => normalizeGrantRow(row)).filter(Boolean)
+    const grantData = getIpcData(result);
+    const grants = Array.isArray(grantData.grants)
+      ? grantData.grants.map((row) => normalizeGrantRow(row)).filter(Boolean)
       : [];
     shareState.grantsByDevice[id] = {
       grants,
@@ -2163,7 +2982,7 @@ async function consumeShareInviteLink(linkValue, options = {}) {
   shareState.consumeInput = parsed.raw;
 
   const result = await api.gateway.consumeShareInvite(parsed.raw);
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     if (result && result.requiresAuth) {
       state.pendingInvite = { type: 'share', input: parsed.raw };
       if (!options.silent) {
@@ -2178,11 +2997,12 @@ async function consumeShareInviteLink(linkValue, options = {}) {
     return;
   }
 
+  const consumeData = getIpcData(result);
   shareState.consumeResult = {
-    grantId: typeof result.grantId === 'string' ? result.grantId : '',
-    deviceId: typeof result.deviceId === 'string' ? result.deviceId : '',
-    role: typeof result.role === 'string' ? result.role : '',
-    status: normalizeGrantStatus(result.status || 'active'),
+    grantId: typeof consumeData.grantId === 'string' ? consumeData.grantId : '',
+    deviceId: typeof consumeData.deviceId === 'string' ? consumeData.deviceId : '',
+    role: typeof consumeData.role === 'string' ? consumeData.role : '',
+    status: normalizeGrantStatus(consumeData.status || 'active'),
     acceptedAt: nowIso(),
   };
   persistShareConsumeResult(shareState.consumeResult);
@@ -2220,19 +3040,20 @@ async function createShareInvite(form) {
   }
 
   const result = await api.gateway.createShareInvite(payload);
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to create share link'), 'error');
     return;
   }
 
   const shareState = getShareState();
+  const invData = getIpcData(result);
   shareState.lastCreatedInviteByDevice[ownDeviceId] = {
-    inviteUrl: extractInviteUrl(result),
-    grantId: typeof result.grantId === 'string' ? result.grantId : '',
+    inviteUrl: extractInviteUrl(invData),
+    grantId: typeof invData.grantId === 'string' ? invData.grantId : '',
     inviteeEmail: email,
-    status: normalizeGrantStatus(result.status || 'pending'),
-    inviteTokenExpiresAt: parseEpochSeconds(result.inviteTokenExpiresAt),
-    grantExpiresAt: parseEpochSeconds(result.grantExpiresAt),
+    status: normalizeGrantStatus(invData.status || 'pending'),
+    inviteTokenExpiresAt: parseEpochSeconds(invData.inviteTokenExpiresAt),
+    grantExpiresAt: parseEpochSeconds(invData.grantExpiresAt),
   };
 
   showToast('Share link created.', 'success');
@@ -2250,7 +3071,7 @@ async function revokeShareGrant(grantId, deviceId) {
 
   try {
     const result = await api.gateway.revokeShareGrant(id);
-    if (!result || result.ok !== true) {
+    if (!result || !isIpcSuccess(result)) {
       showToast(normalizeError(result, 'Unable to revoke grant'), 'error');
       return;
     }
@@ -2281,7 +3102,7 @@ async function leaveShareGrant(grantId) {
 
   try {
     const result = await api.gateway.leaveShareGrant(id);
-    if (!result || result.ok !== true) {
+    if (!result || !isIpcSuccess(result)) {
       showToast(normalizeError(result, 'Unable to leave share'), 'error');
       return;
     }
@@ -2393,9 +3214,10 @@ async function sendPrivateMessage(form) {
       tags: ['remote_private_local'],
     });
 
-    if (localEcho && localEcho.ok === true && localEcho.case) {
-      patchState({ caseData: localEcho.case });
-      ensureCaseInList(localEcho.case);
+    const echoData = localEcho ? getIpcData(localEcho) : {};
+    if (localEcho && isIpcSuccess(localEcho) && echoData.case) {
+      patchState({ caseData: echoData.case });
+      ensureCaseInList(echoData.case);
     } else if (remote.case) {
       patchState({ caseData: remote.case });
       ensureCaseInList(remote.case);
@@ -2409,9 +3231,10 @@ async function sendPrivateMessage(form) {
       prompt: message,
     });
 
-    if (coachResult && coachResult.ok === true && coachResult.case) {
-      patchState({ caseData: coachResult.case });
-      ensureCaseInList(coachResult.case);
+    const coachData = coachResult ? getIpcData(coachResult) : {};
+    if (coachResult && isIpcSuccess(coachResult) && coachData.case) {
+      patchState({ caseData: coachData.case });
+      ensureCaseInList(coachData.case);
     } else {
       showToast('Coach is taking a moment to respond.', 'info');
     }
@@ -2428,13 +3251,14 @@ async function sendPrivateMessage(form) {
     tags: ['intake'],
   });
 
-  if (!appendResult || appendResult.ok !== true) {
+  if (!appendResult || !isIpcSuccess(appendResult)) {
     showToast(normalizeError(appendResult, 'Unable to send message'), 'error');
     return;
   }
 
-  patchState({ caseData: appendResult.case });
-  ensureCaseInList(appendResult.case);
+  const appendData = getIpcData(appendResult);
+  patchState({ caseData: appendData.case });
+  ensureCaseInList(appendData.case);
   state.chatDrafts.set(draftKey, '');
 
   const coachResult = await api.mediation.coachReply({
@@ -2443,9 +3267,10 @@ async function sendPrivateMessage(form) {
     prompt: message,
   });
 
-  if (coachResult && coachResult.ok === true && coachResult.case) {
-    patchState({ caseData: coachResult.case });
-    ensureCaseInList(coachResult.case);
+  const coachData2 = coachResult ? getIpcData(coachResult) : {};
+  if (coachResult && isIpcSuccess(coachResult) && coachData2.case) {
+    patchState({ caseData: coachData2.case });
+    ensureCaseInList(coachData2.case);
   } else {
     showToast('Coach is taking a moment to respond.', 'info');
   }
@@ -2469,17 +3294,18 @@ async function runIntakeTemplate() {
     partyId: current.partyId,
   });
 
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to generate summary'), 'error');
     return;
   }
 
-  patchState({ caseData: result.case });
-  ensureCaseInList(result.case);
+  const intakeData = getIpcData(result);
+  patchState({ caseData: intakeData.case });
+  ensureCaseInList(intakeData.case);
 
   const summaryKey = `summary:${caseData.id}:${current.partyId}`;
-  if (typeof result.summary === 'string') {
-    state.chatDrafts.set(summaryKey, result.summary);
+  if (typeof intakeData.summary === 'string') {
+    state.chatDrafts.set(summaryKey, intakeData.summary);
   }
 
   showToast('Summary draft generated.', 'success');
@@ -2574,7 +3400,7 @@ async function saveSummaryAndReady() {
     allowSummaryShare: Boolean(consentShareEl && consentShareEl.checked),
     allowDirectQuote: Boolean(consentQuoteEl && consentQuoteEl.checked),
   });
-  if (!setConsentResult || setConsentResult.ok !== true) {
+  if (!setConsentResult || !isIpcSuccess(setConsentResult)) {
     showToast(normalizeError(setConsentResult, 'Unable to save preferences'), 'error');
     return;
   }
@@ -2585,7 +3411,7 @@ async function saveSummaryAndReady() {
     summary,
     resolved: true,
   });
-  if (!setSummaryResult || setSummaryResult.ok !== true) {
+  if (!setSummaryResult || !isIpcSuccess(setSummaryResult)) {
     showToast(normalizeError(setSummaryResult, 'Unable to save summary'), 'error');
     return;
   }
@@ -2594,15 +3420,16 @@ async function saveSummaryAndReady() {
     caseId: caseData.id,
     partyId: current.partyId,
   });
-  if (!readyResult || readyResult.ok !== true) {
+  if (!readyResult || !isIpcSuccess(readyResult)) {
     showToast(normalizeError(readyResult, 'Unable to mark as ready'), 'error');
     return;
   }
 
-  patchState({ caseData: readyResult.case });
-  ensureCaseInList(readyResult.case);
+  const readyData = getIpcData(readyResult);
+  patchState({ caseData: readyData.case });
+  ensureCaseInList(readyData.case);
 
-  if (readyResult.case.phase === 'group_chat') {
+  if (readyData.case.phase === 'group_chat') {
     state.activeSubview = 'group-chat';
     showToast('Both parties are ready. Starting mediation.', 'success');
   } else {
@@ -2660,15 +3487,16 @@ async function sendGroupMessage(form) {
     partyId: current.partyId,
     text,
   });
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to send message'), 'error');
     return;
   }
 
   const draftKey = `group:${caseData.id}:${current.partyId}`;
   state.chatDrafts.set(draftKey, '');
-  patchState({ caseData: result.case });
-  ensureCaseInList(result.case);
+  const groupData = getIpcData(result);
+  patchState({ caseData: groupData.case });
+  ensureCaseInList(groupData.case);
   render();
 }
 
@@ -2756,14 +3584,30 @@ async function sendDraftMessage(form) {
       initialPartyMessage: text,
     });
 
-    if (!createResult || createResult.ok !== true) {
+    if (!createResult || !isIpcSuccess(createResult)) {
       showToast(normalizeError(createResult, 'Unable to start draft'), 'error');
       return;
     }
 
-    draft = createResult.draft;
-    latestCase = createResult.case || caseData;
+    const createData = getIpcData(createResult);
+    draft = createData.draft;
+    latestCase = createData.case || caseData;
     state.activeDraftByCase[caseData.id] = draft.id;
+
+    // V2: Initialize draft coach metadata for new drafts
+    if (latestCase.schemaVersion >= 2 && draft) {
+      const metaResult = await api.mediation.draftCoachTurn({
+        caseId: caseData.id,
+        draftId: draft.id,
+        partyId: current.partyId,
+        message: text,
+        phase: 'exploring',
+      });
+      const metaData = metaResult ? getIpcData(metaResult) : {};
+      if (metaResult && isIpcSuccess(metaResult) && metaData.case) {
+        latestCase = metaData.case;
+      }
+    }
   } else {
     const appendResult = await api.mediation.appendDraft({
       caseId: caseData.id,
@@ -2772,28 +3616,47 @@ async function sendDraftMessage(form) {
       text,
     });
 
-    if (!appendResult || appendResult.ok !== true) {
+    if (!appendResult || !isIpcSuccess(appendResult)) {
       showToast(normalizeError(appendResult, 'Unable to send draft message'), 'error');
       return;
     }
 
-    latestCase = appendResult.case;
+    latestCase = getIpcData(appendResult).case;
+
+    // V2: Use draft coach turn API for coaching response
+    if (latestCase.schemaVersion >= 2 && draft) {
+      setTypingIndicator('coach', true, 'Coach');
+      const coachResult = await api.mediation.draftCoachTurn({
+        caseId: caseData.id,
+        draftId: draft.id,
+        partyId: current.partyId,
+        message: text,
+        phase: draft.coachMeta?.phase || 'exploring',
+      });
+      setTypingIndicator('coach', false);
+      const draftCoachData = coachResult ? getIpcData(coachResult) : {};
+      if (coachResult && isIpcSuccess(coachResult) && draftCoachData.case) {
+        latestCase = draftCoachData.case;
+      }
+    }
   }
 
   state.chatDrafts.set(draftKey, '');
   patchState({ caseData: latestCase });
   ensureCaseInList(latestCase);
 
+  // Legacy: Only run draft suggestion for v1 drafts without coachMeta
   const activeDraft = findActiveDraft(latestCase, current.partyId);
-  if (activeDraft) {
+  if (activeDraft && !activeDraft.coachMeta) {
     const suggestionResult = await api.mediation.runDraftSuggestion({
       caseId: caseData.id,
       draftId: activeDraft.id,
     });
 
-    if (suggestionResult && suggestionResult.ok === true && suggestionResult.case) {
-      patchState({ caseData: suggestionResult.case });
-      ensureCaseInList(suggestionResult.case);
+    const sugData = suggestionResult ? getIpcData(suggestionResult) : {};
+    if (suggestionResult && isIpcSuccess(suggestionResult) && sugData.case) {
+      patchState({ caseData: sugData.case });
+      ensureCaseInList(sugData.case);
     }
   }
 
@@ -2842,13 +3705,14 @@ async function runDraftSuggestion() {
     caseId: caseData.id,
     draftId: draft.id,
   });
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to generate suggestion'), 'error');
     return;
   }
 
-  patchState({ caseData: result.case });
-  ensureCaseInList(result.case);
+  const suggestData = getIpcData(result);
+  patchState({ caseData: suggestData.case });
+  ensureCaseInList(suggestData.case);
   render();
 }
 
@@ -2905,13 +3769,14 @@ async function approveDraft() {
     approvedText: approvedText || undefined,
   });
 
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to send draft'), 'error');
     return;
   }
 
-  patchState({ caseData: result.case });
-  ensureCaseInList(result.case);
+  const approveData = getIpcData(result);
+  patchState({ caseData: approveData.case });
+  ensureCaseInList(approveData.case);
   state.coachPanelOpen = false;
   delete state.activeDraftByCase[caseData.id];
   showToast('Message sent to the group.', 'success');
@@ -2967,15 +3832,23 @@ async function rejectDraft() {
     reason: 'continue_drafting',
   });
 
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to discard draft'), 'error');
     return;
   }
 
-  patchState({ caseData: result.case });
-  ensureCaseInList(result.case);
-  delete state.activeDraftByCase[caseData.id];
-  showToast('Draft discarded. You can start a new one.', 'info');
+  const rejectData = getIpcData(result);
+  patchState({ caseData: rejectData.case });
+  ensureCaseInList(rejectData.case);
+
+  // V2: Keep draft active (reset to exploring). V1: Close draft.
+  const updatedDraft = rejectData.case?.groupChat?.draftsById?.[draft.id];
+  if (updatedDraft && updatedDraft.coachMeta) {
+    showToast('Back to exploring. Continue the conversation.', 'info');
+  } else {
+    delete state.activeDraftByCase[caseData.id];
+    showToast('Draft discarded. You can start a new one.', 'info');
+  }
   render();
 }
 
@@ -3020,17 +3893,18 @@ async function resolveCaseFromModal(form) {
   }
 
   const result = await api.mediation.resolve({ caseId: caseData.id, resolution });
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to resolve'), 'error');
     return;
   }
 
+  const resolveData = getIpcData(result);
   patchState({
-    caseData: result.case,
+    caseData: resolveData.case,
     modal: null,
     activeSubview: null,
   });
-  ensureCaseInList(result.case);
+  ensureCaseInList(resolveData.case);
   render();
 }
 
@@ -3063,13 +3937,14 @@ async function closeCurrentCase() {
   }
 
   const result = await api.mediation.close({ caseId: caseData.id });
-  if (!result || result.ok !== true) {
+  if (!result || !isIpcSuccess(result)) {
     showToast(normalizeError(result, 'Unable to close'), 'error');
     return;
   }
 
-  patchState({ caseData: result.case, activeSubview: null });
-  ensureCaseInList(result.case);
+  const closeData = getIpcData(result);
+  patchState({ caseData: closeData.case, activeSubview: null });
+  ensureCaseInList(closeData.case);
   showToast('Case closed.', 'success');
   render();
 }
@@ -3115,6 +3990,20 @@ function handleInput(event) {
     const key = target.getAttribute('data-draft-key');
     if (key) getState().chatDrafts.set(key, target.value);
   }
+
+  // Main-topic form: sync category/template selects to form state and re-render
+  if (target.name === 'mainTopicCategory') {
+    const state = getState();
+    state.mainTopicForm.categoryId = target.value;
+    // Clear template selection when category changes so the filter takes effect
+    state.mainTopicForm.templateId = '';
+    render();
+    return;
+  }
+  if (target.name === 'mainTopicTemplate') {
+    const state = getState();
+    state.mainTopicForm.templateId = target.value;
+  }
 }
 
 async function handleSubmit(event) {
@@ -3130,7 +4019,12 @@ async function handleSubmit(event) {
   if (action === 'send-private-message') { await sendPrivateMessage(form); return; }
   if (action === 'send-group-message') { await sendGroupMessage(form); return; }
   if (action === 'send-draft-message') { await sendDraftMessage(form); return; }
-  if (action === 'resolve-case') { await resolveCaseFromModal(form); }
+  if (action === 'submit-main-topic') { await handleSubmitMainTopic(form); return; }
+  if (action === 'resolve-case') { await resolveCaseFromModal(form); return; }
+  if (action === 'create-template') { await handleCreateTemplate(form); return; }
+  if (action === 'create-version') { await handleCreateVersion(form); return; }
+  if (action === 'create-category') { await handleCreateCategory(form); return; }
+  if (action === 'edit-category') { await handleEditCategory(form); return; }
 }
 
 async function handleClick(event) {
@@ -3171,7 +4065,9 @@ async function handleClick(event) {
     state.caseId = null;
     state.caseData = null;
     state.activeSubview = null;
+    state.templateAdminView = null;
     state.coachPanelOpen = false;
+    state.createFormExpanded = true;
     render();
     return;
   }
@@ -3291,6 +4187,267 @@ async function handleClick(event) {
   if (action === 'run-draft-suggestion') { await runDraftSuggestion(); return; }
   if (action === 'approve-draft') { await approveDraft(); return; }
   if (action === 'reject-draft') { await rejectDraft(); return; }
+
+  // V2 draft coach actions (F-01)
+  if (action === 'set-draft-ready') {
+    const caseData = state.caseData;
+    const current = caseData ? getCurrentParty(caseData) : null;
+    if (caseData && current) {
+      const draft = findActiveDraft(caseData, current.partyId);
+      if (draft) {
+        const result = await api.mediation.setDraftReadiness({ caseId: caseData.id, draftId: draft.id, ready: true });
+        if (result && isIpcSuccess(result)) {
+          // Response is { phase } per spec Section 4.2.1 — update coachMeta.phase locally
+          const rd = getIpcData(result);
+          const newPhase = rd.phase || 'confirm_ready';
+          if (draft.coachMeta) { draft.coachMeta.phase = newPhase; }
+          else { draft.coachMeta = { phase: newPhase }; }
+          // Refresh full case to stay in sync
+          const refreshResult = await api.mediation.get(caseData.id);
+          if (refreshResult && isIpcSuccess(refreshResult)) {
+            const refreshData = getIpcData(refreshResult);
+            const updatedCase = refreshData.case || refreshData;
+            patchState({ caseData: updatedCase });
+            ensureCaseInList(updatedCase);
+          }
+        }
+      }
+    }
+    render();
+    return;
+  }
+
+  if (action === 'reset-to-exploring') {
+    const caseData = state.caseData;
+    const current = caseData ? getCurrentParty(caseData) : null;
+    if (caseData && current) {
+      const draft = findActiveDraft(caseData, current.partyId);
+      if (draft) {
+        const result = await api.mediation.setDraftReadiness({ caseId: caseData.id, draftId: draft.id, ready: false });
+        if (result && isIpcSuccess(result)) {
+          // Response is { phase } per spec Section 4.2.1 — update coachMeta.phase locally
+          const rd = getIpcData(result);
+          const newPhase = rd.phase || 'exploring';
+          if (draft.coachMeta) { draft.coachMeta.phase = newPhase; }
+          else { draft.coachMeta = { phase: newPhase }; }
+          // Refresh full case to stay in sync
+          const refreshResult = await api.mediation.get(caseData.id);
+          if (refreshResult && isIpcSuccess(refreshResult)) {
+            const refreshData = getIpcData(refreshResult);
+            const updatedCase = refreshData.case || refreshData;
+            patchState({ caseData: updatedCase });
+            ensureCaseInList(updatedCase);
+          }
+        }
+      }
+    }
+    render();
+    return;
+  }
+
+  if (action === 'generate-formal-draft') {
+    const caseData = state.caseData;
+    const current = caseData ? getCurrentParty(caseData) : null;
+    if (caseData && current) {
+      const draft = findActiveDraft(caseData, current.partyId);
+      if (draft) {
+        setTypingIndicator('coach', true, 'Coach');
+        const result = await api.mediation.draftCoachTurn({
+          caseId: caseData.id,
+          draftId: draft.id,
+          partyId: current.partyId,
+          message: '',
+          phase: 'confirm_ready',
+        });
+        setTypingIndicator('coach', false);
+        const formalData = result ? getIpcData(result) : {};
+        if (result && isIpcSuccess(result) && formalData.case) {
+          patchState({ caseData: formalData.case });
+          ensureCaseInList(formalData.case);
+        } else {
+          showToast(normalizeError(result, 'Unable to generate formal draft'), 'error');
+        }
+      }
+    }
+    render();
+    return;
+  }
+
+  // Template admin actions (F-05)
+  if (action === 'open-template-admin') {
+    const state = getState();
+    state.templateAdminView = 'list';
+    state.caseId = null;
+    state.caseData = null;
+    state.activeSubview = null;
+    await loadTemplateAdminData();
+    render();
+    return;
+  }
+
+  if (action === 'select-admin-template') {
+    const templateId = target.getAttribute('data-template-id') || target.closest('[data-template-id]')?.getAttribute('data-template-id') || '';
+    if (templateId) {
+      const state = getState();
+      try {
+        const result = await api.templates.get(templateId);
+        if (result && isIpcSuccess(result)) {
+          const data = getIpcData(result);
+          state.templateAdminData.selectedTemplate = data.template || null;
+          state.templateAdminData.versions = data.versions || [];
+        }
+      } catch {
+        showToast('Failed to load template details.', 'error');
+      }
+      render();
+    }
+    return;
+  }
+
+  if (action === 'create-admin-template') {
+    const state = getState();
+    state.modal = {
+      type: 'create-template',
+      fields: { name: '', description: '', categoryId: '' },
+    };
+    render();
+    return;
+  }
+
+  if (action === 'archive-admin-template') {
+    const templateId = target.getAttribute('data-template-id') || '';
+    if (templateId) {
+      try {
+        const currentStatus = state.templateAdminData.selectedTemplate?.status;
+        const newStatus = currentStatus === 'active' ? 'archived' : 'active';
+        await api.templates.setStatus({ templateId, status: newStatus, actorId: 'local_owner' });
+        showToast(`Template ${newStatus === 'archived' ? 'archived' : 'activated'}.`, 'info');
+        await loadTemplateAdminData();
+        render();
+      } catch (err) {
+        showToast('Failed to update template status.', 'error');
+      }
+    }
+    return;
+  }
+
+  // F-05: Create new version for a template
+  if (action === 'create-admin-version') {
+    const templateId = target.getAttribute('data-template-id') || '';
+    if (templateId) {
+      const state = getState();
+      state.modal = {
+        type: 'create-version',
+        fields: { templateId, restoreFromVersion: '' },
+      };
+      render();
+    }
+    return;
+  }
+
+  // F-05: Edit current version (publishes as a new version with pre-populated fields)
+  if (action === 'edit-admin-version') {
+    const templateId = target.getAttribute('data-template-id') || target.closest('[data-template-id]')?.getAttribute('data-template-id') || '';
+    const versionNumber = target.getAttribute('data-version-number') || '';
+    if (templateId && versionNumber) {
+      const state = getState();
+      state.modal = {
+        type: 'create-version',
+        fields: { templateId, editFromVersion: versionNumber },
+      };
+      render();
+    }
+    return;
+  }
+
+  // F-05: Restore older version as new current version
+  if (action === 'restore-admin-version') {
+    const templateId = target.getAttribute('data-template-id') || target.closest('[data-template-id]')?.getAttribute('data-template-id') || '';
+    const versionNumber = target.getAttribute('data-version-number') || '';
+    if (templateId && versionNumber) {
+      const state = getState();
+      state.modal = {
+        type: 'create-version',
+        fields: { templateId, restoreFromVersion: versionNumber },
+      };
+      render();
+    }
+    return;
+  }
+
+  // Category CRUD actions (F-05)
+  if (action === 'create-admin-category') {
+    const state = getState();
+    state.modal = { type: 'create-category' };
+    render();
+    return;
+  }
+
+  if (action === 'edit-admin-category') {
+    const categoryId = target.getAttribute('data-category-id') || '';
+    const catName = target.getAttribute('data-category-name') || '';
+    const catDesc = target.getAttribute('data-category-description') || '';
+    if (categoryId) {
+      const state = getState();
+      state.modal = {
+        type: 'edit-category',
+        fields: { categoryId, name: catName, description: catDesc },
+      };
+      render();
+    }
+    return;
+  }
+
+  if (action === 'delete-admin-category') {
+    const categoryId = target.getAttribute('data-category-id') || '';
+    if (categoryId) {
+      try {
+        const result = await api.templates.deleteCategory({ categoryId, actorId: 'local_owner' });
+        if (result && isIpcSuccess(result)) {
+          showToast('Category deleted.', 'info');
+          await loadTemplateAdminData();
+        } else {
+          const code = result?.error?.code || '';
+          showToast(code === 'category_in_use' ? 'Cannot delete: category has templates.' : 'Failed to delete category.', 'error');
+        }
+        render();
+      } catch (err) {
+        showToast('Failed to delete category.', 'error');
+      }
+    }
+    return;
+  }
+
+  if (action === 'delete-admin-template') {
+    const templateId = target.getAttribute('data-template-id') || '';
+    if (templateId) {
+      try {
+        const result = await api.templates.delete({ templateId, actorId: 'local_owner' });
+        if (result && isIpcSuccess(result)) {
+          const state = getState();
+          state.templateAdminData.selectedTemplate = null;
+          state.templateAdminData.versions = [];
+          showToast('Template deleted.', 'info');
+          await loadTemplateAdminData();
+        } else {
+          const code = result?.error?.code || '';
+          showToast(code === 'template_in_use' ? 'Cannot delete: template is in use.' : 'Failed to delete template.', 'error');
+        }
+        render();
+      } catch (err) {
+        showToast('Failed to delete template.', 'error');
+      }
+    }
+    return;
+  }
+
+  // Copy message action (F-02)
+  if (action === 'copy-message') {
+    const copyText = target.getAttribute('data-copy-text') || '';
+    if (copyText) await copyToClipboard(copyText);
+    return;
+  }
+
   if (action === 'open-resolve-prompt') { state.modal = { type: 'resolve-case' }; render(); return; }
   if (action === 'close-case') { await closeCurrentCase(); return; }
   if (action === 'export-transcript') { exportTranscript(); return; }
@@ -3383,6 +4540,28 @@ function onMediationEvent(payload) {
       state.caseData = mediationCase;
     }
 
+    // Section 6.2.1 clear condition #2: new message from typing source clears indicator
+    const action = payload.action || '';
+    if (action === 'mediator_turn' || action === 'coach_reply' || action === 'draft_coach_turn') {
+      const caseId = mediationCase.id || '';
+      const sourceMap = {
+        mediator_turn: 'mediator',
+        coach_reply: 'intake',
+        draft_coach_turn: 'draft_coach',
+      };
+      const sourceId = sourceMap[action] || 'ai';
+      // Clear any matching typing indicator
+      const state2 = getState();
+      if (state2.typingIndicators) {
+        for (const key of Object.keys(state2.typingIndicators)) {
+          if (key.includes(sourceId) && key.includes(caseId)) {
+            delete state2.typingIndicators[key];
+            TYPING_DEBOUNCE_MAP.delete(key);
+          }
+        }
+      }
+    }
+
     render();
     return;
   }
@@ -3405,6 +4584,35 @@ function onMediationEvent(payload) {
     }
     showToast('This shared case is no longer available.', 'info', 5000);
     render();
+    return;
+  }
+
+  // Typing indicators (Section 6.2.1 TypingIndicatorEvent)
+  if (payload.type === 'typing_start') {
+    const sourceId = payload.sourceId || payload.source || 'ai';
+    const sourceType = payload.sourceType || 'ai_generation';
+    const caseId = payload.caseId || '';
+    const chatSurface = payload.chatSurface || 'group';
+    let label;
+    if (sourceType === 'remote_party') {
+      // Section 6.2.1: "{Party name} is typing..." — resolve display name from case data
+      const caseData = getState().caseData;
+      const partyEntry = caseData?.parties?.find((p) => p.id === sourceId);
+      label = partyEntry?.displayName || sourceId || 'Participant';
+    } else {
+      label = sourceId === 'mediator' ? 'Mediator'
+        : sourceId === 'draft_coach' ? 'Draft Coach'
+        : sourceId === 'intake_coach' ? 'Intake Coach'
+        : 'AI';
+    }
+    setTypingIndicator(`${sourceId}_${caseId}_${chatSurface}`, true, label, sourceType);
+    return;
+  }
+  if (payload.type === 'typing_stop') {
+    const sourceId = payload.sourceId || payload.source || 'ai';
+    const caseId = payload.caseId || '';
+    const chatSurface = payload.chatSurface || 'group';
+    setTypingIndicator(`${sourceId}_${caseId}_${chatSurface}`, false);
     return;
   }
 
@@ -3538,6 +4746,7 @@ async function bootstrap() {
   appRoot.addEventListener('submit', (event) => { void handleSubmit(event); });
   modalRoot.addEventListener('submit', (event) => { void handleSubmit(event); });
   appRoot.addEventListener('input', handleInput);
+  appRoot.addEventListener('change', handleInput);
 
   startButton.addEventListener('click', () => { void startFlow(); });
 

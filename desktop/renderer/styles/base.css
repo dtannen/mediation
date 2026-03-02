@@ -694,9 +694,11 @@ textarea {
   background: rgba(4, 8, 14, 0.6);
   backdrop-filter: blur(8px);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   z-index: 30;
+  overflow-y: auto;
+  padding: var(--sp-6) 0;
   animation: fadeIn var(--duration-fast) ease both;
 }
 
@@ -707,6 +709,7 @@ textarea {
   background: var(--panel-elevated);
   padding: var(--sp-6);
   box-shadow: var(--shadow-lg);
+  flex-shrink: 0;
   animation: slideUp var(--duration-slow) var(--ease-out) both;
 }
 

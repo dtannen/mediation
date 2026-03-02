@@ -11,6 +11,8 @@ export interface AuditEvent {
   actor_type: string;
   actor_id: string;
   event_type: string;
+  /** Explicit target of the action — template ID or case ID (Section 1.3) */
+  target_id?: string;
   policy_decision?: string;
   delivery_mode?: string;
   error?: string;

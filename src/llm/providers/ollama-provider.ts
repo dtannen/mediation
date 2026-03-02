@@ -49,6 +49,7 @@ const ollamaProvider: ProviderPlugin = {
     supportsTools: false,
     supportsSessionResume: true,
     supportsPolicy: false,
+    contextWindowTokens: 8_192, // llama3.2 default num_ctx
   },
   runPrompt: runOllamaPrompt,
 };

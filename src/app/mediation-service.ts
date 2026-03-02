@@ -5,12 +5,16 @@ import type {
   CaseConsent,
   CoachComposeAuthor,
   CreateCaseInput,
+  DraftCoachMetadata,
+  DraftCoachPhase,
   GroupMessageDeliveryMode,
   GroupMessageDraft,
+  MainTopicConfig,
   MediationCase,
   MediationPhase,
   Party,
   PartyParticipationState,
+  TemplateSelection,
   ThreadMessage,
 } from '../domain/types';
 import { validateTransition } from '../engine/phase-engine';
@@ -243,6 +247,7 @@ export class MediationService {
         messages: [],
         draftsById: {},
       },
+      schemaVersion: 2,
     };
 
     this.store.save(mediationCase);
@@ -648,11 +653,192 @@ export class MediationService {
       throw new DomainError('draft_closed', `draft '${draftId}' is already ${draft.status}`);
     }
 
+    // V2 behavior: if coachMeta is present, reset to exploring phase instead of terminal reject
+    if (draft.coachMeta) {
+      draft.coachMeta.phase = 'exploring';
+      draft.coachMeta.formalDraftText = undefined;
+      draft.coachMeta.phaseChangedAt = nowIso();
+      draft.status = 'composing';
+      draft.suggestedText = undefined;
+      draft.updatedAt = nowIso();
+      mediationCase.updatedAt = nowIso();
+      this.store.save(mediationCase);
+      return mediationCase;
+    }
+
+    // Legacy v1 behavior: terminal reject
     draft.status = 'rejected';
     draft.rejectedAt = nowIso();
     draft.rejectionReason = (reason || '').trim() || undefined;
     draft.updatedAt = nowIso();
 
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  /* ============================================================
+     V2: Main Topic, Template Selection, Draft Coach Extensions
+     ============================================================ */
+
+  /**
+   * Check whether a case is fully configured (main topic + template).
+   * Used for gating entry points (F-06).
+   */
+  isCaseConfigured(mediationCase: MediationCase): boolean {
+    if (!mediationCase.mainTopicConfig?.topic?.trim()) return false;
+    if (!mediationCase.templateSelection?.templateId?.trim()) return false;
+    return true;
+  }
+
+  setMainTopicConfig(caseId: string, config: {
+    topic: string;
+    description?: string;
+    categoryId: string;
+    templateId?: string;
+    templateVersion?: number;
+    configuredByPartyId?: string;
+  }): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    const topic = config.topic.trim();
+    if (!topic) {
+      throw new DomainError('main_topic_required', 'topic is required');
+    }
+
+    const now = nowIso();
+    mediationCase.mainTopicConfig = {
+      topic,
+      description: (config.description || '').trim(),
+      categoryId: config.categoryId,
+      templateId: config.templateId,
+      templateVersion: config.templateVersion,
+      configuredAt: now,
+      confirmedAt: now,
+      configuredByPartyId: config.configuredByPartyId,
+    };
+    mediationCase.topic = topic;
+    mediationCase.description = (config.description || '').trim();
+    mediationCase.updatedAt = now;
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  setTemplateSelection(caseId: string, selection: {
+    categoryId?: string;
+    templateId: string;
+    templateVersion?: number;
+    versionId?: string;
+    selectedAt?: string;
+    selectedBy?: string;
+  }): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    const now = nowIso();
+    mediationCase.templateSelection = {
+      categoryId: selection.categoryId,
+      templateId: selection.templateId,
+      templateVersion: selection.templateVersion || 0,
+      versionId: selection.versionId,
+      selectedAt: selection.selectedAt || now,
+      selectedBy: selection.selectedBy,
+    };
+    mediationCase.updatedAt = now;
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  setDraftReadiness(caseId: string, draftId: string, ready: boolean): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+    if (!draft.coachMeta) {
+      throw new DomainError('invalid_phase_transition', 'draft does not have coach metadata');
+    }
+
+    const now = nowIso();
+
+    if (ready) {
+      // Guard: must be in exploring phase to transition to confirm_ready
+      if (draft.coachMeta.phase !== 'exploring') {
+        throw new DomainError('invalid_phase_transition', `cannot transition to confirm_ready from phase '${draft.coachMeta.phase}'`);
+      }
+      // Guard: at least one coach exchange (user message + AI response) required
+      const hasPartyMessage = draft.composeMessages.some((m) => m.author === 'party');
+      const hasCoachMessage = draft.composeMessages.some((m) => m.author === 'party_llm');
+      if (!hasPartyMessage || !hasCoachMessage) {
+        throw new DomainError('no_coach_exchanges', 'at least one completed coach exchange is required before confirming readiness');
+      }
+      draft.coachMeta.phase = 'confirm_ready';
+      draft.coachMeta.readinessConfirmedAt = now;
+    } else {
+      draft.coachMeta.phase = 'exploring';
+      draft.coachMeta.formalDraftText = undefined;
+      draft.coachMeta.formalDraftGeneratedAt = undefined;
+      draft.coachMeta.readinessConfirmedAt = undefined;
+    }
+    draft.coachMeta.phaseChangedAt = now;
+    draft.updatedAt = now;
+    mediationCase.updatedAt = now;
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  initializeDraftCoachMeta(caseId: string, draftId: string): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+
+    if (!draft.coachMeta) {
+      draft.coachMeta = {
+        phase: 'exploring',
+        coachHistory: [],
+        phaseChangedAt: nowIso(),
+      };
+    }
+
+    draft.updatedAt = nowIso();
+    mediationCase.updatedAt = nowIso();
+    this.store.save(mediationCase);
+    return mediationCase;
+  }
+
+  setFormalDraftReady(caseId: string, draftId: string, formalText: string): MediationCase {
+    const mediationCase = this.getCase(caseId);
+    assertGroupChatPhase(mediationCase);
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found`);
+    }
+    if (!draft.coachMeta) {
+      throw new DomainError('invalid_phase_transition', 'draft does not have coach metadata');
+    }
+
+    // Guard: must be in confirm_ready to generate formal draft (Section 4.2.1)
+    if (draft.coachMeta.phase !== 'confirm_ready') {
+      throw new DomainError('invalid_phase_transition', `cannot generate formal draft from phase '${draft.coachMeta.phase}'`);
+    }
+
+    const trimmed = formalText.trim();
+    if (!trimmed) {
+      throw new DomainError('invalid_suggested_text', 'formal draft text is required');
+    }
+
+    const now = nowIso();
+    draft.coachMeta.phase = 'formal_draft_ready';
+    draft.coachMeta.formalDraftText = trimmed;
+    draft.coachMeta.formalDraftGeneratedAt = now;
+    draft.coachMeta.phaseChangedAt = now;
+    draft.suggestedText = trimmed;
+    draft.status = 'pending_approval';
+    draft.updatedAt = nowIso();
     mediationCase.updatedAt = nowIso();
     this.store.save(mediationCase);
     return mediationCase;

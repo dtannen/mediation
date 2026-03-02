@@ -5,6 +5,120 @@ export type MediationPhase =
   | 'resolved'
   | 'closed';
 
+/* ============================================================
+   V2: Coaching Template System (F-03 / F-05)
+   ============================================================ */
+
+export type CoachingRole = 'intake' | 'draft_coach' | 'mediator';
+
+export interface CoachingCategory {
+  id: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CoachingTemplateVersion {
+  id: string;
+  templateId: string;
+  versionNumber: number;
+  /** @deprecated Use individual role preamble fields */
+  preambles?: Record<CoachingRole, string>;
+  /** @deprecated Use individual role instruction fields */
+  instructions?: Record<CoachingRole, string>;
+  /** @deprecated Use changeNote */
+  changeNotes?: string;
+  // V2 spec fields (Section 4.3 CoachingTemplateVersion)
+  globalGuidance: string;
+  intakeCoachPreamble?: string;
+  draftCoachPreamble?: string;
+  mediatorPreamble?: string;
+  intakeCoachInstructions?: string;
+  draftCoachInstructions?: string;
+  mediatorInstructions?: string;
+  changeNote: string;
+  createdByActorId: string;
+  createdByActorDisplay?: string;
+  /** @deprecated Use createdByActorId */
+  actorId?: string;
+  createdAt: string;
+}
+
+export type TemplateStatus = 'active' | 'archived';
+
+export interface CoachingTemplate {
+  id: string;
+  categoryId: string;
+  name: string;
+  description: string;
+  status: TemplateStatus;
+  currentVersion: number;
+  currentVersionId: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string;   // soft-delete marker (F-05)
+}
+
+export interface TemplateSelection {
+  categoryId?: string;
+  templateId: string;
+  templateVersion: number;
+  /** @deprecated Use templateVersion */
+  versionId?: string;
+  selectedAt: string;
+  selectedBy?: string;
+}
+
+export interface MainTopicConfig {
+  topic: string;
+  description: string;
+  categoryId: string;
+  templateId?: string;
+  templateVersion?: number;
+  configuredAt?: string;
+  /** @deprecated Use configuredAt */
+  confirmedAt?: string;
+  configuredByPartyId?: string;
+}
+
+/* ============================================================
+   V2: Draft Coach Phases (F-01)
+   ============================================================ */
+
+export type DraftCoachPhase = 'exploring' | 'confirm_ready' | 'formal_draft_ready';
+
+export interface DraftCoachMetadata {
+  phase: DraftCoachPhase;
+  coachHistory: CoachComposeMessage[];
+  readinessConfirmedAt?: string;
+  explorationSummary?: string;
+  formalDraftText?: string;
+  formalDraftGeneratedAt?: string;
+  phaseChangedAt: string;
+}
+
+/* ============================================================
+   V2: IPC Error Codes
+   ============================================================ */
+
+export type IpcErrorCode =
+  | 'template_not_found'
+  | 'template_inactive'
+  | 'template_version_not_found'
+  | 'template_in_use'
+  | 'main_topic_required'
+  | 'main_topic_not_configured'
+  | 'draft_readiness_required'
+  | 'invalid_template_category'
+  | 'invalid_phase_transition'
+  | 'no_coach_exchanges'
+  | 'draft_not_found'
+  | 'context_budget_exceeded'
+  | 'admin_override_required'
+  | 'unauthorized_admin_action'
+  | 'internal_error';
+
 export type MessageAuthorType =
   | 'party'
   | 'party_llm'
@@ -107,6 +221,7 @@ export interface GroupMessageDraft {
   rejectedAt?: string;
   rejectionReason?: string;
   sentMessageId?: string;
+  coachMeta?: DraftCoachMetadata;
 }
 
 export interface GroupChatRoom {
@@ -132,6 +247,9 @@ export interface MediationCase {
   privateIntakeByPartyId: Record<string, PrivateIntakeThread>;
   groupChat: GroupChatRoom;
   resolution?: string;
+  schemaVersion?: number;
+  templateSelection?: TemplateSelection;
+  mainTopicConfig?: MainTopicConfig;
 }
 
 export interface CreateCaseInput {

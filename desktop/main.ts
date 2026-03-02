@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { app, BrowserWindow, ipcMain, shell, safeStorage } from 'electron';
 import { MediationService } from '../src/app/mediation-service';
 import type { MediationCase } from '../src/domain/types';
+import { DomainError } from '../src/domain/errors';
 import { FileBackedMediationStore } from '../src/store/file-backed-store';
 import createAuthService from './auth';
 import createGatewayClient from './transport/gateway-client';
@@ -22,6 +23,12 @@ import {
   createEmitRoomMetrics,
 } from './ipc/group-chat-ipc';
 import { register as registerInterfacesIpc } from './ipc/interfaces-ipc';
+import { register as registerTemplateIpc } from './ipc/template-ipc';
+import { UserProfileStore } from './lib/user-profile-store';
+import { FileBackedTemplateStore } from '../src/store/template-store';
+import { TemplateService } from '../src/app/template-service';
+import { migrateCaseStore } from '../src/store/case-migration';
+import type { CoachingRole, CoachingTemplateVersion, MainTopicConfig, DraftCoachPhase } from '../src/domain/types';
 import { CH } from './ipc/channel-manifest';
 import createGroupChatRuntime from '../src/room/group-chat-runtime';
 import {
@@ -34,6 +41,8 @@ import { RemoteMediationRouter } from '../src/remote/router';
 import { FileBackedRouterStatePersistence } from '../src/remote/router-state-persistence';
 import type { GatewayAuthContext, MediationEventEnvelope } from '../src/remote/protocol';
 import { projectCaseForActor } from '../src/remote/projection';
+import { getProvider, listProviderIds } from '../src/llm/provider-registry';
+import { registerBuiltInProviders } from '../src/llm/providers';
 
 function normalizeDevProfileId(value: unknown): string {
   const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
@@ -332,6 +341,103 @@ function parseGatewayAuthContext(
   };
 }
 
+// ── Template-aware prompt assembly (Spec Section 5.1) ──────────────────────
+
+const DEFAULT_INTAKE_PREAMBLE = 'You are a private intake coach helping a mediation party articulate their perspective.';
+const DEFAULT_DRAFT_COACH_PREAMBLE = 'You are a draft coach helping a mediation party compose thoughtful messages for group discussion.';
+const DEFAULT_MEDIATOR_PREAMBLE = 'You are a neutral AI mediator facilitating constructive dialogue between parties.';
+const DEFAULT_INTAKE_INSTRUCTIONS = 'Guide the party through structured questions to understand their position, interests, and constraints.';
+const DEFAULT_DRAFT_COACH_INSTRUCTIONS = 'Help the party refine their message for clarity, empathy, and constructiveness.';
+const DEFAULT_MEDIATOR_INSTRUCTIONS = 'Facilitate balanced discussion, ask clarifying questions, and help identify common ground.';
+
+const ROLE_PREAMBLE_DEFAULTS: Record<CoachingRole, string> = {
+  intake: DEFAULT_INTAKE_PREAMBLE,
+  draft_coach: DEFAULT_DRAFT_COACH_PREAMBLE,
+  mediator: DEFAULT_MEDIATOR_PREAMBLE,
+};
+const ROLE_INSTRUCTION_DEFAULTS: Record<CoachingRole, string> = {
+  intake: DEFAULT_INTAKE_INSTRUCTIONS,
+  draft_coach: DEFAULT_DRAFT_COACH_INSTRUCTIONS,
+  mediator: DEFAULT_MEDIATOR_INSTRUCTIONS,
+};
+
+/**
+ * Template-driven prompt assembly (Spec Section 5.1).
+ *
+ * Assembly order:
+ *   1. Role preamble (template override or runtime default)
+ *   2. globalGuidance from template
+ *   3. Role-specific instructions (template or runtime default)
+ *   4. Topic + description from mainTopicConfig
+ *   5. Runtime context lines (transcript, instructions, etc.)
+ */
+/** Resolve the role-specific preamble from v2 individual fields or legacy preambles map */
+function resolveRolePreamble(tv: CoachingTemplateVersion | null, role: CoachingRole): string {
+  if (!tv) return ROLE_PREAMBLE_DEFAULTS[role];
+  // V2 spec fields first (Section 4.3)
+  const preambleMap: Record<CoachingRole, string | undefined> = {
+    intake: tv.intakeCoachPreamble,
+    draft_coach: tv.draftCoachPreamble,
+    mediator: tv.mediatorPreamble,
+  };
+  if (preambleMap[role]) return preambleMap[role]!;
+  // Legacy fallback
+  if (tv.preambles?.[role]) return tv.preambles[role];
+  return ROLE_PREAMBLE_DEFAULTS[role];
+}
+
+/** Resolve the role-specific instructions from v2 individual fields or legacy instructions map */
+function resolveRoleInstructions(tv: CoachingTemplateVersion | null, role: CoachingRole): string {
+  if (!tv) return ROLE_INSTRUCTION_DEFAULTS[role];
+  // V2 spec fields first (Section 4.3)
+  const instructionsMap: Record<CoachingRole, string | undefined> = {
+    intake: tv.intakeCoachInstructions,
+    draft_coach: tv.draftCoachInstructions,
+    mediator: tv.mediatorInstructions,
+  };
+  if (instructionsMap[role]) return instructionsMap[role]!;
+  // Legacy fallback
+  if (tv.instructions?.[role]) return tv.instructions[role];
+  return ROLE_INSTRUCTION_DEFAULTS[role];
+}
+
+function assemblePrompt(
+  role: CoachingRole,
+  templateVersion: CoachingTemplateVersion | null,
+  mainTopicConfig: MainTopicConfig | null | undefined,
+  runtimeLines: string[],
+): string {
+  // 1. Role preamble: v2 individual field > legacy preambles map > runtime default (Section 5.1)
+  const preamble = resolveRolePreamble(templateVersion, role);
+
+  // 2. Global guidance from template (Section 5.1)
+  const globalGuidance = templateVersion?.globalGuidance || '';
+
+  // 3. Role-specific instructions: v2 individual field > legacy instructions map > runtime default
+  const instructions = resolveRoleInstructions(templateVersion, role);
+
+  // 4. Case topic and description
+  const topicLine = mainTopicConfig?.topic
+    ? `Case topic: ${mainTopicConfig.topic}`
+    : '';
+  const descriptionLine = mainTopicConfig?.description
+    ? `Case description: ${mainTopicConfig.description}`
+    : '';
+
+  return [
+    preamble,
+    '',
+    globalGuidance ? `Global guidance: ${globalGuidance}` : '',
+    '',
+    instructions,
+    '',
+    topicLine,
+    descriptionLine,
+    '',
+    ...runtimeLines,
+  ].filter((line) => line !== undefined && line !== '').join('\n');
+}
+
 function buildIntakePromptTemplate(mediationCase: MediationCase, partyId: string): string {
   const party = mediationCase.parties.find((entry) => entry.id === partyId);
   const partyName = party?.displayName || partyId;
@@ -586,8 +692,41 @@ async function bootstrap(): Promise<void> {
   const registry = createIpcRegistry();
 
   const mediationStorePath = path.join(app.getPath('userData'), 'mediation-cases.json');
-  const mediationService = new MediationService(new FileBackedMediationStore(mediationStorePath));
+  const mediationStore = new FileBackedMediationStore(mediationStorePath);
+  const mediationService = new MediationService(mediationStore);
   mediationService.purgeExpiredRemoteTombstones();
+
+  const templateStorePath = path.join(app.getPath('userData'), 'mediation-templates.json');
+  const templateStore = new FileBackedTemplateStore(templateStorePath);
+  const templateService = new TemplateService(templateStore);
+
+  // User profile store for admin authorization (Spec Section 1.3)
+  const userProfileStore = new UserProfileStore();
+  userProfileStore.ensureLocalOwner('local_owner');
+
+  const auditLogPath = path.join(app.getPath('userData'), 'audit.log');
+
+  // Migrate pre-v2 cases
+  try {
+    const systemDefault = templateService.getSystemDefault();
+    const cases = mediationService.listCases() as any[];
+    // c2_4 fix: pass version resolver to deterministically map legacy versionId → versionNumber
+    const versionResolver = (tplId: string, verId: string): number | undefined => {
+      try { return templateService.resolveVersionIdToNumber(tplId, verId); } catch { return undefined; }
+    };
+    const migrated = migrateCaseStore(cases, {
+      templateId: systemDefault.template.id as string,
+      versionId: systemDefault.version.id as string,
+      templateVersion: (systemDefault.version as any).versionNumber ?? 1,
+    }, versionResolver);
+    if (migrated > 0) {
+      for (const c of cases) {
+        mediationStore.save(c);
+      }
+    }
+  } catch {
+    // best-effort migration
+  }
 
   const auth = createAuthService({
     shell,
@@ -693,7 +832,40 @@ async function bootstrap(): Promise<void> {
           grant_id: authContext.grantId || '',
         });
 
+        // Section 6.2.1: Emit remote-party typing indicators for content-bearing commands.
+        // The renderer handles sourceType: 'remote_party' but needs the backend to emit them.
+        // chatSurface values must conform to spec enum: 'intake' | 'group' | 'coach_panel'
+        const CONTENT_COMMANDS: Record<string, string> = {
+          'case.send_group': 'group',
+          'case.append_private': 'intake',
+          'case.append_draft': 'coach_panel',
+        };
+        const remoteTypingSurface = commandName ? CONTENT_COMMANDS[commandName] : undefined;
+        if (remoteTypingSurface && commandCaseId && commandPartyId) {
+          emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+            type: 'typing_start',
+            sourceType: 'remote_party',
+            sourceId: commandPartyId,
+            caseId: commandCaseId,
+            chatSurface: remoteTypingSurface,
+            timestamp: new Date().toISOString(),
+          });
+        }
+
         const handled = await remoteRouter.handleCommand(authContext, command);
+
+        // Emit typing_stop after the remote command is processed
+        if (remoteTypingSurface && commandCaseId && commandPartyId) {
+          emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+            type: 'typing_stop',
+            sourceType: 'remote_party',
+            sourceId: commandPartyId,
+            caseId: commandCaseId,
+            chatSurface: remoteTypingSurface,
+            timestamp: new Date().toISOString(),
+          });
+        }
+
         const remoteVersion = (
           handled.result.ok === true
             ? Number((handled.result as { remote_version?: unknown }).remote_version || 0)
@@ -959,9 +1131,61 @@ async function bootstrap(): Promise<void> {
   };
 
   const localBridge = createLocalPromptBridge();
+
+  // c4_2: Eagerly register built-in providers so contextWindowTokens is available
+  // before any transcript compression calls (which can run on the first AI turn).
+  // The bridge-manager also calls registerBuiltInProviders() lazily, but that
+  // happens too late for first-call paths. This is idempotent via duplicate guards.
+  try {
+    if (!listProviderIds().includes('chatgpt')) {
+      registerBuiltInProviders();
+    }
+  } catch {
+    // best-effort — bridge-manager will retry lazily
+  }
+
+  // ── V2 Model Family Defaults (Spec Section 5.4) ───────────────────────
+  //
+  // Model resolution precedence (highest to lowest):
+  //   1. Feature flag override (reserved, not set in v2)
+  //   2. Template-level override (reserved, not present in v2 schema)
+  //   3. Runtime default — ChatGPT for all three AI roles
+  //   4. Per-party localLLM config — DEPRECATED for v2 AI roles
+  //
+  // Environment variable overrides:
+  //   MEDIATION_V2_MODEL_PROVIDER  (default: 'chatgpt')
+  //   MEDIATION_V2_MODEL           (default: 'gpt-4o')
+  //   MEDIATION_BRIDGE_PROVIDER / MEDIATION_BRIDGE_MODEL — legacy, lower precedence
+  const V2_DEFAULT_PROVIDER = process.env.MEDIATION_V2_MODEL_PROVIDER || 'chatgpt';
+  const V2_DEFAULT_MODEL = process.env.MEDIATION_V2_MODEL || 'gpt-4o';
+
+  // Profile patterns for v2 AI roles (intake, draft coach, mediator)
+  const V2_ROLE_PROFILE_RE = /^(case_|coach_|draftcoach_|mediator_|draft_)/;
+
+  function resolveProfileRuntimeConfig(profileId: string): { provider: string; model: string; cwd: string } {
+    const cwd = process.env.MEDIATION_BRIDGE_CWD || process.cwd();
+
+    // V2 AI role profiles default to ChatGPT per Section 5.4
+    if (V2_ROLE_PROFILE_RE.test(profileId)) {
+      return {
+        provider: V2_DEFAULT_PROVIDER,
+        model: V2_DEFAULT_MODEL,
+        cwd,
+      };
+    }
+
+    // Non-role profiles use legacy bridge defaults
+    return {
+      provider: process.env.MEDIATION_BRIDGE_PROVIDER || process.env.PROVIDER || 'claude',
+      model: process.env.MEDIATION_BRIDGE_MODEL || process.env.MODEL || 'sonnet',
+      cwd,
+    };
+  }
+
   const bridgeManager = createBridgeManager({
     localBridge,
     emitLog,
+    resolveProfileRuntimeConfig,
   });
   stopBridgeManager = () => {
     bridgeManager.stopAll('app_shutdown');
@@ -989,64 +1213,110 @@ async function bootstrap(): Promise<void> {
       throw new Error(`party '${partyId}' not found in case`);
     }
 
+    // Resolve template-driven prompt (Issue 8 fix)
+    let templateVersion: CoachingTemplateVersion | null = null;
+    try {
+      const sel = mediationCase.templateSelection;
+      const resolved = templateService.resolveTemplateForCase(sel?.templateId, sel?.templateVersion);
+      templateVersion = resolved.version;
+    } catch {
+      // Fallback to hardcoded defaults
+    }
+
     const profileId = `case_${caseId}_${partyId}`;
     bridgeManager.ensureBridge(profileId);
 
-    const promptTemplate = buildIntakePromptTemplate(mediationCase, partyId);
-    const timeoutMs = 120_000;
-    const result = await localBridge.requestLocalPrompt(
-      profileId,
-      {
-        objective: `Private intake for ${party.displayName}`,
-        mode: 'manual',
-        text: promptTemplate,
-        constraints: {
-          allow_tool_use: false,
-          max_output_chars: 8_000,
-          max_history_turns: 0,
-          max_history_chars: 0,
-          local_turn_timeout_ms: timeoutMs,
-        },
-      },
-      timeoutMs,
-    );
-
-    const resultRecord = result as Record<string, unknown>;
-    if (resultRecord.ok !== true) {
-      const errorRecord = (
-        resultRecord.error
-        && typeof resultRecord.error === 'object'
-      ) ? resultRecord.error as Record<string, unknown> : undefined;
-      throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
-    }
-
-    const frame = (
-      resultRecord.frame
-      && typeof resultRecord.frame === 'object'
-    ) ? resultRecord.frame as Record<string, unknown> : {};
-    if (pickString(frame, 'status') === 'error') {
-      throw new Error(pickString(frame, 'reason') || 'local prompt error');
-    }
-
-    const summary = pickString(frame, 'draft_message');
-    if (!summary) {
-      throw new Error('local prompt returned empty summary');
-    }
-
-    mediationService.appendPrivateMessage({
+    // Emit typing start (Section 6.2.1 TypingIndicatorEvent)
+    emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+      type: 'typing_start',
+      sourceType: 'ai_generation',
+      sourceId: 'intake_coach',
       caseId,
-      partyId,
-      authorType: 'party_llm',
-      text: summary,
-      tags: ['summary', 'intake_template'],
+      chatSurface: 'intake',
+      timestamp: new Date().toISOString(),
     });
-    const updatedCase = mediationService.setPrivateSummary(caseId, partyId, summary, false);
 
-    return {
-      case: updatedCase,
-      summary,
-      promptTemplate,
-    };
+    // Build prompt using template assembly (Section 5.1)
+    const runtimeLines = [
+      `You are the private intake coach for ${party.displayName}.`,
+      '',
+      'Complete the following steps exactly:',
+      '1. Clarify the user goals in two concise bullets.',
+      '2. Clarify hard constraints and non-negotiables in two concise bullets.',
+      '3. Identify one realistic concession the user can offer.',
+      '4. Identify one concrete request the user should make.',
+      '5. Draft a private summary (120-220 words) for mediation context.',
+      '6. Keep tone neutral, practical, and non-accusatory.',
+      '',
+      'Return only the final private summary text (no JSON, no markdown headings).',
+    ];
+    const promptTemplate = assemblePrompt('intake', templateVersion, mediationCase.mainTopicConfig, runtimeLines);
+    const timeoutMs = 120_000;
+    try {
+      const result = await localBridge.requestLocalPrompt(
+        profileId,
+        {
+          objective: `Private intake for ${party.displayName}`,
+          mode: 'manual',
+          text: promptTemplate,
+          constraints: {
+            allow_tool_use: false,
+            max_output_chars: 8_000,
+            max_history_turns: 0,
+            max_history_chars: 0,
+            local_turn_timeout_ms: timeoutMs,
+          },
+        },
+        timeoutMs,
+      );
+
+      const resultRecord = result as Record<string, unknown>;
+      if (resultRecord.ok !== true) {
+        const errorRecord = (
+          resultRecord.error
+          && typeof resultRecord.error === 'object'
+        ) ? resultRecord.error as Record<string, unknown> : undefined;
+        throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
+      }
+
+      const frame = (
+        resultRecord.frame
+        && typeof resultRecord.frame === 'object'
+      ) ? resultRecord.frame as Record<string, unknown> : {};
+      if (pickString(frame, 'status') === 'error') {
+        throw new Error(pickString(frame, 'reason') || 'local prompt error');
+      }
+
+      const summary = pickString(frame, 'draft_message');
+      if (!summary) {
+        throw new Error('local prompt returned empty summary');
+      }
+
+      mediationService.appendPrivateMessage({
+        caseId,
+        partyId,
+        authorType: 'party_llm',
+        text: summary,
+        tags: ['summary', 'intake_template'],
+      });
+      const updatedCase = mediationService.setPrivateSummary(caseId, partyId, summary, false);
+
+      return {
+        case: updatedCase,
+        summary,
+        promptTemplate,
+      };
+    } finally {
+      // Emit typing stop (Section 6.2.1 TypingIndicatorEvent)
+      emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+        type: 'typing_stop',
+        sourceType: 'ai_generation',
+        sourceId: 'intake_coach',
+        caseId,
+        chatSurface: 'intake',
+        timestamp: new Date().toISOString(),
+      });
+    }
   };
 
   const runCoachReply = async (input: {
@@ -1076,62 +1346,114 @@ async function bootstrap(): Promise<void> {
       throw new Error(`party '${partyId}' not found in case`);
     }
 
+    // Resolve template-driven prompt (Section 5.1)
+    let templateVersion: CoachingTemplateVersion | null = null;
+    try {
+      const sel = mediationCase.templateSelection;
+      const resolved = templateService.resolveTemplateForCase(sel?.templateId, sel?.templateVersion);
+      templateVersion = resolved.version;
+    } catch {
+      // Fallback to hardcoded defaults
+    }
+
     const profileId = `coach_${caseId}_${partyId}`;
     bridgeManager.ensureBridge(profileId);
 
-    const promptTemplate = buildCoachReplyPrompt(mediationCase, partyId, partyPrompt);
-    const timeoutMs = 120_000;
-    const result = await localBridge.requestLocalPrompt(
-      profileId,
-      {
-        objective: `Private intake coach reply for ${party.displayName}`,
-        mode: 'manual',
-        text: promptTemplate,
-        constraints: {
-          allow_tool_use: false,
-          max_output_chars: 4_000,
-          max_history_turns: 0,
-          max_history_chars: 0,
-          local_turn_timeout_ms: timeoutMs,
-        },
-      },
-      timeoutMs,
-    );
-
-    const resultRecord = result as Record<string, unknown>;
-    if (resultRecord.ok !== true) {
-      const errorRecord = (
-        resultRecord.error
-        && typeof resultRecord.error === 'object'
-      ) ? resultRecord.error as Record<string, unknown> : undefined;
-      throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
-    }
-
-    const frame = (
-      resultRecord.frame
-      && typeof resultRecord.frame === 'object'
-    ) ? resultRecord.frame as Record<string, unknown> : {};
-    if (pickString(frame, 'status') === 'error') {
-      throw new Error(pickString(frame, 'reason') || 'local prompt error');
-    }
-
-    const reply = pickString(frame, 'draft_message');
-    if (!reply) {
-      throw new Error('local prompt returned empty coach reply');
-    }
-
-    const updatedCase = mediationService.appendPrivateMessage({
+    // Emit typing start (Section 6.2.1 TypingIndicatorEvent)
+    emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+      type: 'typing_start',
+      sourceType: 'ai_generation',
+      sourceId: 'intake_coach',
       caseId,
-      partyId,
-      authorType: 'party_llm',
-      text: reply,
-      tags: ['coach_reply'],
+      chatSurface: 'intake',
+      timestamp: new Date().toISOString(),
     });
 
-    return {
-      case: updatedCase,
-      reply,
-    };
+    // Build prompt using template assembly (Section 5.1)
+    const thread = mediationCase.privateIntakeByPartyId[partyId];
+    const history = (thread?.messages || [])
+      .slice(-10)
+      .map((message) => {
+        const role = message.authorType === 'party' ? 'Party' : 'Coach';
+        return `${role}: ${message.text}`;
+      })
+      .join('\n');
+
+    const runtimeLines = [
+      history ? 'Recent private intake transcript:' : '',
+      history || '',
+      '',
+      `Latest party message: ${partyPrompt}`,
+      '',
+      'Respond with empathy, neutrality, and actionability.',
+      'Keep your reply under 180 words and ask at most one clarifying question.',
+      'Return only the coach response text.',
+    ].filter(Boolean);
+    const promptTemplate = assemblePrompt('intake', templateVersion, mediationCase.mainTopicConfig, runtimeLines);
+    const timeoutMs = 120_000;
+    try {
+      const result = await localBridge.requestLocalPrompt(
+        profileId,
+        {
+          objective: `Private intake coach reply for ${party.displayName}`,
+          mode: 'manual',
+          text: promptTemplate,
+          constraints: {
+            allow_tool_use: false,
+            max_output_chars: 4_000,
+            max_history_turns: 0,
+            max_history_chars: 0,
+            local_turn_timeout_ms: timeoutMs,
+          },
+        },
+        timeoutMs,
+      );
+
+      const resultRecord = result as Record<string, unknown>;
+      if (resultRecord.ok !== true) {
+        const errorRecord = (
+          resultRecord.error
+          && typeof resultRecord.error === 'object'
+        ) ? resultRecord.error as Record<string, unknown> : undefined;
+        throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
+      }
+
+      const frame = (
+        resultRecord.frame
+        && typeof resultRecord.frame === 'object'
+      ) ? resultRecord.frame as Record<string, unknown> : {};
+      if (pickString(frame, 'status') === 'error') {
+        throw new Error(pickString(frame, 'reason') || 'local prompt error');
+      }
+
+      const reply = pickString(frame, 'draft_message');
+      if (!reply) {
+        throw new Error('local prompt returned empty coach reply');
+      }
+
+      const updatedCase = mediationService.appendPrivateMessage({
+        caseId,
+        partyId,
+        authorType: 'party_llm',
+        text: reply,
+        tags: ['coach_reply'],
+      });
+
+      return {
+        case: updatedCase,
+        reply,
+      };
+    } finally {
+      // Emit typing stop (Section 6.2.1 TypingIndicatorEvent)
+      emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+        type: 'typing_stop',
+        sourceType: 'ai_generation',
+        sourceId: 'intake_coach',
+        caseId,
+        chatSurface: 'intake',
+        timestamp: new Date().toISOString(),
+      });
+    }
   };
 
   const runDraftSuggestion = async (input: {
@@ -1205,6 +1527,433 @@ async function bootstrap(): Promise<void> {
     };
   };
 
+  // ── V2 Transcript Compression (Section 5.2.1 Normative) ────────────────
+  // Deterministic 7-step algorithm with token budgeting, required markers,
+  // and structured context_budget_exceeded diagnostics.
+  const IMMUTABLE_TURNS = 30;
+  const BLOCK_SIZE = 10;
+  const FALLBACK_BLOCK_SIZE = 20;
+  const CHARS_PER_TOKEN = 4; // approximation for token-budget estimation
+  const RESERVED_OUTPUT_TOKENS = 4096; // Section 5.2.1: reserved output buffer
+  const DEFAULT_CONTEXT_WINDOW_TOKENS = 8192; // conservative default if provider unknown
+
+  /**
+   * Resolve the V2 default provider's context window token limit.
+   * Ensures providers are registered before lookup (c4_2) so first-call
+   * paths (e.g. first draft-coach turn) get provider-derived budgets
+   * rather than the conservative 8192 fallback.
+   */
+  function resolveV2ContextWindowTokens(): number {
+    // Ensure providers are registered — idempotent via duplicate guards.
+    try {
+      if (!listProviderIds().length) {
+        registerBuiltInProviders();
+      }
+    } catch {
+      // best-effort
+    }
+
+    try {
+      // Try the V2 default provider first
+      const plugin = getProvider(V2_DEFAULT_PROVIDER);
+      if (plugin?.capabilities?.contextWindowTokens) {
+        return plugin.capabilities.contextWindowTokens;
+      }
+
+      // Fallback: use the largest context window from any registered provider
+      let maxTokens = 0;
+      for (const id of listProviderIds()) {
+        try {
+          const p = getProvider(id);
+          const tokens = p?.capabilities?.contextWindowTokens || 0;
+          if (tokens > maxTokens) maxTokens = tokens;
+        } catch {
+          // skip
+        }
+      }
+      return maxTokens > 0 ? maxTokens : DEFAULT_CONTEXT_WINDOW_TOKENS;
+    } catch {
+      return DEFAULT_CONTEXT_WINDOW_TOKENS;
+    }
+  }
+
+  /** Estimate token count from text length */
+  function estimateTokens(text: string): number {
+    return Math.ceil(text.length / CHARS_PER_TOKEN);
+  }
+
+  /**
+   * Extractive summary for a block of turns (Section 5.2.1 step 2):
+   * Retain first and last turn verbatim; intermediate turns → one sentence each.
+   */
+  function extractiveSummary(turns: Array<{ label: string; text: string }>, subjectLineOnly = false): string {
+    if (turns.length === 0) return '';
+    if (turns.length === 1) return `${turns[0].label}: ${turns[0].text}`;
+
+    const lines: string[] = [];
+    for (let i = 0; i < turns.length; i++) {
+      const t = turns[i];
+      if (i === 0 || i === turns.length - 1) {
+        // First and last turn: keep verbatim
+        lines.push(`${t.label}: ${t.text}`);
+      } else if (subjectLineOnly) {
+        // Fallback: subject-line-only extracts (≤15 tokens ~ ≤60 chars)
+        const subject = t.text.slice(0, 60).split(/[.!?]/)[0] || t.text.slice(0, 60);
+        lines.push(`${t.label}: ${subject.trim()}`);
+      } else {
+        // Normal: one sentence per turn
+        const firstSentence = t.text.split(/[.!?]\s/)[0] || t.text.slice(0, 80);
+        lines.push(`${t.label}: ${firstSentence.trim()}`);
+      }
+    }
+    return lines.join(' | ');
+  }
+
+  /**
+   * Section 5.2.1 normative transcript compression.
+   * @param maxContextTokens - provider model's context window (minus reserved output)
+   */
+  function compressTranscript(
+    messages: Array<{ authorType: string; authorPartyId?: string; text: string }>,
+    parties: Array<{ id: string; displayName: string }>,
+    prefix: string,
+    maxContextTokens?: number,
+  ): string {
+    const budgetTokens = (maxContextTokens || DEFAULT_CONTEXT_WINDOW_TOKENS) - RESERVED_OUTPUT_TOKENS;
+
+    const labeled = messages.map((m, idx) => {
+      let label: string;
+      if (m.authorType === 'party') {
+        label = parties.find((p) => p.id === m.authorPartyId)?.displayName || m.authorPartyId || 'Participant';
+      } else if (m.authorType === 'mediator_llm') {
+        label = 'Mediator';
+      } else {
+        label = m.authorType === 'party_llm' ? 'Coach' : 'System';
+      }
+      return { label, text: m.text, turnIndex: idx + 1 };
+    });
+
+    // Step 1: Split into immutable (recent 30) and compressible (older)
+    const immutableStart = Math.max(0, labeled.length - IMMUTABLE_TURNS);
+    const immutable = labeled.slice(immutableStart);
+    const older = labeled.slice(0, immutableStart);
+
+    const formatTurn = (t: { label: string; text: string }) => `${t.label}: ${t.text}`;
+    const immutableText = immutable.map(formatTurn).join('\n');
+    const immutableTokens = estimateTokens(immutableText);
+
+    // Step 7: If immutable segments alone exceed budget, emit context_budget_exceeded
+    // Structured diagnostics surfaced as IPC error.details (Section 5.2.1 / 7.0)
+    if (immutableTokens > budgetTokens) {
+      throw new DomainError(
+        'context_budget_exceeded',
+        `Immutable segment (${immutable.length} turns, ~${immutableTokens} tokens) exceeds context budget (~${budgetTokens} tokens)`,
+        {
+          requiredTokens: immutableTokens,
+          availableTokens: budgetTokens,
+          immutableTurnCount: immutable.length,
+          totalTurnCount: labeled.length,
+          contextWindowTokens: maxContextTokens || DEFAULT_CONTEXT_WINDOW_TOKENS,
+          reservedOutputTokens: RESERVED_OUTPUT_TOKENS,
+        },
+      );
+    }
+
+    if (older.length === 0) {
+      return immutableText;
+    }
+
+    // Step 2-3: Group older turns into blocks with extractive summaries
+    const remainingTokenBudget = budgetTokens - immutableTokens;
+    let compressed = compressOlderTurns(older, BLOCK_SIZE, false);
+
+    // Step 4: Check if compressed + immutable fits within budget
+    if (estimateTokens(compressed) > remainingTokenBudget) {
+      // Step 5: Fallback — increase block size to 20, subject-line-only extracts
+      compressed = compressOlderTurns(older, FALLBACK_BLOCK_SIZE, true);
+    }
+
+    // Step 6: If still over budget, truncate oldest compressed blocks
+    if (estimateTokens(compressed) > remainingTokenBudget) {
+      const lines = compressed.split('\n');
+      // Remove oldest blocks (from the front) until it fits
+      while (lines.length > 0 && estimateTokens(lines.join('\n')) > remainingTokenBudget) {
+        lines.shift();
+      }
+      // Prepend truncation marker (Section 5.2.1 step 6)
+      const firstOmitted = older[0]?.turnIndex || 1;
+      const lastOmittedIdx = older.length - (lines.length > 0 ? FALLBACK_BLOCK_SIZE * lines.length : 0);
+      const lastOmitted = lastOmittedIdx > 0 ? older[Math.min(lastOmittedIdx - 1, older.length - 1)]?.turnIndex || older.length : older.length;
+      lines.unshift(`[Transcript truncated: turns ${firstOmitted}–${lastOmitted} omitted]`);
+      compressed = lines.join('\n');
+
+      // Final safety: hard-truncate to fit
+      if (estimateTokens(compressed) > remainingTokenBudget) {
+        const maxChars = remainingTokenBudget * CHARS_PER_TOKEN;
+        compressed = compressed.slice(0, maxChars - 80) + `\n[Transcript truncated: turns 1–${older[older.length - 1]?.turnIndex || older.length} omitted]`;
+      }
+    }
+
+    return compressed ? `${compressed}\n${immutableText}` : immutableText;
+  }
+
+  /**
+   * Compress older turns into block summaries with normative markers.
+   * Returns compressed text with `[Compressed: turns N–M]` markers (Section 5.2.1).
+   */
+  function compressOlderTurns(
+    turns: Array<{ label: string; text: string; turnIndex: number }>,
+    blockSize: number,
+    subjectLineOnly: boolean,
+  ): string {
+    const blocks: string[] = [];
+    for (let i = 0; i < turns.length; i += blockSize) {
+      const block = turns.slice(i, i + blockSize);
+      const firstTurn = block[0].turnIndex;
+      const lastTurn = block[block.length - 1].turnIndex;
+      const summary = extractiveSummary(block, subjectLineOnly);
+      // Section 5.2.1 step 3: required [Compressed: turns N–M] marker
+      blocks.push(`[Compressed: turns ${firstTurn}–${lastTurn}] ${summary}`);
+    }
+    return blocks.join('\n');
+  }
+
+  // ── V2 Draft Coach Turn runner (Spec Section 5.2) ───────────────────────
+  const runDraftCoachTurn = async (input: {
+    caseId: string;
+    draftId: string;
+    partyId: string;
+    userMessage: string;
+    composeText?: string;
+  }): Promise<Record<string, unknown>> => {
+    const caseId = input.caseId.trim();
+    const draftId = input.draftId.trim();
+    const partyId = input.partyId.trim();
+    const userMessage = input.userMessage.trim();
+    if (!caseId || !draftId || !partyId) {
+      throw new Error('caseId, draftId, and partyId are required');
+    }
+
+    const mediationCase = mediationService.getCase(caseId);
+    if (mediationCase.phase !== 'group_chat') {
+      throw new Error('draft coach is only available during group_chat');
+    }
+
+    // F-06 gating check
+    if (!mediationCase.mainTopicConfig?.topic?.trim() || !mediationCase.templateSelection?.templateId) {
+      throw new DomainError('main_topic_not_configured', 'Main topic and template must be configured');
+    }
+
+    const draft = mediationCase.groupChat.draftsById[draftId];
+    if (!draft) {
+      throw new DomainError('draft_not_found', `draft '${draftId}' not found in case`);
+    }
+
+    const party = mediationCase.parties.find((entry) => entry.id === partyId);
+    if (!party) {
+      throw new Error(`party '${partyId}' not found in case`);
+    }
+
+    // Ensure draft has coach metadata initialized
+    if (!draft.coachMeta) {
+      mediationService.initializeDraftCoachMeta(caseId, draftId);
+    }
+
+    // Resolve pinned template version for prompt assembly (Issue 4 fix)
+    let templateVersion: CoachingTemplateVersion | null = null;
+    try {
+      const sel = mediationCase.templateSelection;
+      const resolved = templateService.resolveTemplateForCase(
+        sel?.templateId,
+        sel?.templateVersion,
+      );
+      templateVersion = resolved.version;
+    } catch {
+      // Fallback to hardcoded defaults
+    }
+
+    const mainTopicCfg = mediationCase.mainTopicConfig || null;
+
+    // Build context: private intake + group chat + coach history
+    // Uses Section 5.2.1 transcript compression for group chat
+    const intakeThread = mediationCase.privateIntakeByPartyId[partyId];
+    const intakeContext = (intakeThread?.messages || [])
+      .slice(-6)
+      .map((m) => `[Intake] ${m.authorType === 'party' ? 'Party' : 'Coach'}: ${m.text}`)
+      .join('\n');
+
+    let groupChatContext: string;
+    try {
+      groupChatContext = compressTranscript(
+        mediationCase.groupChat.messages,
+        mediationCase.parties,
+        'Group',
+        resolveV2ContextWindowTokens(),
+      );
+    } catch (compErr) {
+      if (compErr instanceof DomainError && compErr.code === 'context_budget_exceeded') {
+        throw compErr; // Propagate context_budget_exceeded
+      }
+      // Fallback to simple slice
+      groupChatContext = mediationCase.groupChat.messages
+        .slice(-10)
+        .map((m) => {
+          if (m.authorType === 'party') {
+            const pName = mediationCase.parties.find((p) => p.id === m.authorPartyId)?.displayName || m.authorPartyId || 'Participant';
+            return `[Group] ${pName}: ${m.text}`;
+          }
+          if (m.authorType === 'mediator_llm') {
+            return `[Group] Mediator: ${m.text}`;
+          }
+          return `[Group] System: ${m.text}`;
+        })
+        .join('\n');
+    }
+
+    // Get refreshed case for coach history
+    const refreshedCase = mediationService.getCase(caseId);
+    const refreshedDraft = refreshedCase.groupChat.draftsById[draftId];
+    const coachMeta = refreshedDraft?.coachMeta;
+    const coachHistoryContext = (coachMeta?.coachHistory || [])
+      .slice(-12)
+      .map((m) => `${m.author === 'party' ? 'Party' : 'Coach'}: ${m.text}`)
+      .join('\n');
+
+    // Phase-aware prompt construction (Section 4.2.1)
+    // Per spec: user input in confirm_ready resets to exploring.
+    // Only an explicit "Generate Formal Draft" action (empty userMessage) triggers formal draft.
+    const currentPhase = coachMeta?.phase || 'exploring';
+    const isFormalDraftRequest = currentPhase === 'confirm_ready' && !userMessage;
+
+    // If user sent a message while in confirm_ready, reset phase to exploring
+    if (currentPhase === 'confirm_ready' && userMessage) {
+      mediationService.setDraftReadiness(caseId, draftId, false);
+    }
+
+    const runtimeLines: string[] = [];
+    if (intakeContext) {
+      runtimeLines.push('Private intake context:', intakeContext, '');
+    }
+    if (groupChatContext) {
+      runtimeLines.push('Group chat context:', groupChatContext, '');
+    }
+    if (coachHistoryContext) {
+      runtimeLines.push('Draft coach conversation:', coachHistoryContext, '');
+    }
+
+    if (isFormalDraftRequest) {
+      runtimeLines.push(
+        `Now generate a formal draft message for ${party.displayName} to send in the group chat.`,
+        'The draft should be calm, specific, non-accusatory, and negotiation-oriented.',
+        'Length: 60-180 words.',
+        'Return only the final message text.',
+      );
+    } else {
+      if (userMessage) {
+        runtimeLines.push(`Latest party message: ${userMessage}`, '');
+      }
+      runtimeLines.push(
+        `Help ${party.displayName} prepare a message for the group chat.`,
+        'Analyze their perspective and provide coaching guidance.',
+        'Keep your reply under 180 words and ask at most one clarifying question.',
+        'Return only the coaching response text.',
+      );
+    }
+
+    const promptText = assemblePrompt('draft_coach', templateVersion, mainTopicCfg, runtimeLines);
+
+    // Emit typing start (Section 6.2.1 TypingIndicatorEvent)
+    emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+      type: 'typing_start',
+      sourceType: 'ai_generation',
+      sourceId: 'draft_coach',
+      caseId,
+      chatSurface: 'coach_panel',
+      timestamp: new Date().toISOString(),
+    });
+
+    const profileId = `draftcoach_${caseId}_${partyId}`;
+    bridgeManager.ensureBridge(profileId);
+
+    const timeoutMs = 120_000;
+    try {
+      const result = await localBridge.requestLocalPrompt(
+        profileId,
+        {
+          objective: isFormalDraftRequest
+            ? `Formal draft for ${party.displayName}`
+            : `Draft coaching for ${party.displayName}`,
+          mode: 'manual',
+          text: promptText,
+          constraints: {
+            allow_tool_use: false,
+            max_output_chars: 6_000,
+            max_history_turns: 0,
+            max_history_chars: 0,
+            local_turn_timeout_ms: timeoutMs,
+          },
+        },
+        timeoutMs,
+      );
+
+      const resultRecord = result as Record<string, unknown>;
+      if (resultRecord.ok !== true) {
+        const errorRecord = (
+          resultRecord.error
+          && typeof resultRecord.error === 'object'
+        ) ? resultRecord.error as Record<string, unknown> : undefined;
+        throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
+      }
+
+      const frame = (
+        resultRecord.frame
+        && typeof resultRecord.frame === 'object'
+      ) ? resultRecord.frame as Record<string, unknown> : {};
+      if (pickString(frame, 'status') === 'error') {
+        throw new Error(pickString(frame, 'reason') || 'local prompt error');
+      }
+
+      const responseText = pickString(frame, 'draft_message');
+      if (!responseText) {
+        throw new Error('local prompt returned empty draft coach response');
+      }
+
+      // Record the user message if provided
+      if (userMessage) {
+        mediationService.appendCoachDraftMessage(caseId, draftId, 'party', userMessage);
+      }
+
+      // Record the coach response
+      mediationService.appendCoachDraftMessage(caseId, draftId, 'party_llm', responseText);
+
+      let updatedCase: Record<string, unknown>;
+      if (isFormalDraftRequest) {
+        // Set formal draft
+        updatedCase = mediationService.setFormalDraftReady(caseId, draftId, responseText) as any;
+      } else {
+        // Get updated case after recording messages
+        updatedCase = mediationService.getCase(caseId) as any;
+      }
+
+      return {
+        case: updatedCase,
+        draftId,
+        phase: isFormalDraftRequest ? 'formal_draft_ready' : (coachMeta?.phase || 'exploring'),
+        coachResponse: responseText,
+      };
+    } finally {
+      // Emit typing stop (Section 6.2.1 TypingIndicatorEvent)
+      emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+        type: 'typing_stop',
+        sourceType: 'ai_generation',
+        sourceId: 'draft_coach',
+        caseId,
+        chatSurface: 'coach_panel',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  };
+
   const runMediatorTurn = async (input: {
     caseId: string;
     partyId: string;
@@ -1227,61 +1976,140 @@ async function bootstrap(): Promise<void> {
       throw new Error(`party '${partyId}' not found in case`);
     }
 
+    // Resolve template-driven prompt (Section 5.1)
+    let templateVersion: CoachingTemplateVersion | null = null;
+    try {
+      const sel = mediationCase.templateSelection;
+      const resolved = templateService.resolveTemplateForCase(sel?.templateId, sel?.templateVersion);
+      templateVersion = resolved.version;
+    } catch {
+      // Fallback to hardcoded defaults
+    }
+
     const profileId = `mediator_${caseId}`;
     bridgeManager.ensureBridge(profileId);
 
-    const promptTemplate = buildMediatorTurnPrompt(mediationCase, partyId, content);
-    const timeoutMs = 45_000;
-    const result = await localBridge.requestLocalPrompt(
-      profileId,
-      {
-        objective: `Mediator follow-up for ${mediationCase.topic}`,
-        mode: 'manual',
-        text: promptTemplate,
-        constraints: {
-          allow_tool_use: false,
-          max_output_chars: 3_000,
-          max_history_turns: 0,
-          max_history_chars: 0,
-          local_turn_timeout_ms: timeoutMs,
-        },
-      },
-      timeoutMs,
-    );
-
-    const resultRecord = result as Record<string, unknown>;
-    if (resultRecord.ok !== true) {
-      const errorRecord = (
-        resultRecord.error
-        && typeof resultRecord.error === 'object'
-      ) ? resultRecord.error as Record<string, unknown> : undefined;
-      throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
-    }
-
-    const frame = (
-      resultRecord.frame
-      && typeof resultRecord.frame === 'object'
-    ) ? resultRecord.frame as Record<string, unknown> : {};
-    if (pickString(frame, 'status') === 'error') {
-      throw new Error(pickString(frame, 'reason') || 'local prompt error');
-    }
-
-    const mediatorReply = pickString(frame, 'draft_message');
-    if (!mediatorReply) {
-      throw new Error('local prompt returned empty mediator reply');
-    }
-
-    const updatedCase = mediationService.appendGroupMessage({
+    // Emit typing start (Section 6.2.1 TypingIndicatorEvent)
+    emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+      type: 'typing_start',
+      sourceType: 'ai_generation',
+      sourceId: 'mediator',
       caseId,
-      authorType: 'mediator_llm',
-      text: mediatorReply,
-      tags: ['mediator_followup'],
+      chatSurface: 'group',
+      timestamp: new Date().toISOString(),
     });
 
-    return {
-      case: updatedCase,
-      reply: mediatorReply,
-    };
+    // Build mediator prompt using template assembly (Section 5.1)
+    // Uses Section 5.2.1 transcript compression
+    const participantNames = mediationCase.parties.map((entry) => entry.displayName || entry.id).join(', ');
+    let transcript: string;
+    try {
+      transcript = compressTranscript(
+        mediationCase.groupChat.messages,
+        mediationCase.parties,
+        'Group',
+        resolveV2ContextWindowTokens(),
+      );
+    } catch (compErr) {
+      if (compErr instanceof DomainError && compErr.code === 'context_budget_exceeded') {
+        throw compErr;
+      }
+      // Fallback to simple slice
+      transcript = mediationCase.groupChat.messages
+        .slice(-14)
+        .map((message) => {
+          if (message.authorType === 'party') {
+            const pName = mediationCase.parties.find((entry) => entry.id === message.authorPartyId)?.displayName
+              || message.authorPartyId
+              || 'Participant';
+            return `${pName}: ${message.text}`;
+          }
+          if (message.authorType === 'mediator_llm') {
+            return `Mediator: ${message.text}`;
+          }
+          return `Assistant: ${message.text}`;
+        })
+        .join('\n');
+    }
+
+    const mediatorRuntimeLines = [
+      `Participants: ${participantNames}.`,
+      'Use participant display names exactly as listed. Never use generic labels like "Party A" or "Party B".',
+      '',
+      `Latest speaker: ${party.displayName}`,
+      `Latest message: ${content}`,
+      '',
+      'Recent transcript:',
+      transcript || '(no prior transcript)',
+      '',
+      'Write one concise facilitator response that moves the conversation forward.',
+      'Keep tone neutral and practical, 45-120 words, and ask at most one focused follow-up question.',
+      'Return only the mediator message text.',
+    ];
+    const promptTemplate = assemblePrompt('mediator', templateVersion, mediationCase.mainTopicConfig, mediatorRuntimeLines);
+    const timeoutMs = 45_000;
+    try {
+      const result = await localBridge.requestLocalPrompt(
+        profileId,
+        {
+          objective: `Mediator follow-up for ${mediationCase.topic}`,
+          mode: 'manual',
+          text: promptTemplate,
+          constraints: {
+            allow_tool_use: false,
+            max_output_chars: 3_000,
+            max_history_turns: 0,
+            max_history_chars: 0,
+            local_turn_timeout_ms: timeoutMs,
+          },
+        },
+        timeoutMs,
+      );
+
+      const resultRecord = result as Record<string, unknown>;
+      if (resultRecord.ok !== true) {
+        const errorRecord = (
+          resultRecord.error
+          && typeof resultRecord.error === 'object'
+        ) ? resultRecord.error as Record<string, unknown> : undefined;
+        throw new Error(pickString(errorRecord, 'message') || 'local prompt failed');
+      }
+
+      const frame = (
+        resultRecord.frame
+        && typeof resultRecord.frame === 'object'
+      ) ? resultRecord.frame as Record<string, unknown> : {};
+      if (pickString(frame, 'status') === 'error') {
+        throw new Error(pickString(frame, 'reason') || 'local prompt error');
+      }
+
+      const mediatorReply = pickString(frame, 'draft_message');
+      if (!mediatorReply) {
+        throw new Error('local prompt returned empty mediator reply');
+      }
+
+      const updatedCase = mediationService.appendGroupMessage({
+        caseId,
+        authorType: 'mediator_llm',
+        text: mediatorReply,
+        tags: ['mediator_followup'],
+      });
+
+      return {
+        case: updatedCase,
+        reply: mediatorReply,
+      };
+    } finally {
+      // Emit typing stop (Section 6.2.1 TypingIndicatorEvent)
+      emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
+        type: 'typing_stop',
+        sourceType: 'ai_generation',
+        sourceId: 'mediator',
+        caseId,
+        chatSurface: 'group',
+        timestamp: new Date().toISOString(),
+      });
+    }
   };
 
   const idempotencyStorePath = path.join(app.getPath('userData'), 'mediation-idempotency.json');
@@ -1736,7 +2564,18 @@ async function bootstrap(): Promise<void> {
     runIntakeTemplate,
     runCoachReply,
     runDraftSuggestion,
+    runDraftCoachTurn,
     runMediatorTurn,
+    isAdmin: (actorId: string) => {
+      const profile = userProfileStore.getProfile(actorId);
+      return profile?.isAdmin === true;
+    },
+    // c4_1: Strict template resolvability check (no default fallback).
+    // Uses isTemplateVersionResolvable which validates exact templateId + versionNumber
+    // existence without falling back to the system default template.
+    isTemplateResolvable: (templateId: string, templateVersion: number) => {
+      return templateService.isTemplateVersionResolvable(templateId, templateVersion);
+    },
     emitMediationEvent: (payload) => {
       emitToAllWindows(CH.OUT_MEDIATION_EVENT, {
         ts: new Date().toISOString(),
@@ -1791,6 +2630,14 @@ async function bootstrap(): Promise<void> {
       }
     },
     emitStructuredLog: emitStructuredMainLog,
+  });
+
+  registerTemplateIpc(ipcMain, {
+    registry: registry as any,
+    templateService: templateService as any,
+    userProfileStore: userProfileStore as any,
+    caseStore: mediationStore as any,
+    auditLogPath,
   });
 
   registerRoomIpc(ipcMain, {
