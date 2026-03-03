@@ -11,9 +11,19 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execSync, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import OpenAI from 'openai';
-import { Agent, run, tool, setDefaultOpenAIClient } from '@openai/agents';
+import {
+  Agent,
+  run,
+  tool,
+  setDefaultOpenAIClient,
+  MCPServerStdio,
+  MCPServerStreamableHttp,
+  MCPServerSSE,
+  connectMcpServers,
+  createMCPToolStaticFilter,
+} from '@openai/agents';
 import { OpenAIResponsesCompactionSession } from '@openai/agents-openai';
 import { z } from 'zod';
 import { validatePathArgsWithinProject } from './path-guard.mjs';
@@ -217,10 +227,206 @@ function createSafePath(primaryRoot, allowedRoots) {
   };
 }
 
+function normalizeToolName(name) {
+  return String(name || '').trim().toLowerCase();
+}
+
+function hasDisallowedTool(policy, toolName) {
+  if (!policy || !Array.isArray(policy.disallowedTools)) return false;
+  const wanted = normalizeToolName(toolName);
+  return policy.disallowedTools.some((t) => normalizeToolName(t) === wanted);
+}
+
+function hasAnyDisallowedTool(policy, toolNames) {
+  return toolNames.some((toolName) => hasDisallowedTool(policy, toolName));
+}
+
+function matchesArgvPrefix(argv, prefix) {
+  if (!Array.isArray(prefix) || prefix.length === 0) return false;
+  if (prefix.length > argv.length) return false;
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (prefix[i] !== argv[i]) return false;
+  }
+  return true;
+}
+
+function formatPrefixList(prefixes, maxCount = 10) {
+  if (!Array.isArray(prefixes) || prefixes.length === 0) return '';
+  const labels = prefixes
+    .filter((p) => Array.isArray(p) && p.length > 0)
+    .map((p) => p.join(' '));
+  if (labels.length === 0) return '';
+  if (labels.length <= maxCount) return labels.join(', ');
+  return `${labels.slice(0, maxCount).join(', ')}, ...`;
+}
+
+function getShellPolicyViolation(command, argv, policy) {
+  if (!policy) return null;
+
+  if (hasDisallowedTool(policy, 'Bash')) {
+    return 'shell commands are disabled by this permission profile';
+  }
+
+  if (Array.isArray(policy?.bash?.denyPatterns)) {
+    for (const pattern of policy.bash.denyPatterns) {
+      try {
+        if (new RegExp(pattern, 'i').test(command)) {
+          return `command blocked by deny pattern: ${pattern}`;
+        }
+      } catch {
+        // Ignore invalid patterns to avoid taking down tool execution.
+      }
+    }
+  }
+
+  const shellPolicy = policy.shell;
+  if (!shellPolicy) return null;
+
+  if (Array.isArray(shellPolicy.denyPrefixes)) {
+    for (const prefix of shellPolicy.denyPrefixes) {
+      if (matchesArgvPrefix(argv, prefix)) {
+        return `command prefix denied: ${prefix.join(' ')}`;
+      }
+    }
+  }
+
+  if (Array.isArray(shellPolicy.allowPrefixes)) {
+    if (shellPolicy.allowPrefixes.length === 0) {
+      return 'no shell commands are allowed by this permission profile';
+    }
+
+    const hasWildcard = shellPolicy.allowPrefixes.some(
+      (p) => Array.isArray(p) && p.length === 1 && p[0] === '*',
+    );
+    if (hasWildcard) return null;
+
+    const allowed = shellPolicy.allowPrefixes.some((prefix) => matchesArgvPrefix(argv, prefix));
+    if (!allowed) {
+      return `command is not in allowed shell prefixes: ${argv[0] || '(unknown)'}`;
+    }
+  }
+
+  return null;
+}
+
+function getServerToolLists(serverId, policy) {
+  const allowRefs = Array.isArray(policy?.mcpAllowTools) ? policy.mcpAllowTools : [];
+  const denyRefs = Array.isArray(policy?.mcpDenyTools) ? policy.mcpDenyTools : [];
+
+  const allowedToolNames = [];
+  const blockedToolNames = [];
+
+  for (const ref of allowRefs) {
+    if (typeof ref !== 'string') continue;
+    const idx = ref.indexOf('__');
+    if (idx <= 0) continue;
+    if (ref.slice(0, idx) !== serverId) continue;
+    const toolName = ref.slice(idx + 2);
+    if (toolName) allowedToolNames.push(toolName);
+  }
+
+  for (const ref of denyRefs) {
+    if (typeof ref !== 'string') continue;
+    const idx = ref.indexOf('__');
+    if (idx <= 0) continue;
+    if (ref.slice(0, idx) !== serverId) continue;
+    const toolName = ref.slice(idx + 2);
+    if (toolName) blockedToolNames.push(toolName);
+  }
+
+  return {
+    hasGlobalAllowList: allowRefs.length > 0,
+    allowedToolNames,
+    blockedToolNames,
+  };
+}
+
+function isMcpServerAllowed(serverId, policy) {
+  if (!Array.isArray(policy?.mcpAllowServers)) return true;
+  if (policy.mcpAllowServers.includes('*')) return true;
+  return policy.mcpAllowServers.includes(serverId);
+}
+
+function buildMcpServerInstance(serverId, config) {
+  const rawType = typeof config?.type === 'string' ? config.type.trim() : '';
+  const type = rawType || 'stdio';
+
+  if (type === 'stdio') {
+    return new MCPServerStdio({
+      name: serverId,
+      command: config.command,
+      ...(Array.isArray(config.args) ? { args: config.args } : {}),
+      ...(config.env && typeof config.env === 'object' ? { env: config.env } : {}),
+    });
+  }
+
+  if (type === 'http' || type === 'sse') {
+    const headers = (config.headers && typeof config.headers === 'object') ? config.headers : undefined;
+    const requestInit = headers ? { headers } : undefined;
+    if (type === 'http') {
+      return new MCPServerStreamableHttp({
+        name: serverId,
+        url: config.url,
+        ...(requestInit ? { requestInit } : {}),
+      });
+    }
+    return new MCPServerSSE({
+      name: serverId,
+      url: config.url,
+      ...(requestInit ? { requestInit } : {}),
+    });
+  }
+
+  throw new Error(`unsupported_mcp_server_type_${type}`);
+}
+
+async function connectPolicyMcpServers(inputMcpServers, policy) {
+  if (!inputMcpServers || typeof inputMcpServers !== 'object') {
+    return null;
+  }
+
+  const prepared = [];
+  for (const [serverId, config] of Object.entries(inputMcpServers)) {
+    if (!isMcpServerAllowed(serverId, policy)) {
+      continue;
+    }
+
+    const { hasGlobalAllowList, allowedToolNames, blockedToolNames } = getServerToolLists(serverId, policy);
+    if (hasGlobalAllowList && allowedToolNames.length === 0) {
+      continue;
+    }
+
+    try {
+      const server = buildMcpServerInstance(serverId, config);
+      const toolFilter = createMCPToolStaticFilter({
+        ...(hasGlobalAllowList ? { allowed: allowedToolNames } : {}),
+        ...(blockedToolNames.length > 0 ? { blocked: blockedToolNames } : {}),
+      });
+      if (toolFilter) {
+        server.toolFilter = toolFilter;
+      }
+      prepared.push(server);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[openai-provider] skipping MCP server "${serverId}": ${message}\n`);
+    }
+  }
+
+  if (prepared.length === 0) {
+    return null;
+  }
+
+  return connectMcpServers(prepared, {
+    strict: false,
+    dropFailed: true,
+    connectInParallel: true,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Create tools scoped to allowed directories
 // ---------------------------------------------------------------------------
-function createTools(projectDir, allowedRoots) {
+function createTools(projectDir, allowedRoots, policy) {
   const safePath = createSafePath(projectDir, allowedRoots);
   const multiRoot = allowedRoots.length > 1;
   const pathDesc = multiRoot
@@ -334,6 +540,21 @@ function createTools(projectDir, allowedRoots) {
     'file', 'stat', 'tree', 'du', 'ls',
   ]);
 
+  const shellAllowSummary = Array.isArray(policy?.shell?.allowPrefixes)
+    ? formatPrefixList(policy.shell.allowPrefixes)
+    : '';
+  const runtimePermissionProfile = String(process.env.PERMISSION_PROFILE || '').trim().toLowerCase();
+  // Built-in "full" compiles to mode:none, so input.policy is undefined.
+  // In that case, bypass the static fallback allowlist to preserve full-access semantics.
+  const isFullProfileWithoutPolicy = !policy && runtimePermissionProfile === 'full';
+  const runCommandDescription = policy
+    ? (shellAllowSummary
+      ? `Run one non-interactive command allowed by the permission profile. Allowed command prefixes include: ${shellAllowSummary}.`
+      : 'Run one non-interactive command, constrained by the permission profile.')
+    : (isFullProfileWithoutPolicy
+      ? 'Run one non-interactive command in the project directory. Full Access profile detected, so command-prefix allowlist checks are not applied.'
+      : 'Run an allowed command in the project directory (no shell). Permitted: build, test, lint, git read-only, file inspection. Destructive or network commands are blocked.');
+
   function isCommandAllowed(cmd) {
     const trimmed = cmd.trim();
     return ALLOWED_COMMANDS.some(prefix => {
@@ -381,20 +602,33 @@ function createTools(projectDir, allowedRoots) {
 
   const runCommand = tool({
     name: 'run_command',
-    description: 'Run an allowed command in the project directory (no shell). Permitted: build, test, lint, git read-only, file inspection. Destructive or network commands are blocked.',
+    description: `${runCommandDescription} No shell operators (;, |, &&, >, $, etc.) and no interactive terminal sessions.`,
     parameters: z.object({
       command: z.string().describe('The command to execute (no shell operators like ;, |, &&, >, etc.)'),
     }),
     execute: async ({ command }) => {
+      const trimmedCommand = String(command || '').trim();
+      if (!trimmedCommand) {
+        return 'Command rejected: command cannot be empty.';
+      }
       // Reject shell metacharacters before any further processing
-      if (SHELL_META_RE.test(command)) {
+      if (SHELL_META_RE.test(trimmedCommand)) {
         return 'Command rejected: shell operators (;, |, &&, >, $, etc.) are not allowed. Provide a single command without shell syntax.';
       }
-      if (!isCommandAllowed(command)) {
+      const argv = parseCommand(trimmedCommand);
+      const policyViolation = getShellPolicyViolation(trimmedCommand, argv, policy);
+      if (policyViolation) {
+        return `Command rejected by permission profile: ${policyViolation}`;
+      }
+      if (!policy && !isFullProfileWithoutPolicy && !isCommandAllowed(trimmedCommand)) {
         return `Command not allowed. Only read-only and build/test commands are permitted. Allowed prefixes: ${ALLOWED_COMMANDS.slice(0, 10).join(', ')}, ...`;
       }
+
       try {
-        const [program, ...args] = parseCommand(command.trim());
+        const [program, ...args] = argv;
+        if (!program) {
+          return 'Command rejected: command cannot be empty.';
+        }
         // Validate that file-reading commands cannot access paths outside allowed roots
         validatePathArgs(program, args);
         const result = execFileSync(program, args, {
@@ -417,7 +651,27 @@ function createTools(projectDir, allowedRoots) {
     },
   });
 
-  return [listFiles, readFile, writeFile, searchFiles, runCommand];
+  const tools = [listFiles, readFile];
+
+  const writeIsDisallowed = hasAnyDisallowedTool(policy, [
+    'Write',
+    'Edit',
+    'MultiEdit',
+    'NotebookEdit',
+    'NotebookWrite',
+  ]);
+  if (!writeIsDisallowed) {
+    tools.push(writeFile);
+  }
+
+  tools.push(searchFiles);
+
+  const bashIsDisallowed = hasDisallowedTool(policy, 'Bash');
+  if (!bashIsDisallowed) {
+    tools.push(runCommand);
+  }
+
+  return tools;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,31 +730,44 @@ const openaiProvider = {
     });
     setDefaultOpenAIClient(client);
 
-    // Build agent with file-system tools scoped to allowed directories
-    const tools = createTools(projectDir, allowedRoots);
+    const mcpSession = await connectPolicyMcpServers(input.mcpServers, input.policy);
+    try {
+      // Build agent with file-system tools scoped to allowed directories
+      const tools = createTools(projectDir, allowedRoots, input.policy);
 
-    const agent = new Agent({
-      name: 'Coder',
-      instructions: systemPrompt,
-      model,
-      tools,
-    });
+      const agent = new Agent({
+        name: 'Coder',
+        instructions: systemPrompt,
+        model,
+        tools,
+        ...(mcpSession?.active?.length ? { mcpServers: mcpSession.active } : {}),
+      });
 
-    // Use SDK compaction session for conversation history management + auto-compaction
-    const { session, id: sessionId } = getOrCreateSession(input.resumeSessionId, client, model);
+      // Use SDK compaction session for conversation history management + auto-compaction
+      const { session, id: sessionId } = getOrCreateSession(input.resumeSessionId, client, model);
 
-    // Run the agent — pass maxTurns from input so room fan-out's
-    // max_tool_rounds constraint is respected (SDK defaults to 10).
-    const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 10;
-    const result = await run(agent, input.prompt, { maxTurns, session });
+      // Run the agent — pass maxTurns from input so room fan-out's
+      // max_tool_rounds constraint is respected (SDK defaults to 10).
+      const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 500;
+      const result = await run(agent, input.prompt, { maxTurns, session });
 
-    return {
-      result: result.finalOutput || '',
-      turns: 1,
-      costUsd: 0,
-      model,
-      sessionId,
-    };
+      return {
+        result: result.finalOutput || '',
+        turns: 1,
+        costUsd: 0,
+        model,
+        sessionId,
+      };
+    } finally {
+      if (mcpSession) {
+        try {
+          await mcpSession.close();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[openai-provider] failed to close MCP session: ${message}\n`);
+        }
+      }
+    }
   },
 };
 
